@@ -29,29 +29,31 @@ jobs:
       - name: Install build tools
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
         run: |
-          choco install -y cmake nasm strawberryperl
+          choco install -y cmake ninja nasm
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
         shell: pwsh
+
+      - name: Setup MSVC
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
         run: |
-          # Clone BoringSSL at the version boring-sys 4.19 expects
+          # Clone BoringSSL
           git clone --depth 1 https://boringssl.googlesource.com/boringssl C:\boringssl-src
           cd C:\boringssl-src
 
-          # Build with Visual Studio generator (same as boring-sys)
-          cmake -B build -G "Visual Studio 17 2022" -A x64
-          # Build specific targets that boring-sys needs
-          cmake --build build --target ssl --config Release --parallel 4
-          cmake --build build --target crypto --config Release --parallel 4
+          # Build with Ninja (VS generator doesn't support BoringSSL's NASM assembly)
+          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
+          ninja -C build crypto ssl
 
-          # Copy outputs to prebuilt location
+          # Copy outputs (Ninja puts libs directly in build/crypto/ and build/ssl/)
           mkdir C:\boringssl-prebuilt\lib
           mkdir C:\boringssl-prebuilt\include
           xcopy /E /I include C:\boringssl-prebuilt\include
-          copy build\ssl\Release\ssl.lib C:\boringssl-prebuilt\lib\
-          copy build\crypto\Release\crypto.lib C:\boringssl-prebuilt\lib\
+          copy build\crypto\crypto.lib C:\boringssl-prebuilt\lib\
+          copy build\ssl\ssl.lib C:\boringssl-prebuilt\lib\
         shell: pwsh
 
       - name: Upload BoringSSL artifact
@@ -161,7 +163,6 @@ jobs:
           # Use prebuilt BoringSSL - avoids cmake-rs path bugs and speeds up build
           BORING_BSSL_PATH: C:\boringssl-prebuilt
           BORING_BSSL_INCLUDE_PATH: C:\boringssl-prebuilt\include
-          QUICHE_BSSL_PATH: C:\boringssl-prebuilt
 
       - name: Build (cross-compile with zig)
         if: matrix.settings.cross
