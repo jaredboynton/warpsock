@@ -13,58 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  # Build BoringSSL once on Windows and cache it for reuse
-  build-boringssl-windows:
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache BoringSSL
-        id: cache-boringssl
-        uses: actions/cache@v4
-        with:
-          path: C:\boringssl-prebuilt
-          key: boringssl-windows-${{ hashFiles('Cargo.lock') }}-v1
-
-      - name: Install build tools
-        if: steps.cache-boringssl.outputs.cache-hit != 'true'
-        run: |
-          choco install -y cmake ninja nasm
-          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
-        shell: pwsh
-
-      - name: Setup MSVC
-        if: steps.cache-boringssl.outputs.cache-hit != 'true'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build BoringSSL
-        if: steps.cache-boringssl.outputs.cache-hit != 'true'
-        run: |
-          # Clone BoringSSL
-          git clone --depth 1 https://boringssl.googlesource.com/boringssl C:\boringssl-src
-          cd C:\boringssl-src
-
-          # Build with Ninja (VS generator doesn't support BoringSSL's NASM assembly)
-          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
-          ninja -C build crypto ssl
-
-          # Copy outputs (Ninja puts libs directly in build/crypto/ and build/ssl/)
-          mkdir C:\boringssl-prebuilt\lib
-          mkdir C:\boringssl-prebuilt\include
-          xcopy /E /I include C:\boringssl-prebuilt\include
-          copy build\crypto\crypto.lib C:\boringssl-prebuilt\lib\
-          copy build\ssl\ssl.lib C:\boringssl-prebuilt\lib\
-        shell: pwsh
-
-      - name: Upload BoringSSL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: boringssl-windows-prebuilt
-          path: C:\boringssl-prebuilt
-          retention-days: 7
-
   build:
-    needs: build-boringssl-windows
     strategy:
       fail-fast: false
       matrix:
@@ -97,10 +46,10 @@ jobs:
       # Download prebuilt BoringSSL for Windows builds
       - name: Download BoringSSL (Windows)
         if: runner.os == 'Windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: boringssl-windows-prebuilt
-          path: C:\boringssl-prebuilt
+        run: |
+          curl -L -o boringssl.zip https://github.com/jaredboynton/specter/releases/download/boringssl-prebuilt-v1/boringssl-windows-x64.zip
+          Expand-Archive -Path boringssl.zip -DestinationPath C:\boringssl-prebuilt
+        shell: pwsh
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
