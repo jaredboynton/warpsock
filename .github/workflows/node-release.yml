@@ -40,9 +40,11 @@ jobs:
           git clone --depth 1 https://boringssl.googlesource.com/boringssl C:\boringssl-src
           cd C:\boringssl-src
 
-          # Build with Visual Studio generator
+          # Build with Visual Studio generator (same as boring-sys)
           cmake -B build -G "Visual Studio 17 2022" -A x64
-          cmake --build build --config Release --parallel 4
+          # Build specific targets that boring-sys needs
+          cmake --build build --target ssl --config Release --parallel 4
+          cmake --build build --target crypto --config Release --parallel 4
 
           # Copy outputs to prebuilt location
           mkdir C:\boringssl-prebuilt\lib
