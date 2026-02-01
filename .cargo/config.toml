@@ -1,0 +1,21 @@
+# Cargo configuration for specter
+# Uses prebuilt BoringSSL libraries from lib/boringssl/
+
+# Note: Environment variables for boring-sys are set via:
+# - Local dev: source scripts/env.sh
+# - CI: Set BORING_BSSL_PATH and BORING_BSSL_INCLUDE_PATH in workflow
+
+[build]
+# Uncomment to use prebuilt BoringSSL by default
+# rustflags = []
+
+[env]
+# These are relative to the manifest directory (where Cargo.toml lives)
+# Unfortunately Cargo doesn't support relative paths in [env], so we use scripts instead
+
+# Target-specific linker settings for cross-compilation
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"

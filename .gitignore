@@ -1,11 +1,11 @@
 # Build artifacts
 target/
+.boringssl-build/
+.boringssl-src/
 
-
-
-
-
-
-
-
-
+# Agent files
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+COPILOT.md
+CURSOR.md

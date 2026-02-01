@@ -8,72 +8,110 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Disable incremental compilation in CI (sccache handles caching)
   CARGO_INCREMENTAL: 0
-  # RUSTC_WRAPPER set after sccache is initialized (see step below)
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  ci:
-    name: CI
+  test:
+    name: Test (macOS)
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
-      - name: Configure sccache for Rust
-        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: Configure prebuilt BoringSSL
+        run: |
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            echo "BORING_BSSL_PATH=${{ github.workspace }}/lib/boringssl/aarch64-apple-darwin" >> $GITHUB_ENV
+          else
+            echo "BORING_BSSL_PATH=${{ github.workspace }}/lib/boringssl/x86_64-apple-darwin" >> $GITHUB_ENV
+          fi
 
-      - name: Run tests
-        run: cargo nextest run --all-features --profile ci
+      - run: cargo fmt -- --check
+      - run: cargo nextest run --all-features --profile ci
 
-      - name: Archive test results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: nextest-results
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
-      - name: Run fingerprint_validation example
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 2
-          max_attempts: 3
-          retry_wait_seconds: 10
-          command: cargo run --example fingerprint_validation
-
-      - name: Run protocol_test example
+      - name: Run examples
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 3
           max_attempts: 3
           retry_wait_seconds: 10
-          command: cargo run --example protocol_test
+          command: |
+            cargo run --example fingerprint_validation
+            cargo run --example protocol_test
+
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install zig
+        run: brew install zig
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build
+        run: |
+          chmod +x scripts/zig-cc-* scripts/zig-cxx-*
+          just zigbuild ${{ matrix.target }}
+
+  build-windows:
+    name: Build Windows (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin
+
+      - name: Build
+        run: cargo xwin build --release --target ${{ matrix.target }} --lib

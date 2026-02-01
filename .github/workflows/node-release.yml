@@ -43,14 +43,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Download prebuilt BoringSSL for Windows builds
-      - name: Download BoringSSL (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          curl -L -o boringssl.zip https://github.com/jaredboynton/specter/releases/download/boringssl-prebuilt-v1/boringssl-windows-x64.zip
-          Expand-Archive -Path boringssl.zip -DestinationPath C:\boringssl-prebuilt
-        shell: pwsh
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -101,6 +93,9 @@ jobs:
           ${{ matrix.settings.build }}
         env:
           MACOSX_DEPLOYMENT_TARGET: '10.13'
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.settings.target }}
+          BORING_BSSL_INCLUDE_PATH: ${{ github.workspace }}/lib/boringssl/include
 
       - name: Build (native - Windows)
         if: runner.os == 'Windows'
@@ -109,9 +104,8 @@ jobs:
           npm run build
         shell: pwsh
         env:
-          # Use prebuilt BoringSSL - avoids cmake-rs path bugs and speeds up build
-          BORING_BSSL_PATH: C:\boringssl-prebuilt
-          BORING_BSSL_INCLUDE_PATH: C:\boringssl-prebuilt\include
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}\lib\boringssl\x86_64-pc-windows-msvc
 
       - name: Build (cross-compile with zig)
         if: matrix.settings.cross
@@ -133,6 +127,8 @@ jobs:
           cd bindings/node
           ${{ matrix.settings.build }}
         env:
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.settings.target }}
           # Use wrapper scripts that translate --target flag for cmake/boring-sys
           CC: ${{ github.workspace }}/.github/scripts/zig-cc-${{ matrix.settings.zig_target }}
           CXX: ${{ github.workspace }}/.github/scripts/zig-cxx-${{ matrix.settings.zig_target }}
@@ -177,6 +173,8 @@ jobs:
           npm run build -- --target x86_64-unknown-linux-musl
         env:
           CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-musl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -215,6 +213,9 @@ jobs:
         run: |
           cd bindings/node
           npm run build:debug
+        env:
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu
 
       - name: Test
         run: |

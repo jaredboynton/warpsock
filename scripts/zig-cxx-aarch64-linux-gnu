@@ -1,0 +1,18 @@
+#!/bin/bash
+# Wrapper script for zig c++ that:
+# 1. Uses the correct Zig target (aarch64-linux-gnu)
+# 2. Strips conflicting --target=aarch64-unknown-linux-gnu flags from cmake/boring-sys
+# 3. Handles both compilation and assembly
+
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --target=aarch64-unknown-linux-gnu) ;; # Strip Rust-style target
+        --target=*-unknown-linux-*) ;; # Strip any Rust-style Linux target
+        -target) ;; # Skip standalone -target (zig uses different format)
+        aarch64-unknown-linux-gnu) ;; # Skip if target is passed as separate arg
+        *) args+=("$arg") ;;
+    esac
+done
+
+exec zig c++ -target aarch64-linux-gnu "${args[@]}"

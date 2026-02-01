@@ -29,11 +29,9 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/Cargo.toml
           manylinux: manylinux_2_28
-          before-script-linux: |
-            # Install cmake and clang for BoringSSL (bindgen needs libclang >= 5.0)
-            # manylinux_2_28 uses AlmaLinux 8 with dnf
-            # Also install perl which BoringSSL's build system requires
-            dnf install -y cmake clang clang-devel llvm-devel perl-IPC-Cmd
+          # Use prebuilt BoringSSL from repo
+          env: |
+            BORING_BSSL_PATH=/home/runner/work/specter/specter/lib/boringssl/${{ matrix.target }}-unknown-linux-gnu
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -56,10 +54,9 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/Cargo.toml
           manylinux: musllinux_1_2
-          before-script-linux: |
-            # Install cmake and clang for BoringSSL (bindgen needs libclang >= 5.0)
-            # Also install perl and go which BoringSSL's build system requires
-            apk add --no-cache cmake clang-dev clang-static llvm-dev musl-dev linux-headers perl go
+          # Use prebuilt BoringSSL from repo (only x86_64-musl available, aarch64 falls back to build)
+          env: |
+            BORING_BSSL_PATH=/home/runner/work/specter/specter/lib/boringssl/${{ matrix.target }}-unknown-linux-musl
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -70,7 +67,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        target: [x64, x86]
+        target: [x64]
     steps:
       - uses: actions/checkout@v4
       
@@ -81,14 +78,13 @@ jobs:
           python-version: '3.12'
           architecture: ${{ matrix.target }}
       
-      - name: Install build tools
-        run: |
-          choco install cmake nasm -y
-          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/Cargo.toml
+        env:
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}\lib\boringssl\x86_64-pc-windows-msvc
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -106,6 +102,9 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/Cargo.toml
+        env:
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.target }}
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -148,6 +147,9 @@ jobs:
         run: |
           . .venv/bin/activate
           maturin develop --release -m bindings/python/Cargo.toml
+        env:
+          # Use prebuilt BoringSSL from repo
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu
       - name: Run tests
         run: |
           . .venv/bin/activate
