@@ -14,7 +14,7 @@ env:
 jobs:
   test:
     name: Test (macOS)
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +68,7 @@ jobs:
 
   build-linux:
     name: Build Linux (${{ matrix.target }})
-    runs-on: macos-latest
+    runs-on: macos-14
     strategy:
       matrix:
         target:
@@ -82,11 +82,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-zigbuild
+
       - name: Install zig
         run: brew install zig
-
-      - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild
 
       - name: Build
         run: |
@@ -95,7 +96,7 @@ jobs:
 
   build-windows:
     name: Build Windows (${{ matrix.target }})
-    runs-on: macos-latest
+    runs-on: macos-14
     strategy:
       matrix:
         target:
@@ -112,11 +113,14 @@ jobs:
       - name: Install LLVM
         run: brew install llvm
 
-      - name: Install cargo-xwin
-        run: cargo install cargo-xwin
+      - name: Add LLVM to PATH
+        run: echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
 
       - name: Build
         run: cargo xwin build --release --target ${{ matrix.target }} --lib
         env:
           BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.target }}
-          PATH: /opt/homebrew/opt/llvm/bin:$PATH

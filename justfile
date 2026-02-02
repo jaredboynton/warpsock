@@ -43,9 +43,13 @@ zigbuild target="aarch64-unknown-linux-gnu":
             WRAPPER_CC="$(pwd)/scripts/zig-cc-x86_64-linux-musl"
             WRAPPER_CXX="$(pwd)/scripts/zig-cxx-x86_64-linux-musl"
             ;;
+        aarch64-unknown-linux-musl)
+            WRAPPER_CC="$(pwd)/scripts/zig-cc-aarch64-linux-musl"
+            WRAPPER_CXX="$(pwd)/scripts/zig-cxx-aarch64-linux-musl"
+            ;;
         *)
             echo "Unsupported target: $TARGET"
-            echo "Supported targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl"
+            echo "Supported targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl"
             exit 1
             ;;
     esac

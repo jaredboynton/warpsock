@@ -45,6 +45,7 @@ ALL_TARGETS=(
     "x86_64-unknown-linux-gnu"
     "x86_64-unknown-linux-musl"
     "aarch64-unknown-linux-gnu"
+    "aarch64-unknown-linux-musl"
     "x86_64-pc-windows-msvc"
     "aarch64-pc-windows-msvc"
 )
@@ -152,9 +153,10 @@ build_linux_zig() {
     
     local zig_target
     case "$target" in
-        x86_64-unknown-linux-gnu)  zig_target="x86_64-linux-gnu" ;;
-        x86_64-unknown-linux-musl) zig_target="x86_64-linux-musl" ;;
-        aarch64-unknown-linux-gnu) zig_target="aarch64-linux-gnu" ;;
+        x86_64-unknown-linux-gnu)   zig_target="x86_64-linux-gnu" ;;
+        x86_64-unknown-linux-musl)  zig_target="x86_64-linux-musl" ;;
+        aarch64-unknown-linux-gnu)  zig_target="aarch64-linux-gnu" ;;
+        aarch64-unknown-linux-musl) zig_target="aarch64-linux-musl" ;;
     esac
     
     local src_dir="$boring_sys_dir/deps/boringssl"
@@ -286,13 +288,14 @@ OPTIONS:
     --clean         Remove build artifacts
 
 TARGETS:
-    aarch64-apple-darwin       macOS ARM64
-    x86_64-apple-darwin        macOS x86_64
-    x86_64-unknown-linux-gnu   Linux x86_64 (glibc)
-    x86_64-unknown-linux-musl  Linux x86_64 (musl)
-    aarch64-unknown-linux-gnu  Linux ARM64 (glibc)
-    x86_64-pc-windows-msvc     Windows x86_64
-    aarch64-pc-windows-msvc    Windows ARM64
+    aarch64-apple-darwin        macOS ARM64
+    x86_64-apple-darwin         macOS x86_64
+    x86_64-unknown-linux-gnu    Linux x86_64 (glibc)
+    x86_64-unknown-linux-musl   Linux x86_64 (musl)
+    aarch64-unknown-linux-gnu   Linux ARM64 (glibc)
+    aarch64-unknown-linux-musl  Linux ARM64 (musl)
+    x86_64-pc-windows-msvc      Windows x86_64
+    aarch64-pc-windows-msvc     Windows ARM64
 
 USAGE IN BUILD:
     export BORING_BSSL_PATH=$PWD/lib/boringssl/<target>
