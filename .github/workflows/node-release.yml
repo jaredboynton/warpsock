@@ -160,7 +160,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y cmake clang libclang-dev perl golang
+          apt-get install -y cmake clang libclang-dev perl golang musl-tools
 
       - name: Install dependencies
         run: |
@@ -173,6 +173,8 @@ jobs:
           npm run build -- --target x86_64-unknown-linux-musl
         env:
           CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
           # Use prebuilt BoringSSL from repo
           BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-musl
 
@@ -226,7 +228,7 @@ jobs:
     name: Publish to npm
     needs: [build, build-musl, test]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
       id-token: write
