@@ -13,116 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
-    steps:
-      - uses: actions/checkout@v4
-      # QEMU required for aarch64 builds on x86_64 runners
-      - name: Setup QEMU
-        if: matrix.target == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/python/Cargo.toml
-          manylinux: manylinux_2_28
-          before-script-linux: |
-            if command -v apk >/dev/null 2>&1; then
-              apk add --no-cache clang llvm-dev
-            elif command -v yum >/dev/null 2>&1; then
-              yum install -y clang llvm llvm-devel libclang || yum install -y clang llvm llvm-devel
-            else
-              apt-get update
-              apt-get install -y clang libclang-dev
-            fi
-            if command -v llvm-config >/dev/null 2>&1; then
-              export LIBCLANG_PATH="$(llvm-config --libdir)"
-            elif [ -d /usr/lib64/llvm ]; then
-              export LIBCLANG_PATH=/usr/lib64/llvm/lib
-            elif [ -d /usr/lib/llvm ]; then
-              export LIBCLANG_PATH=/usr/lib/llvm/lib
-            fi
-            echo "LIBCLANG_PATH=${LIBCLANG_PATH:-unset}"
-          # Use prebuilt BoringSSL from repo (path is /io inside Docker container)
-          docker-options: -e BORING_BSSL_PATH=/io/lib/boringssl/${{ matrix.target }}-unknown-linux-gnu
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-${{ matrix.target }}
-          path: dist/*.whl
-
-  musllinux:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
-    steps:
-      - uses: actions/checkout@v4
-      # QEMU required for aarch64 builds on x86_64 runners
-      - name: Setup QEMU
-        if: matrix.target == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/python/Cargo.toml
-          manylinux: musllinux_1_2
-          before-script-linux: |
-            if command -v apk >/dev/null 2>&1; then
-              apk add --no-cache clang llvm-dev
-            elif command -v yum >/dev/null 2>&1; then
-              yum install -y clang llvm llvm-devel libclang || yum install -y clang llvm llvm-devel
-            else
-              apt-get update
-              apt-get install -y clang libclang-dev
-            fi
-            if command -v llvm-config >/dev/null 2>&1; then
-              export LIBCLANG_PATH="$(llvm-config --libdir)"
-            elif [ -d /usr/lib64/llvm ]; then
-              export LIBCLANG_PATH=/usr/lib64/llvm/lib
-            elif [ -d /usr/lib/llvm ]; then
-              export LIBCLANG_PATH=/usr/lib/llvm/lib
-            fi
-            echo "LIBCLANG_PATH=${LIBCLANG_PATH:-unset}"
-          # Use prebuilt BoringSSL from repo (path is /io inside Docker container)
-          docker-options: -e BORING_BSSL_PATH=/io/lib/boringssl/${{ matrix.target }}-unknown-linux-musl
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-musllinux-${{ matrix.target }}
-          path: dist/*.whl
-
-  windows:
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        target: [x64]
-    steps:
-      - uses: actions/checkout@v4
-      
-      # Setup Python with correct architecture for the target
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          architecture: ${{ matrix.target }}
-      
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/python/Cargo.toml
-        env:
-          # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}\lib\boringssl\x86_64-pc-windows-msvc
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-${{ matrix.target }}
-          path: dist/*.whl
-
   macos:
     runs-on: macos-14
     strategy:
@@ -144,18 +34,13 @@ jobs:
           path: dist/*.whl
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist -m bindings/python/Cargo.toml
-          container: off
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
@@ -163,7 +48,7 @@ jobs:
           path: dist/*.tar.gz
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -171,8 +56,8 @@ jobs:
           python-version: '3.11'
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang libclang-dev
+          brew update
+          brew install cmake
       # maturin develop requires a virtualenv - create one explicitly
       - name: Create virtualenv and install deps
         run: |
@@ -186,7 +71,7 @@ jobs:
           maturin develop --release -m bindings/python/Cargo.toml
         env:
           # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/aarch64-apple-darwin
       - name: Run tests
         run: |
           . .venv/bin/activate
@@ -195,8 +80,8 @@ jobs:
 
   release:
     name: Release
-    runs-on: ubuntu-latest
-    needs: [linux, musllinux, windows, macos, sdist]
+    runs-on: macos-14
+    needs: [macos, sdist]
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       id-token: write

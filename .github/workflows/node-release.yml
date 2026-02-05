@@ -18,26 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          # Native builds
           - host: macos-14
             target: aarch64-apple-darwin
             build: npm run build
           - host: macos-14
             target: x86_64-apple-darwin
             build: npm run build -- --target x86_64-apple-darwin
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            build: npm run build
-          - host: windows-2022
-            target: x86_64-pc-windows-msvc
-            build: npm run build
-          # Cross-compilation with zig wrapper scripts (handles boring-sys/cmake)
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            build: npm run build -- --target aarch64-unknown-linux-gnu
-            cross: true
-            zig_target: aarch64-linux-gnu
-            libc_impl: glibc
     name: Build ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -60,34 +46,7 @@ jobs:
           cd bindings/node
           npm install
 
-      # Install zig for cross-compilation builds
-      - name: Install Zig
-        if: matrix.settings.cross
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Install cargo-zigbuild
-        if: matrix.settings.cross
-        run: cargo install cargo-zigbuild
-
-      # Make wrapper scripts executable
-      - name: Setup zig wrapper scripts
-        if: matrix.settings.cross
-        run: |
-          chmod +x scripts/zig-cc-${{ matrix.settings.zig_target }}
-          chmod +x scripts/zig-cxx-${{ matrix.settings.zig_target }}
-
-      # All Linux builds need cmake + clang for bindgen
-      - name: Install build tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang libclang-dev
-
-
-      - name: Build (native - Unix)
-        if: ${{ !matrix.settings.cross && runner.os != 'Windows' }}
+      - name: Build
         run: |
           cd bindings/node
           ${{ matrix.settings.build }}
@@ -97,46 +56,6 @@ jobs:
           BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.settings.target }}
           BORING_BSSL_INCLUDE_PATH: ${{ github.workspace }}/lib/boringssl/include
 
-      - name: Build (native - Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd bindings/node
-          npm run build
-        shell: pwsh
-        env:
-          # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}\lib\boringssl\x86_64-pc-windows-msvc
-
-      - name: Build (cross-compile with zig)
-        if: matrix.settings.cross
-        run: |
-          # Get zig's lib directory for sysroot paths
-          ZIG_LIB=$(zig env | grep lib_dir | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "ZIG_LIB=$ZIG_LIB"
-
-          # Set bindgen clang args with zig's sysroot for the target
-          # Include paths: target-specific, generic linux, generic libc, and libc implementation
-          BINDGEN_ARGS="--target=${{ matrix.settings.zig_target }}"
-          BINDGEN_ARGS="$BINDGEN_ARGS -isystem $ZIG_LIB/libc/include/${{ matrix.settings.zig_target }}"
-          BINDGEN_ARGS="$BINDGEN_ARGS -isystem $ZIG_LIB/libc/include/any-linux-any"
-          BINDGEN_ARGS="$BINDGEN_ARGS -isystem $ZIG_LIB/libc/include/generic-${{ matrix.settings.libc_impl }}"
-          BINDGEN_ARGS="$BINDGEN_ARGS -isystem $ZIG_LIB/libc/${{ matrix.settings.libc_impl }}/include"
-          export BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_ARGS"
-          echo "BINDGEN_EXTRA_CLANG_ARGS=$BINDGEN_EXTRA_CLANG_ARGS"
-
-          cd bindings/node
-          ${{ matrix.settings.build }}
-        env:
-          # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/${{ matrix.settings.target }}
-          # Use wrapper scripts that translate --target flag for cmake/boring-sys
-          CC: ${{ github.workspace }}/scripts/zig-cc-${{ matrix.settings.zig_target }}
-          CXX: ${{ github.workspace }}/scripts/zig-cxx-${{ matrix.settings.zig_target }}
-          CC_${{ matrix.settings.target }}: ${{ github.workspace }}/scripts/zig-cc-${{ matrix.settings.zig_target }}
-          CXX_${{ matrix.settings.target }}: ${{ github.workspace }}/scripts/zig-cxx-${{ matrix.settings.zig_target }}
-          AR_${{ matrix.settings.target }}: zig ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ github.workspace }}/scripts/zig-cc-aarch64-linux-gnu
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -144,50 +63,9 @@ jobs:
           path: bindings/node/*.node
           if-no-files-found: error
 
-  build-musl:
-    name: Build x86_64-unknown-linux-musl
-    runs-on: ubuntu-latest
-    container:
-      image: messense/rust-musl-cross:x86_64-musl
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        run: |
-          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-          apt-get install -y nodejs
-
-      - name: Install build tools
-        run: |
-          apt-get update
-          apt-get install -y cmake clang libclang-dev perl golang musl-tools
-
-      - name: Install dependencies
-        run: |
-          cd bindings/node
-          npm install
-
-      - name: Build
-        run: |
-          cd bindings/node
-          npm run build -- --target x86_64-unknown-linux-musl
-        env:
-          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-musl
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-x86_64-unknown-linux-musl
-          path: bindings/node/*.node
-          if-no-files-found: error
-
   test:
     name: Test bindings
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -201,11 +79,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang libclang-dev
-
       - name: Install dependencies
         run: |
           cd bindings/node
@@ -216,8 +89,9 @@ jobs:
           cd bindings/node
           npm run build:debug
         env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
           # Use prebuilt BoringSSL from repo
-          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/aarch64-apple-darwin
 
       - name: Test
         run: |
@@ -226,8 +100,8 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [build, build-musl, test]
-    runs-on: ubuntu-latest
+    needs: [build, test]
+    runs-on: macos-14
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
