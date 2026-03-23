@@ -1,5 +1,5 @@
 [package]
-name = "specter"
+name = "specters"
 version = "2.0.0"
 edition = "2021"
 license = "MIT"
@@ -9,6 +9,9 @@ keywords = ["http", "http3", "fingerprint", "tls", "boringssl"]
 categories = ["network-programming", "web-programming::http-client"]
 authors = ["Jared Boynton"]
 readme = "README.md"
+
+[lib]
+name = "specter"
 
 [dependencies]
 # TLS with BoringSSL

@@ -1126,7 +1126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "specter"
+name = "specters"
 version = "2.0.0"
 dependencies = [
  "base64",
