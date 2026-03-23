@@ -9,6 +9,15 @@ keywords = ["http", "http3", "fingerprint", "tls", "boringssl"]
 categories = ["network-programming", "web-programming::http-client"]
 authors = ["Jared Boynton"]
 readme = "README.md"
+exclude = [
+    "lib/boringssl/",
+    "bindings/",
+    "scripts/",
+    ".github/",
+    ".cargo/",
+    "examples/",
+    "justfile",
+]
 
 [lib]
 name = "specter"
