@@ -40,7 +40,12 @@ asyncio.run(main())
 ```python
 import specter
 
-# Impersonate Chrome 142
+# Impersonate Chrome 146 (current stable)
+client = (specter.Client.builder()
+    .fingerprint(specter.FingerprintProfile.Chrome146)
+    .build())
+
+# Or pick a specific version (142, 143, 144, 145, 146)
 client = (specter.Client.builder()
     .fingerprint(specter.FingerprintProfile.Chrome142)
     .build())

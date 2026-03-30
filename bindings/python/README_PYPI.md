@@ -11,7 +11,7 @@ pip install specters
 ## Features
 
 - HTTP/1.1, HTTP/2, and HTTP/3 support
-- Chrome 142 TLS fingerprint (BoringSSL)
+- Chrome 142-146 TLS fingerprint (BoringSSL)
 - Chrome HTTP/2 fingerprint (SETTINGS, pseudo-header order, GREASE)
 - Async/await interface
 - Cookie jar with Netscape format support
@@ -23,7 +23,7 @@ import asyncio
 from specter import Client, FingerprintProfile
 
 async def main():
-    client = Client(fingerprint=FingerprintProfile.Chrome142)
+    client = Client(fingerprint=FingerprintProfile.Chrome146)
 
     response = await client.get("https://example.com")
     print(f"Status: {response.status}")

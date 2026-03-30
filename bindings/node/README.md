@@ -40,7 +40,12 @@ main();
 ```javascript
 const { Client, FingerprintProfile } = require('@specter/client');
 
-// Impersonate Chrome 142
+// Impersonate Chrome 146 (current stable)
+const client = Client.builder()
+  .fingerprint(FingerprintProfile.Chrome146)
+  .build();
+
+// Or pick a specific version (142, 143, 144, 145, 146)
 const client = Client.builder()
   .fingerprint(FingerprintProfile.Chrome142)
   .build();
