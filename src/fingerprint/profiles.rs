@@ -11,6 +11,7 @@ use super::tls::TlsFingerprint;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FingerprintProfile {
     /// Chrome 142 on macOS
+    #[default]
     Chrome142,
     /// Chrome 143 on macOS
     Chrome143,
@@ -19,7 +20,6 @@ pub enum FingerprintProfile {
     /// Chrome 145 on macOS
     Chrome145,
     /// Chrome 146 on macOS (current stable, March 2026)
-    #[default]
     Chrome146,
     /// Firefox 133 on macOS - basic fingerprint (cipher suites, curves, sigalgs)
     /// TLS extension order is randomized by Firefox, so this fingerprint
