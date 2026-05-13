@@ -1,7 +1,7 @@
 {
   "name": "specters",
-  "version": "2.2.0",
-  "description": "Node.js bindings for Specter HTTP client with TLS/HTTP2/HTTP3 fingerprint control",
+  "version": "3.0.0",
+  "description": "Node.js bindings for Specter HTTP, WebSocket, HTTP/2, and HTTP/3 tunnel client",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
@@ -29,11 +29,16 @@
     "artifacts": "napi artifacts --output-dir ./artifacts",
     "test": "jest"
   },
+  "jest": {
+    "testMatch": [
+      "**/__tests__/*.test.js"
+    ]
+  },
   "optionalDependencies": {
-    "specters-darwin-x64": "2.2.0",
-    "specters-darwin-arm64": "2.2.0",
-    "specters-linux-x64-gnu": "2.2.0",
-    "specters-linux-arm64-gnu": "2.2.0"
+    "specters-darwin-x64": "3.0.0",
+    "specters-darwin-arm64": "3.0.0",
+    "specters-linux-x64-gnu": "3.0.0",
+    "specters-linux-arm64-gnu": "3.0.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.2",

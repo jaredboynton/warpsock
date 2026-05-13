@@ -13,7 +13,7 @@ Basic usage:
     ...     client = specter.Client.builder().build()
     ...     
     ...     # Simple GET request
-    ...     response = await client.get("https://httpbin.org/get").send()
+    ...     response = await client.get("https://example.com/").send()
     ...     print(f"Status: {response.status}")
     ...     print(await response.text())
     ...
@@ -29,11 +29,11 @@ With headers and body:
     ...     request.json('{"name": "test"}')
     ...     response = await request.send()
     ...     
-    ...     # Or chain the calls
-    ...     response = await (client.post("https://api.example.com/data")
-    ...         .header("Authorization", "Bearer token")
-    ...         .json('{"name": "test"}')
-    ...         .send())
+    ...     # Or reuse the request object
+    ...     request = client.post("https://api.example.com/data")
+    ...     request.header("Authorization", "Bearer token")
+    ...     request.json('{"name": "test"}')
+    ...     response = await request.send()
     ...
     >>> asyncio.run(main())
 
@@ -57,19 +57,65 @@ from .specter import (
     RequestBuilder,
     Response,
     CookieJar,
+    CloseFrame,
+    WebSocketMessage,
+    WebSocketBuilder,
+    WebSocket,
+    WebSocketH2Builder,
+    WebSocketH2Tunnel,
+    H2TunnelEvent,
+    WebSocketH3Builder,
+    WebSocketH3Tunnel,
+    H3TunnelEvent,
     FingerprintProfile,
     HttpVersion,
     Timeouts,
+    CLOSE_NORMAL,
+    CLOSE_GOING_AWAY,
+    CLOSE_PROTOCOL_ERROR,
+    CLOSE_UNSUPPORTED,
+    CLOSE_NO_STATUS,
+    CLOSE_ABNORMAL,
+    CLOSE_INVALID_PAYLOAD,
+    CLOSE_POLICY_VIOLATION,
+    CLOSE_MESSAGE_TOO_BIG,
+    CLOSE_MANDATORY_EXTENSION,
+    CLOSE_INTERNAL_ERROR,
+    CLOSE_TLS_ERROR,
+    is_valid_close_code,
 )
 
-__version__ = "1.2.0"
+__version__ = "3.0.0"
 __all__ = [
     "Client",
     "ClientBuilder",
     "RequestBuilder",
     "Response",
     "CookieJar",
+    "CloseFrame",
+    "WebSocketMessage",
+    "WebSocketBuilder",
+    "WebSocket",
+    "WebSocketH2Builder",
+    "WebSocketH2Tunnel",
+    "H2TunnelEvent",
+    "WebSocketH3Builder",
+    "WebSocketH3Tunnel",
+    "H3TunnelEvent",
     "FingerprintProfile",
     "HttpVersion",
     "Timeouts",
+    "CLOSE_NORMAL",
+    "CLOSE_GOING_AWAY",
+    "CLOSE_PROTOCOL_ERROR",
+    "CLOSE_UNSUPPORTED",
+    "CLOSE_NO_STATUS",
+    "CLOSE_ABNORMAL",
+    "CLOSE_INVALID_PAYLOAD",
+    "CLOSE_POLICY_VIOLATION",
+    "CLOSE_MESSAGE_TOO_BIG",
+    "CLOSE_MANDATORY_EXTENSION",
+    "CLOSE_INTERNAL_ERROR",
+    "CLOSE_TLS_ERROR",
+    "is_valid_close_code",
 ]

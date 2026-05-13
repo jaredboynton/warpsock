@@ -10,7 +10,7 @@ Supported Chrome fingerprints: **142, 143, 144, 145, 146** (current stable). Fir
 
 ```toml
 [dependencies]
-specter = "2.2"
+specter = "2.3"
 ```
 
 ## Usage
@@ -179,6 +179,8 @@ while let Some(message) = ws.next().await? {
 
 For `wss://`, the RFC 6455 path advertises HTTP/1.1 only via ALPN so the opening handshake stays an HTTP/1.1 Upgrade. Cookie lookup and `Set-Cookie` storage use the equivalent `http://` or `https://` URL, so existing `CookieJar` policy applies to WebSocket handshakes.
 
+Node and Python bindings expose the same RFC 6455 API shape through `client.websocket(...)`, with RFC 6455 messages represented as typed text, binary, ping, pong, and close objects.
+
 Specter also exposes RFC 8441 Extended CONNECT for WebSocket-over-HTTP/2 when the peer advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`:
 
 ```rust
@@ -192,6 +194,8 @@ let mut tunnel = client
 
 tunnel.send_bytes(Bytes::from_static(b"raw websocket bytes"), false).await?;
 ```
+
+Node and Python bindings expose RFC 8441 separately as `client.websocketH2(...)` and `client.websocket_h2(...)` raw byte tunnels so framed WebSocket behavior is not mixed with Extended CONNECT streams.
 
 The RFC 8441 API is a byte tunnel. Use it when you need H2 Extended CONNECT semantics directly; use `client.websocket(...)` for the full RFC 6455 frame/message client.
 

@@ -6,7 +6,14 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
+
+mod websocket;
+mod websocket_h2;
+mod websocket_h3;
+mod ws_types;
 
 // Re-export specter types - use ::specter to disambiguate
 use ::specter::{
@@ -18,7 +25,7 @@ use ::specter::{
 /// Node.js wrapper for Specter HTTP client.
 #[napi]
 pub struct Client {
-    inner: RustClient,
+    pub(crate) inner: RustClient,
 }
 
 /// Node.js wrapper for ClientBuilder.
@@ -46,7 +53,7 @@ pub struct Response {
 /// Node.js wrapper for CookieJar.
 #[napi]
 pub struct CookieJar {
-    inner: RustCookieJar,
+    pub(crate) inner: Arc<RwLock<RustCookieJar>>,
 }
 
 /// Browser fingerprint profiles for impersonation.
@@ -131,6 +138,24 @@ pub fn client_builder() -> ClientBuilder {
 
 #[napi]
 impl Client {
+    /// Create an RFC 6455 WebSocket connection builder.
+    #[napi]
+    pub fn websocket(&self, url: String) -> websocket::WebSocketBuilder {
+        websocket::builder_for_client(self, url)
+    }
+
+    /// Create an RFC 8441 WebSocket-over-HTTP/2 tunnel builder.
+    #[napi]
+    pub fn websocket_h2(&self, url: String) -> websocket_h2::WebSocketH2Builder {
+        websocket_h2::builder_for_client(self, url)
+    }
+
+    /// Create an RFC 9220 WebSocket-over-HTTP/3 tunnel builder.
+    #[napi]
+    pub fn websocket_h3(&self, url: String) -> websocket_h3::WebSocketH3Builder {
+        websocket_h3::builder_for_client(self, url)
+    }
+
     /// Create a GET request builder.
     #[napi]
     pub fn get(&self, url: String) -> RequestBuilder {
@@ -368,6 +393,33 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable HTTP/2 prior knowledge for cleartext HTTP/2 endpoints.
+    #[napi]
+    pub fn http2_prior_knowledge(&mut self, enabled: bool) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.http2_prior_knowledge(enabled));
+        }
+        self
+    }
+
+    /// Enable or disable an internal shared cookie store.
+    #[napi]
+    pub fn cookie_store(&mut self, enabled: bool) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.cookie_store(enabled));
+        }
+        self
+    }
+
+    /// Use a caller-provided cookie jar shared with this binding object.
+    #[napi]
+    pub fn cookie_jar(&mut self, jar: &CookieJar) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.cookie_jar(jar.inner.clone()));
+        }
+        self
+    }
+
     /// Enable or disable automatic HTTP/3 upgrade via Alt-Svc headers.
     #[napi]
     pub fn h3_upgrade(&mut self, enabled: bool) -> &Self {
@@ -585,20 +637,28 @@ impl CookieJar {
     #[napi(constructor)]
     pub fn new() -> Self {
         Self {
-            inner: RustCookieJar::new(),
+            inner: Arc::new(RwLock::new(RustCookieJar::new())),
         }
     }
 
     /// Get the number of cookies in the jar.
     #[napi(getter)]
-    pub fn length(&self) -> u32 {
-        self.inner.len() as u32
+    pub fn length(&self) -> Result<u32> {
+        Ok(self
+            .inner
+            .try_read()
+            .map_err(|_| Error::new(Status::GenericFailure, "CookieJar is currently locked"))?
+            .len() as u32)
     }
 
     /// Check if the cookie jar is empty.
     #[napi(getter)]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self
+            .inner
+            .try_read()
+            .map_err(|_| Error::new(Status::GenericFailure, "CookieJar is currently locked"))?
+            .is_empty())
     }
 }
 
@@ -628,6 +688,6 @@ pub fn timeouts_streaming_defaults() -> Timeouts {
 }
 
 /// Convert a specter Error to a napi Error.
-fn to_napi_err(e: RustError) -> Error {
+pub(crate) fn to_napi_err(e: RustError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
 }

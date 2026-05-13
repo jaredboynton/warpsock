@@ -8,7 +8,7 @@
 const { execSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
 
-const PACKAGE_VERSION = '2.2.0';
+const PACKAGE_VERSION = '3.0.0';
 
 const targets = {
   'darwin-x64': {
@@ -131,9 +131,29 @@ module.exports.ClientBuilder = binding.ClientBuilder;
 module.exports.RequestBuilder = binding.RequestBuilder;
 module.exports.Response = binding.Response;
 module.exports.CookieJar = binding.CookieJar;
+module.exports.WebSocketBuilder = binding.WebSocketBuilder;
+module.exports.WebSocket = binding.WebSocket;
+module.exports.WebSocketH2Builder = binding.WebSocketH2Builder;
+module.exports.WebSocketH2Tunnel = binding.WebSocketH2Tunnel;
+module.exports.WebSocketH3Builder = binding.WebSocketH3Builder;
+module.exports.WebSocketH3Tunnel = binding.WebSocketH3Tunnel;
+module.exports.WebSocketCloseFrame = binding.WebSocketCloseFrame;
 module.exports.FingerprintProfile = binding.FingerprintProfile;
 module.exports.HttpVersion = binding.HttpVersion;
 module.exports.Timeouts = binding.Timeouts;
+module.exports.CLOSE_NORMAL = binding.CLOSE_NORMAL;
+module.exports.CLOSE_GOING_AWAY = binding.CLOSE_GOING_AWAY;
+module.exports.CLOSE_PROTOCOL_ERROR = binding.CLOSE_PROTOCOL_ERROR;
+module.exports.CLOSE_UNSUPPORTED = binding.CLOSE_UNSUPPORTED;
+module.exports.CLOSE_NO_STATUS = binding.CLOSE_NO_STATUS;
+module.exports.CLOSE_ABNORMAL = binding.CLOSE_ABNORMAL;
+module.exports.CLOSE_INVALID_PAYLOAD = binding.CLOSE_INVALID_PAYLOAD;
+module.exports.CLOSE_POLICY_VIOLATION = binding.CLOSE_POLICY_VIOLATION;
+module.exports.CLOSE_MESSAGE_TOO_BIG = binding.CLOSE_MESSAGE_TOO_BIG;
+module.exports.CLOSE_MANDATORY_EXTENSION = binding.CLOSE_MANDATORY_EXTENSION;
+module.exports.CLOSE_INTERNAL_ERROR = binding.CLOSE_INTERNAL_ERROR;
+module.exports.CLOSE_TLS_ERROR = binding.CLOSE_TLS_ERROR;
+module.exports.isValidCloseCode = binding.isValidCloseCode;
 module.exports.clientBuilder = binding.clientBuilder;
 module.exports.timeoutsApiDefaults = binding.timeoutsApiDefaults;
 module.exports.timeoutsStreamingDefaults = binding.timeoutsStreamingDefaults;

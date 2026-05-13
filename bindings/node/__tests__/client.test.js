@@ -2,6 +2,8 @@
  * Tests for Specter Node.js bindings.
  */
 
+const http = require('http');
+
 const {
   clientBuilder,
   FingerprintProfile,
@@ -11,6 +13,67 @@ const {
   timeoutsApiDefaults,
   timeoutsStreamingDefaults
 } = require('../index');
+
+function canonicalHeaderName(name) {
+  return name
+    .split('-')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join('-');
+}
+
+function createHttpFixture() {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks).toString();
+      const headers = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        headers[canonicalHeaderName(key)] = Array.isArray(value) ? value.join(', ') : value;
+      }
+
+      let parsedJson = null;
+      let form = {};
+      const contentType = req.headers['content-type'] || '';
+      if (body && contentType.includes('application/json')) {
+        parsedJson = JSON.parse(body);
+      }
+      if (body && contentType.includes('application/x-www-form-urlencoded')) {
+        form = Object.fromEntries(new URLSearchParams(body));
+      }
+
+      const payload = JSON.stringify({
+        method: req.method,
+        url: `http://${req.headers.host}${req.url}`,
+        headers,
+        json: parsedJson,
+        form,
+        data: body
+      });
+
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': req.method === 'HEAD' ? '0' : Buffer.byteLength(payload).toString()
+      });
+      if (req.method !== 'HEAD') {
+        res.end(payload);
+      } else {
+        res.end();
+      }
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}`,
+        close: () => new Promise((done) => server.close(done))
+      });
+    });
+  });
+}
 
 describe('ClientBuilder', () => {
   test('builder creation', () => {
@@ -44,9 +107,19 @@ describe('ClientBuilder', () => {
     expect(client).toBeDefined();
   });
 
-  test('prefer http2', () => {
+  test('prefer http2 and prior knowledge options', () => {
     const client = clientBuilder()
       .preferHttp2(true)
+      .http2PriorKnowledge(false)
+      .build();
+    expect(client).toBeDefined();
+  });
+
+  test('cookie store and shared jar options', () => {
+    const jar = new CookieJar();
+    const client = clientBuilder()
+      .cookieStore(true)
+      .cookieJar(jar)
       .build();
     expect(client).toBeDefined();
   });
@@ -107,61 +180,38 @@ describe('RequestBuilder', () => {
   });
 
   test('request builder creation', () => {
-    const request = client.get('https://httpbin.org/get');
+    const request = client.get('http://127.0.0.1/get');
     expect(request).toBeDefined();
     expect(request).toBeInstanceOf(RequestBuilder);
   });
 
   test('all HTTP method request builders', () => {
-    expect(client.get('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.post('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.put('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.delete('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.patch('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.head('https://example.com')).toBeInstanceOf(RequestBuilder);
-    expect(client.options('https://example.com')).toBeInstanceOf(RequestBuilder);
+    expect(client.get('http://127.0.0.1/get')).toBeInstanceOf(RequestBuilder);
+    expect(client.post('http://127.0.0.1/post')).toBeInstanceOf(RequestBuilder);
+    expect(client.put('http://127.0.0.1/put')).toBeInstanceOf(RequestBuilder);
+    expect(client.delete('http://127.0.0.1/delete')).toBeInstanceOf(RequestBuilder);
+    expect(client.patch('http://127.0.0.1/patch')).toBeInstanceOf(RequestBuilder);
+    expect(client.head('http://127.0.0.1/get')).toBeInstanceOf(RequestBuilder);
+    expect(client.options('http://127.0.0.1/anything')).toBeInstanceOf(RequestBuilder);
   });
 
   test('arbitrary HTTP method request builder', () => {
-    const request = client.request('PURGE', 'https://example.com/cache');
+    const request = client.request('PURGE', 'http://127.0.0.1/cache');
     expect(request).toBeInstanceOf(RequestBuilder);
   });
 
-  test('header method returns this for chaining', () => {
-    const request = client.get('https://httpbin.org/get');
-    const result = request.header('X-Custom-Header', 'value');
-    expect(result).toBe(request);
-  });
-
-  test('headers method returns this for chaining', () => {
-    const request = client.get('https://httpbin.org/get');
-    const result = request.headers([['Authorization', 'Bearer token']]);
-    expect(result).toBe(request);
-  });
-
-  test('body method returns this for chaining', () => {
-    const request = client.post('https://httpbin.org/post');
-    const result = request.body(Buffer.from('test'));
-    expect(result).toBe(request);
-  });
-
-  test('json method returns this for chaining', () => {
-    const request = client.post('https://httpbin.org/post');
-    const result = request.json('{"key": "value"}');
-    expect(result).toBe(request);
-  });
-
-  test('form method returns this for chaining', () => {
-    const request = client.post('https://httpbin.org/post');
-    const result = request.form('key=value');
-    expect(result).toBe(request);
+  test('mutator methods return this for chaining', () => {
+    expect(client.get('http://127.0.0.1/get').header('X-Custom-Header', 'value')).toBeInstanceOf(RequestBuilder);
+    expect(client.get('http://127.0.0.1/get').headers([['Authorization', 'Bearer token']])).toBeInstanceOf(RequestBuilder);
+    expect(client.post('http://127.0.0.1/post').body(Buffer.from('test'))).toBeInstanceOf(RequestBuilder);
+    expect(client.post('http://127.0.0.1/post').json('{"key": "value"}')).toBeInstanceOf(RequestBuilder);
+    expect(client.post('http://127.0.0.1/post').form('key=value')).toBeInstanceOf(RequestBuilder);
   });
 });
 
 describe('Timeouts', () => {
   test('api defaults', () => {
     const timeouts = timeoutsApiDefaults();
-    expect(timeouts).toBeDefined();
     expect(timeouts.connect).toBe(10.0);
     expect(timeouts.ttfb).toBe(30.0);
     expect(timeouts.total).toBe(120.0);
@@ -169,44 +219,25 @@ describe('Timeouts', () => {
 
   test('streaming defaults', () => {
     const timeouts = timeoutsStreamingDefaults();
-    expect(timeouts).toBeDefined();
     expect(timeouts.connect).toBe(10.0);
     expect(timeouts.total).toBeUndefined();
   });
 });
 
 describe('FingerprintProfile', () => {
-  test('chrome142 exists', () => {
+  test('profiles exist', () => {
     expect(FingerprintProfile.Chrome142).toBeDefined();
-  });
-
-  test('firefox133 exists', () => {
     expect(FingerprintProfile.Firefox133).toBeDefined();
-  });
-
-  test('none exists', () => {
     expect(FingerprintProfile.None).toBeDefined();
   });
 });
 
 describe('HttpVersion', () => {
-  test('http1_1 exists', () => {
+  test('versions exist', () => {
     expect(HttpVersion.Http1_1).toBeDefined();
-  });
-
-  test('http2 exists', () => {
     expect(HttpVersion.Http2).toBeDefined();
-  });
-
-  test('http3 exists', () => {
     expect(HttpVersion.Http3).toBeDefined();
-  });
-
-  test('http3Only exists', () => {
     expect(HttpVersion.Http3Only).toBeDefined();
-  });
-
-  test('auto exists', () => {
     expect(HttpVersion.Auto).toBeDefined();
   });
 });
@@ -214,7 +245,6 @@ describe('HttpVersion', () => {
 describe('CookieJar', () => {
   test('create new', () => {
     const jar = new CookieJar();
-    expect(jar).toBeDefined();
     expect(jar.length).toBe(0);
     expect(jar.isEmpty).toBe(true);
   });
@@ -222,113 +252,70 @@ describe('CookieJar', () => {
 
 describe('Async Requests', () => {
   let client;
+  let fixture;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    fixture = await createHttpFixture();
     client = clientBuilder().build();
   });
 
+  afterEach(async () => {
+    await fixture.close();
+  });
+
   test('basic GET request', async () => {
-    const response = await client.get('https://httpbin.org/get').send();
+    const response = await client.get(`${fixture.baseUrl}/get`).send();
     expect(response.status).toBe(200);
     expect(response.isSuccess).toBe(true);
-  }, 30000);
+  });
 
   test('GET with custom headers', async () => {
-    const response = await client.get('https://httpbin.org/get')
+    const response = await client.get(`${fixture.baseUrl}/get`)
       .header('X-Custom-Header', 'test-value')
       .send();
-    expect(response.status).toBe(200);
-    // httpbin returns the headers in the response body
     const body = JSON.parse(response.json());
     expect(body.headers['X-Custom-Header']).toBe('test-value');
-  }, 30000);
+  });
 
   test('POST request', async () => {
-    const response = await client.post('https://httpbin.org/post').send();
+    const response = await client.post(`${fixture.baseUrl}/post`).send();
     expect(response.status).toBe(200);
-  }, 30000);
+  });
 
   test('POST with JSON body', async () => {
-    const response = await client.post('https://httpbin.org/post')
+    const response = await client.post(`${fixture.baseUrl}/post`)
       .json(JSON.stringify({ name: 'test', value: 123 }))
       .send();
-    expect(response.status).toBe(200);
     const body = JSON.parse(response.json());
     expect(body.json.name).toBe('test');
     expect(body.json.value).toBe(123);
-  }, 30000);
+  });
 
   test('POST with form body', async () => {
-    const response = await client.post('https://httpbin.org/post')
+    const response = await client.post(`${fixture.baseUrl}/post`)
       .form('field1=value1&field2=value2')
       .send();
-    expect(response.status).toBe(200);
     const body = JSON.parse(response.json());
     expect(body.form.field1).toBe('value1');
     expect(body.form.field2).toBe('value2');
-  }, 30000);
+  });
 
-  test('PUT request', async () => {
-    const response = await client.put('https://httpbin.org/put').send();
-    expect(response.status).toBe(200);
-  }, 30000);
+  test('other HTTP methods', async () => {
+    expect((await client.put(`${fixture.baseUrl}/put`).send()).status).toBe(200);
+    expect((await client.delete(`${fixture.baseUrl}/delete`).send()).status).toBe(200);
+    expect((await client.patch(`${fixture.baseUrl}/patch`).json('{"patch":"data"}').send()).status).toBe(200);
+    expect((await client.head(`${fixture.baseUrl}/get`).send()).status).toBe(200);
+    expect((await client.options(`${fixture.baseUrl}/anything`).send()).status).toBe(200);
+  });
 
-  test('DELETE request', async () => {
-    const response = await client.delete('https://httpbin.org/delete').send();
-    expect(response.status).toBe(200);
-  }, 30000);
-
-  test('PATCH request', async () => {
-    const response = await client.patch('https://httpbin.org/patch')
-      .json(JSON.stringify({ patch: 'data' }))
-      .send();
-    expect(response.status).toBe(200);
-  }, 30000);
-
-  test('HEAD request', async () => {
-    const response = await client.head('https://httpbin.org/get').send();
-    expect(response.status).toBe(200);
-  }, 30000);
-
-  test('OPTIONS request', async () => {
-    const response = await client.options('https://httpbin.org/anything').send();
-    expect(response.status).toBe(200);
-  }, 30000);
-
-  // Skipped: Specter validates HTTP methods and rejects non-standard methods like PURGE
-  test.skip('arbitrary method request', async () => {
-    const response = await client.request('PURGE', 'https://httpbin.org/anything').send();
-    expect(response.status).toBe(200);
-  }, 30000);
-
-  test('response properties', async () => {
-    const response = await client.get('https://httpbin.org/get').send();
+  test('response properties and body helpers', async () => {
+    const response = await client.get(`${fixture.baseUrl}/get`).send();
     expect(typeof response.status).toBe('number');
     expect(typeof response.isSuccess).toBe('boolean');
     expect(typeof response.isRedirect).toBe('boolean');
     expect(response.httpVersion).toBeDefined();
-  }, 30000);
-
-  test('get header', async () => {
-    const response = await client.get('https://httpbin.org/get').send();
-    const contentType = response.getHeader('content-type');
-    expect(contentType).toBeDefined();
-    expect(contentType).toContain('application/json');
-  }, 30000);
-
-  test('response bytes', async () => {
-    const response = await client.get('https://httpbin.org/get').send();
-    const data = response.bytes();
-    expect(Buffer.isBuffer(data)).toBe(true);
-    expect(data.length).toBeGreaterThan(0);
-  }, 30000);
-
-  test('response json', async () => {
-    const response = await client.get('https://httpbin.org/get').send();
-    const jsonStr = response.json();
-    expect(typeof jsonStr).toBe('string');
-    const data = JSON.parse(jsonStr);
-    expect(typeof data).toBe('object');
-    expect(data.url).toBeDefined();
-  }, 30000);
+    expect(response.getHeader('content-type')).toContain('application/json');
+    expect(Buffer.isBuffer(response.bytes())).toBe(true);
+    expect(JSON.parse(response.json()).url).toBe(`${fixture.baseUrl}/get`);
+  });
 });

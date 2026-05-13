@@ -14,21 +14,21 @@ Example:
     ...     client = builder.build()
     ...     
     ...     # Simple GET request
-    ...     response = await client.get("https://httpbin.org/get").send()
+    ...     response = await client.get("https://example.com/").send()
     ...     print(response.status)
     ...     
     ...     # POST with JSON body
-    ...     response = await (client.post("https://httpbin.org/post")
-    ...         .header("X-Custom-Header", "value")
-    ...         .json('{"key": "value"}')
-    ...         .send())
+    ...     request = client.post("https://example.com/items")
+    ...     request.header("X-Custom-Header", "value")
+    ...     request.json('{"key": "value"}')
+    ...     response = await request.send()
     ...     print(await response.json())
     ...
     >>> asyncio.run(main())
 """
 
 from enum import Enum
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 class FingerprintProfile(Enum):
     """Browser fingerprint profiles for impersonation."""
@@ -120,6 +120,18 @@ class ClientBuilder:
     
     def read_timeout(self, timeout_secs: float) -> None:
         """Set read idle timeout in seconds."""
+        ...
+
+    def cookie_store(self, enabled: bool) -> None:
+        """Enable or disable the client's internal cookie store."""
+        ...
+
+    def cookie_jar(self, jar: "CookieJar") -> None:
+        """Attach a live shared cookie jar."""
+        ...
+
+    def http2_prior_knowledge(self, enabled: bool) -> None:
+        """Force HTTP/2 prior knowledge for origins that support h2c or direct H2."""
         ...
     
     def danger_accept_invalid_certs(self, accept: bool) -> None:
@@ -214,6 +226,18 @@ class Client:
         """Create a request builder for an arbitrary HTTP method."""
         ...
 
+    def websocket(self, url: str) -> "WebSocketBuilder":
+        """Create an RFC 6455 framed WebSocket builder."""
+        ...
+
+    def websocket_h2(self, url: str) -> "WebSocketH2Builder":
+        """Create an RFC 8441 Extended CONNECT raw tunnel builder."""
+        ...
+
+    def websocket_h3(self, url: str) -> "WebSocketH3Builder":
+        """Create an RFC 9220 Extended CONNECT raw HTTP/3 tunnel builder."""
+        ...
+
 class Response:
     """HTTP response with decompression support."""
     
@@ -286,3 +310,148 @@ class CookieJar:
     
     @property
     def is_empty(self) -> bool: ...
+
+class CloseFrame:
+    """RFC 6455 close frame."""
+
+    def __init__(self, code: int = 1000, reason: str = "") -> None: ...
+
+    @property
+    def code(self) -> int: ...
+
+    @property
+    def reason(self) -> str: ...
+
+class WebSocketMessage:
+    """RFC 6455 WebSocket message."""
+
+    def __init__(
+        self,
+        kind: Literal["text", "binary", "ping", "pong", "close"],
+        text: Optional[str] = None,
+        data: Optional[bytes] = None,
+        code: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> None: ...
+
+    @property
+    def kind(self) -> Literal["text", "binary", "ping", "pong", "close"]: ...
+
+    @property
+    def text(self) -> Optional[str]: ...
+
+    @property
+    def data(self) -> Optional[bytes]: ...
+
+    @property
+    def code(self) -> Optional[int]: ...
+
+    @property
+    def reason(self) -> Optional[str]: ...
+
+class WebSocketBuilder:
+    """Builder for RFC 6455 framed WebSocket connections."""
+
+    def header(self, key: str, value: str) -> None: ...
+    def headers(self, headers: Sequence[Tuple[str, str]]) -> None: ...
+    def subprotocol(self, protocol: str) -> None: ...
+    def subprotocols(self, protocols: Sequence[str]) -> None: ...
+    def max_message_size(self, bytes: int) -> None: ...
+    def max_frame_size(self, bytes: int) -> None: ...
+    def connect_timeout(self, timeout_secs: float) -> None: ...
+    def handshake_timeout(self, timeout_secs: float) -> None: ...
+    def read_timeout(self, timeout_secs: float) -> None: ...
+    def write_timeout(self, timeout_secs: float) -> None: ...
+    async def connect(self) -> "WebSocket": ...
+
+class WebSocket:
+    """RFC 6455 framed WebSocket connection. Operations are serialized per socket."""
+
+    @property
+    def url(self) -> str: ...
+
+    @property
+    def protocol(self) -> Optional[str]: ...
+
+    async def send(self, message: WebSocketMessage) -> None: ...
+    async def send_text(self, text: str) -> None: ...
+    async def send_binary(self, data: bytes) -> None: ...
+    async def send_ping(self, data: bytes = b"") -> None: ...
+    async def send_pong(self, data: bytes = b"") -> None: ...
+    async def next(self) -> WebSocketMessage: ...
+    async def close(self, frame: Optional[CloseFrame] = None) -> None: ...
+
+class H2TunnelEvent:
+    """RFC 8441 raw tunnel event."""
+
+    @property
+    def kind(self) -> Literal["data", "end_stream", "reset", "goaway", "error"]: ...
+
+    @property
+    def data(self) -> Optional[bytes]: ...
+
+    @property
+    def error(self) -> Optional[str]: ...
+
+    @property
+    def last_stream_id(self) -> Optional[int]: ...
+
+class WebSocketH2Builder:
+    """Builder for RFC 8441 Extended CONNECT raw HTTP/2 tunnels."""
+
+    def header(self, key: str, value: str) -> None: ...
+    def headers(self, headers: Sequence[Tuple[str, str]]) -> None: ...
+    async def connect(self) -> "WebSocketH2Tunnel": ...
+
+class WebSocketH2Tunnel:
+    """RFC 8441 raw byte tunnel. Use one active receive loop per tunnel."""
+
+    async def send_bytes(self, data: bytes, end_stream: bool = False) -> None: ...
+    async def recv_bytes(self) -> Optional[bytes]: ...
+    async def recv_event(self) -> Optional[H2TunnelEvent]: ...
+    async def close_send(self) -> None: ...
+
+class H3TunnelEvent:
+    """RFC 9220 raw HTTP/3 tunnel event."""
+
+    @property
+    def kind(self) -> Literal["data", "end_stream", "reset", "goaway", "error"]: ...
+
+    @property
+    def data(self) -> Optional[bytes]: ...
+
+    @property
+    def error(self) -> Optional[str]: ...
+
+    @property
+    def last_stream_id(self) -> Optional[int]: ...
+
+class WebSocketH3Builder:
+    """Builder for RFC 9220 Extended CONNECT raw HTTP/3 tunnels."""
+
+    def header(self, key: str, value: str) -> None: ...
+    def headers(self, headers: Sequence[Tuple[str, str]]) -> None: ...
+    async def connect(self) -> "WebSocketH3Tunnel": ...
+
+class WebSocketH3Tunnel:
+    """RFC 9220 raw byte tunnel. Use one active receive loop per tunnel."""
+
+    async def send_bytes(self, data: bytes, end_stream: bool = False) -> None: ...
+    async def recv_bytes(self) -> Optional[bytes]: ...
+    async def recv_event(self) -> Optional[H3TunnelEvent]: ...
+    async def close_send(self) -> None: ...
+
+CLOSE_NORMAL: int
+CLOSE_GOING_AWAY: int
+CLOSE_PROTOCOL_ERROR: int
+CLOSE_UNSUPPORTED: int
+CLOSE_NO_STATUS: int
+CLOSE_ABNORMAL: int
+CLOSE_INVALID_PAYLOAD: int
+CLOSE_POLICY_VIOLATION: int
+CLOSE_MESSAGE_TOO_BIG: int
+CLOSE_MANDATORY_EXTENSION: int
+CLOSE_INTERNAL_ERROR: int
+CLOSE_TLS_ERROR: int
+
+def is_valid_close_code(code: int) -> bool: ...

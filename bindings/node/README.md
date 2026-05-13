@@ -1,161 +1,95 @@
 # Specter Node.js Bindings
 
-Node.js bindings for Specter, a high-performance HTTP client with full TLS, HTTP/2, and HTTP/3 fingerprint control.
+Node.js bindings for Specter, a high-performance async HTTP client with TLS, HTTP/2, HTTP/3, RFC 6455 WebSocket, and RFC 8441 Extended CONNECT support.
 
 ## Features
 
-- **Native async/await**: Promise-based API with native performance
-- **Browser fingerprinting**: Impersonate Chrome, Firefox, or use custom TLS/HTTP2 settings
-- **HTTP/3 support**: Automatic upgrade via Alt-Svc headers
-- **Connection pooling**: HTTP/2 multiplexing and HTTP/1.1 keep-alive
-- **Timeout control**: Granular timeouts for connect, TTFB, read/write idle, and total request time
-- **Automatic decompression**: gzip, deflate, brotli, zstd
+- Promise-based HTTP, RFC 6455 WebSocket, and RFC 8441 raw tunnel APIs
+- Browser fingerprinting for Chrome, Firefox, or default TLS settings
+- HTTP/2, HTTP/3, connection pooling, and automatic decompression
+- Cookie store and shared cookie jar support across HTTP and WebSocket handshakes
+- Granular connect, TTFB, read/write idle, total, pool, and WebSocket handshake timeouts
 
 ## Installation
 
 ```bash
-npm install @specter/client
+npm install specters
 ```
 
-## Quick Start
+## HTTP
 
 ```javascript
-const { Client } = require('@specter/client');
+const { clientBuilder, FingerprintProfile } = require('specters');
 
-async function main() {
-  // Create a client with default settings
-  const client = Client.builder().build();
-  
-  // Make a GET request
-  const response = await client.get('https://httpbin.org/get').send();
-  console.log(`Status: ${response.status}`);
-  console.log(await response.text());
-}
-
-main();
-```
-
-## Browser Impersonation
-
-```javascript
-const { Client, FingerprintProfile } = require('@specter/client');
-
-// Impersonate Chrome 146 (current stable)
-const client = Client.builder()
-  .fingerprint(FingerprintProfile.Chrome146)
-  .build();
-
-// Or pick a specific version (142, 143, 144, 145, 146)
-const client = Client.builder()
+const client = clientBuilder()
   .fingerprint(FingerprintProfile.Chrome142)
+  .cookieStore(true)
   .build();
-
-// Or Firefox 133
-const client = Client.builder()
-  .fingerprint(FingerprintProfile.Firefox133)
-  .build();
-```
-
-## Timeout Configuration
-
-```javascript
-const { Client, timeoutsApiDefaults, timeoutsStreamingDefaults } = require('@specter/client');
-
-// Use preset timeout configurations
-const client1 = Client.builder().apiTimeouts().build();
-const client2 = Client.builder().streamingTimeouts().build();
-
-// Or configure manually
-const timeouts = {
-  connect: 10.0,      // TCP + TLS handshake
-  ttfb: 30.0,         // Time to first byte
-  readIdle: 60.0,     // Max time between chunks
-  total: 120.0        // Total request deadline
-};
-
-const client = Client.builder().timeouts(timeouts).build();
-```
-
-## HTTP Methods
-
-```javascript
-const { Client } = require('@specter/client');
-
-const client = Client.builder().build();
-
-// GET
-const response = await client.get('https://api.example.com/items').send();
-
-// POST
-const response = await client.post('https://api.example.com/items').send();
-
-// PUT
-const response = await client.put('https://api.example.com/items/1').send();
-
-// DELETE
-const response = await client.delete('https://api.example.com/items/1').send();
-
-// PATCH
-const response = await client.patch('https://api.example.com/items/1').send();
-
-// HEAD
-const response = await client.head('https://api.example.com/items/1').send();
-
-// OPTIONS
-const response = await client.options('https://api.example.com/items').send();
-
-// Arbitrary method
-const response = await client.request('PURGE', 'https://api.example.com/cache').send();
-```
-
-## Response Handling
-
-```javascript
-const response = await client.get('https://api.example.com/data').send();
-
-// Status code
-console.log(response.status);
-
-// Headers
-console.log(response.headers);  // Record<string, string>
-console.log(response.getHeader('content-type'));
-
-// Body
-console.log(response.text());      // Decompressed text
-console.log(response.json());      // JSON string (use JSON.parse)
-const data = response.bytes();     // Buffer
-
-// Response metadata
-console.log(response.httpVersion); // "HTTP/2", "HTTP/1.1", etc.
-console.log(response.isSuccess);   // true for 2xx status
-
-## Request Builder
-
-```javascript
-const { Client } = require('@specter/client');
-
-const client = Client.builder().build();
 
 const response = await client
-  .post('https://api.example.com/items')
+  .post('https://example.com/items')
   .header('Authorization', 'Bearer token')
   .json(JSON.stringify({ name: 'example' }))
   .send();
 
 console.log(response.status);
+console.log(response.text());
 ```
+
+## RFC 6455 WebSockets
+
+```javascript
+const { CLOSE_NORMAL, clientBuilder } = require('specters');
+
+const client = clientBuilder()
+  .cookieStore(true)
+  .http2PriorKnowledge(false)
+  .build();
+
+const ws = await client.websocket('wss://example.com/socket')
+  .header('Origin', 'https://example.com')
+  .subprotocol('chat.v1')
+  .maxMessageSize(1 << 20)
+  .handshakeTimeout(10)
+  .connect();
+
+await ws.sendText('hello');
+const message = await ws.next();
+
+if (message.type === 'text') {
+  console.log(message.text);
+}
+
+await ws.close({ code: CLOSE_NORMAL, reason: 'done' });
 ```
+
+RFC 6455 sockets are framed message connections. `send*`, `next`, and `close` operations are serialized per socket to preserve Rust's mutable socket contract; avoid running multiple receive loops on the same socket.
+
+## RFC 8441 HTTP/2 Tunnels
+
+```javascript
+const { clientBuilder } = require('specters');
+
+const client = clientBuilder()
+  .http2PriorKnowledge(true)
+  .build();
+
+const tunnel = await client.websocketH2('https://example.com/h2-tunnel')
+  .header('Origin', 'https://example.com')
+  .open();
+
+await tunnel.sendBytes(Buffer.from('raw bytes'), false);
+const data = await tunnel.recvBytes();
+await tunnel.closeSend();
+```
+
+RFC 8441 exposes a raw byte tunnel over HTTP/2 Extended CONNECT. It is intentionally separate from the RFC 6455 framed `WebSocket` API.
 
 ## Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Build the native module
 npm run build
-
-# Run tests
 npm test
 ```
 

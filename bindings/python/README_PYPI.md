@@ -1,6 +1,6 @@
 # Specter
 
-Python bindings for the Specter HTTP client - an HTTP client that accurately replicates Chrome's TLS and HTTP/2 behavior.
+Python bindings for the Specter HTTP client with TLS, HTTP/2, HTTP/3, RFC 6455 WebSocket, and RFC 8441 Extended CONNECT support.
 
 ## Installation
 
@@ -8,63 +8,54 @@ Python bindings for the Specter HTTP client - an HTTP client that accurately rep
 pip install specters
 ```
 
-## Features
-
-- HTTP/1.1, HTTP/2, and HTTP/3 support
-- Chrome 142-146 TLS fingerprint (BoringSSL)
-- Chrome HTTP/2 fingerprint (SETTINGS, pseudo-header order, GREASE)
-- Async/await interface
-- Cookie jar with Netscape format support
-
-## Usage
+## HTTP
 
 ```python
-import asyncio
-from specter import Client, FingerprintProfile
+import specter
 
-async def main():
-    client = Client(fingerprint=FingerprintProfile.Chrome146)
+builder = specter.Client.builder()
+builder.fingerprint(specter.FingerprintProfile.Chrome142)
+client = builder.build()
 
-    response = await client.get("https://example.com")
-    print(f"Status: {response.status}")
-    print(f"Body: {response.text()}")
-
-asyncio.run(main())
+response = await client.get("https://example.com/").send()
+print(response.status)
+print(await response.text())
 ```
 
-### Force HTTP version
+## RFC 6455 WebSockets
 
 ```python
-from specter import HttpVersion
+import specter
 
-# HTTP/2 only
-response = await client.get(url, version=HttpVersion.Http2)
+builder = specter.Client.builder()
+builder.cookie_store(True)
+client = builder.build()
 
-# HTTP/3 with fallback
-response = await client.get(url, version=HttpVersion.Http3)
+ws_builder = client.websocket("wss://example.com/socket")
+ws_builder.subprotocol("chat.v1")
+ws = await ws_builder.connect()
+
+await ws.send_text("hello")
+message = await ws.next()
+await ws.close(specter.CloseFrame(specter.CLOSE_NORMAL, "done"))
 ```
 
-### Custom headers and cookies
+## RFC 8441 HTTP/2 Tunnels
 
 ```python
-from specter import CookieJar
+import specter
 
-jar = CookieJar()
-await jar.load_from_file("cookies.txt")
+builder = specter.Client.builder()
+builder.http2_prior_knowledge(True)
+client = builder.build()
 
-response = await client.get(url, cookies=jar)
-jar.store_from_headers(response.headers, url)
-
-await jar.save_to_file("cookies.txt")
+tunnel = await client.websocket_h2("https://example.com/h2-tunnel").open()
+await tunnel.send_bytes(b"raw bytes", end_stream=False)
+data = await tunnel.recv_bytes()
+await tunnel.close_send()
 ```
 
-## Validation
-
-Specter fingerprints are validated against:
-- ScrapFly (tools.scrapfly.io)
-- Browserleaks (tls.browserleaks.com)
-- tls.peet.ws
-- Cloudflare
+RFC 6455 framed WebSockets and RFC 8441 raw HTTP/2 tunnels are separate APIs by design.
 
 ## License
 

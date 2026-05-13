@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "specters"
-version = "2.0.0"
-description = "Python bindings for Specter HTTP client with TLS/HTTP2/HTTP3 fingerprint control"
+version = "3.0.0"
+description = "Python bindings for Specter HTTP, WebSocket, HTTP/2, and HTTP/3 tunnel client"
 readme = "README_PYPI.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

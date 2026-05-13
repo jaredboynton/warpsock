@@ -1,6 +1,6 @@
 [package]
 name = "specter-python"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for Specter HTTP client"
@@ -11,7 +11,7 @@ name = "specter"
 crate-type = ["cdylib"]
 
 [dependencies]
-specter = { path = "../.." }
+specter = { package = "specters", path = "../.." }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

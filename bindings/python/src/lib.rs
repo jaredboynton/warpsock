@@ -4,10 +4,18 @@
 //! TLS/HTTP2/HTTP3 fingerprint control.
 
 use bytes::Bytes;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
+
+mod websocket;
+mod websocket_h2;
+mod websocket_h3;
+mod ws_types;
 
 // Re-export specter types - use ::specter to disambiguate from pymodule name
 use ::specter::{
@@ -20,7 +28,7 @@ use ::specter::{
 #[pyclass]
 #[derive(Clone)]
 pub struct Client {
-    inner: RustClient,
+    pub(crate) inner: RustClient,
 }
 
 /// Python wrapper for ClientBuilder - uses internal mutability pattern.
@@ -48,7 +56,7 @@ pub struct Response {
 /// Python wrapper for CookieJar.
 #[pyclass]
 pub struct CookieJar {
-    inner: RustCookieJar,
+    pub(crate) inner: Arc<RwLock<RustCookieJar>>,
 }
 
 /// Browser fingerprint profiles for impersonation.
@@ -122,6 +130,21 @@ impl Client {
         ClientBuilder {
             inner: RustClient::builder(),
         }
+    }
+
+    /// Create an RFC 6455 WebSocket connection builder.
+    fn websocket(&self, url: String) -> websocket::WebSocketBuilder {
+        websocket::builder_from_client(self.inner.clone(), url)
+    }
+
+    /// Create an RFC 8441 WebSocket-over-HTTP/2 tunnel builder.
+    fn websocket_h2(&self, url: String) -> websocket_h2::WebSocketH2Builder {
+        websocket_h2::builder_from_client(self.inner.clone(), url)
+    }
+
+    /// Create an RFC 9220 WebSocket-over-HTTP/3 tunnel builder.
+    fn websocket_h3(&self, url: String) -> websocket_h3::WebSocketH3Builder {
+        websocket_h3::builder_from_client(self.inner.clone(), url)
     }
 
     /// Create a GET request builder.
@@ -348,6 +371,27 @@ impl ClientBuilder {
         Ok(())
     }
 
+    /// Enable HTTP/2 prior knowledge for cleartext HTTP/2 endpoints.
+    fn http2_prior_knowledge(&mut self, enabled: bool) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.http2_prior_knowledge(enabled);
+        Ok(())
+    }
+
+    /// Enable or disable an internal shared cookie store.
+    fn cookie_store(&mut self, enabled: bool) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.cookie_store(enabled);
+        Ok(())
+    }
+
+    /// Use a caller-provided cookie jar shared with this binding object.
+    fn cookie_jar(&mut self, jar: &CookieJar) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.cookie_jar(jar.inner.clone());
+        Ok(())
+    }
+
     /// Enable or disable automatic HTTP/3 upgrade via Alt-Svc headers.
     fn h3_upgrade(&mut self, enabled: bool) -> PyResult<()> {
         let old = std::mem::replace(&mut self.inner, RustClient::builder());
@@ -569,24 +613,37 @@ impl CookieJar {
     #[new]
     fn new() -> Self {
         Self {
-            inner: RustCookieJar::new(),
+            inner: Arc::new(RwLock::new(RustCookieJar::new())),
         }
     }
 
     /// Get the number of cookies in the jar.
-    fn __len__(&self) -> usize {
-        self.inner.len()
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self
+            .inner
+            .try_read()
+            .map_err(|_| PyRuntimeError::new_err("CookieJar is currently locked"))?
+            .len())
     }
 
     /// Check if the cookie jar is empty.
     #[getter]
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    fn is_empty(&self) -> PyResult<bool> {
+        Ok(self
+            .inner
+            .try_read()
+            .map_err(|_| PyRuntimeError::new_err("CookieJar is currently locked"))?
+            .is_empty())
     }
 
     /// Get the string representation.
-    fn __repr__(&self) -> String {
-        format!("<specter.CookieJar cookies={}>", self.inner.len())
+    fn __repr__(&self) -> PyResult<String> {
+        let len = self
+            .inner
+            .try_read()
+            .map_err(|_| PyRuntimeError::new_err("CookieJar is currently locked"))?
+            .len();
+        Ok(format!("<specter.CookieJar cookies={len}>"))
     }
 }
 
@@ -713,7 +770,7 @@ impl Timeouts {
 }
 
 /// Convert a specter Error to a Python exception.
-fn to_py_err(e: RustError) -> PyErr {
+pub(crate) fn to_py_err(e: RustError) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
 }
 
@@ -728,5 +785,9 @@ pub fn specter(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FingerprintProfile>()?;
     m.add_class::<HttpVersion>()?;
     m.add_class::<Timeouts>()?;
+    ws_types::register(m)?;
+    websocket::register(m)?;
+    websocket_h2::register(m)?;
+    websocket_h3::register(m)?;
     Ok(())
 }
