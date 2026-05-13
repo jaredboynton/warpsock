@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "specters"
-version = "2.1.3"
+version = "2.2.0"
 dependencies = [
  "base64",
  "boring",

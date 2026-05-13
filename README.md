@@ -10,7 +10,7 @@ Supported Chrome fingerprints: **142, 143, 144, 145, 146** (current stable). Fir
 
 ```toml
 [dependencies]
-specter = "1.0"
+specter = "2.2"
 ```
 
 ## Usage
@@ -150,6 +150,51 @@ jar.save_to_file("cookies.txt").await?;
 
 `Response::decoded_body()`, `Response::text()`, and `Response::json()` transparently decompress gzip/deflate/br/zstd payloads (including chained encodings) before decoding, which matches modern browser behavior.
 
+### WebSockets
+
+Specter supports RFC 6455 WebSockets over HTTP/1.1 Upgrade:
+
+```rust
+use specter::{Client, FingerprintProfile, Message};
+
+let mut ws = Client::builder()
+    .fingerprint(FingerprintProfile::Chrome146)
+    .cookie_store(true)
+    .build()?
+    .websocket("wss://example.com/socket")
+    .subprotocol("chat.v2")
+    .connect()
+    .await?;
+
+ws.send_text("hello").await?;
+
+while let Some(message) = ws.next().await? {
+    match message {
+        Message::Text(text) => println!("{text}"),
+        Message::Binary(bytes) => println!("{} bytes", bytes.len()),
+        _ => {}
+    }
+}
+```
+
+For `wss://`, the RFC 6455 path advertises HTTP/1.1 only via ALPN so the opening handshake stays an HTTP/1.1 Upgrade. Cookie lookup and `Set-Cookie` storage use the equivalent `http://` or `https://` URL, so existing `CookieJar` policy applies to WebSocket handshakes.
+
+Specter also exposes RFC 8441 Extended CONNECT for WebSocket-over-HTTP/2 when the peer advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`:
+
+```rust
+use bytes::Bytes;
+
+let mut tunnel = client
+    .websocket_h2("wss://example.com/socket")
+    .header("origin", "https://example.com")
+    .open()
+    .await?;
+
+tunnel.send_bytes(Bytes::from_static(b"raw websocket bytes"), false).await?;
+```
+
+The RFC 8441 API is a byte tunnel. Use it when you need H2 Extended CONNECT semantics directly; use `client.websocket(...)` for the full RFC 6455 frame/message client.
+
 ## Implementation
 
 **HTTP/1.1** - Direct socket implementation, no hyper dependency.
@@ -163,6 +208,8 @@ jar.save_to_file("cookies.txt").await?;
 - True multiplexing (concurrent requests on single connection, respecting `MAX_CONCURRENT_STREAMS`)
 
 **HTTP/3** - QUIC transport via quiche with TLS 1.3 fingerprinting.
+
+**WebSockets** - RFC 6455 client over HTTP/1.1 Upgrade, plus RFC 8441 Extended CONNECT tunnels over HTTP/2. Compression extensions are intentionally not negotiated.
 
 **TLS** - BoringSSL configured with Chrome cipher suites, curves, and signature algorithms. The TLS configuration is identical across Chrome 142-146. BoringSSL does its own extension randomization (which matches Chrome's behavior for TLS 1.3).
 

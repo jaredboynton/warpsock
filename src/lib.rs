@@ -15,6 +15,7 @@ pub mod request;
 pub mod response;
 pub mod timeouts;
 pub mod version;
+pub mod websocket;
 
 // Fingerprinting
 pub mod fingerprint;
@@ -35,6 +36,10 @@ pub use request::{Body, IntoUrl, RedirectPolicy, Request};
 pub use response::Response;
 pub use timeouts::{recv_with_idle_timeout, Timeouts};
 pub use version::HttpVersion;
+pub use websocket::{
+    CloseCode, CloseFrame, Message, WebSocket, WebSocketBuilder, WebSocketConfig, WebSocketError,
+    WebSocketResult,
+};
 
 // Transport re-exports
 pub use transport::connector::{AlpnProtocol, BoringConnector, MaybeHttpsStream};

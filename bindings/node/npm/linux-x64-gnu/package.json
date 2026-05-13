@@ -1,6 +1,6 @@
 {
   "name": "specters-linux-x64-gnu",
-  "version": "2.1.3",
+  "version": "2.2.0",
   "cpu": [
     "x64"
   ],

@@ -32,6 +32,7 @@ use crate::transport::h1::H1Connection;
 use crate::transport::h2::{H2Connection, H2PooledConnection, H2Tunnel, PseudoHeaderOrder};
 use crate::transport::h3::H3Client;
 use crate::version::HttpVersion;
+use crate::websocket::{WebSocketBuilder, WebSocketClientParts};
 
 /// Unified HTTP client with HTTP/1.1, HTTP/2, and HTTP/3 support.
 ///
@@ -166,6 +167,22 @@ impl Client {
     /// Create an RFC 8441 WebSocket-over-HTTP/2 tunnel builder.
     pub fn websocket_h2(&self, url: impl IntoUrl) -> WebSocketH2Builder<'_> {
         WebSocketH2Builder::new(self, url)
+    }
+
+    /// Create a WebSocket connection builder.
+    pub fn websocket(&self, url: impl IntoUrl) -> WebSocketBuilder<'_> {
+        Client::websocket_with_parts(
+            WebSocketClientParts {
+                connector: &self.connector,
+                insecure_connector: &self.insecure_connector,
+                default_headers: &self.default_headers,
+                timeouts: &self.timeouts,
+                cookie_store: self.cookie_store.as_ref(),
+                danger_accept_invalid_certs: self.danger_accept_invalid_certs,
+                localhost_allows_invalid_certs: self.localhost_allows_invalid_certs,
+            },
+            url,
+        )
     }
 
     /// Get the Alt-Svc cache for manual inspection or manipulation.

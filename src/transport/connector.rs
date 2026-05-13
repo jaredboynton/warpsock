@@ -191,7 +191,7 @@ impl BoringConnector {
         self
     }
 
-    fn configure_ssl(&self, _domain: &str) -> Result<SslConnector, Error> {
+    fn configure_ssl(&self, _domain: &str, alpn_mode: AlpnMode) -> Result<SslConnector, Error> {
         let mut builder = SslConnector::builder(SslMethod::tls_client())
             .map_err(|e| Error::Tls(format!("Failed to create SSL connector: {}", e)))?;
 
@@ -343,13 +343,27 @@ impl BoringConnector {
         // This enables TLS session tickets and session ID caching
         builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
 
-        // Enable ALPN for HTTP/2
+        // Enable ALPN for HTTP/2 or constrain it for HTTP/1-only callers.
+        let alpn_protos = match alpn_mode {
+            AlpnMode::Default => b"\x02h2\x08http/1.1".as_slice(),
+            AlpnMode::Http1Only => b"\x08http/1.1".as_slice(),
+        };
         builder
-            .set_alpn_protos(b"\x02h2\x08http/1.1")
+            .set_alpn_protos(alpn_protos)
             .map_err(|e| Error::Tls(format!("Failed to set ALPN: {}", e)))?;
 
         Ok(builder.build())
     }
+}
+
+/// ALPN configuration mode for TLS connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlpnMode {
+    /// Advertise the default HTTP protocols: h2, then http/1.1.
+    #[default]
+    Default,
+    /// Advertise only http/1.1 for callers that must avoid HTTP/2 negotiation.
+    Http1Only,
 }
 
 /// Negotiated ALPN protocol.
@@ -454,6 +468,15 @@ impl AsyncWrite for MaybeHttpsStream {
 impl BoringConnector {
     /// Connect to a URI, returning either a plain TCP or TLS stream.
     pub async fn connect(&self, uri: &Uri) -> Result<MaybeHttpsStream, Error> {
+        self.connect_with_alpn(uri, AlpnMode::Default).await
+    }
+
+    /// Connect to a URI while constraining TLS ALPN advertisement.
+    pub async fn connect_with_alpn(
+        &self,
+        uri: &Uri,
+        alpn_mode: AlpnMode,
+    ) -> Result<MaybeHttpsStream, Error> {
         let host = uri
             .host()
             .ok_or_else(|| Error::Connection("Missing host".into()))?;
@@ -529,7 +552,7 @@ impl BoringConnector {
         };
 
         if uri.scheme_str() == Some("https") {
-            let ssl_connector = self.configure_ssl(host)?;
+            let ssl_connector = self.configure_ssl(host, alpn_mode)?;
 
             let ssl_config = ssl_connector
                 .configure()
@@ -543,6 +566,11 @@ impl BoringConnector {
         } else {
             Ok(MaybeHttpsStream::Http(tcp_stream))
         }
+    }
+
+    /// Connect to a URI advertising only HTTP/1.1 over TLS.
+    pub async fn connect_h1_only(&self, uri: &Uri) -> Result<MaybeHttpsStream, Error> {
+        self.connect_with_alpn(uri, AlpnMode::Http1Only).await
     }
 }
 
