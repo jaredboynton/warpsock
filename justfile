@@ -61,16 +61,9 @@ zigbuild target="aarch64-unknown-linux-gnu":
         exit 1
     fi
 
-    # Check if prebuilt BoringSSL exists for this target
-    BSSL_PATH="$(pwd)/lib/boringssl/$TARGET"
-    if [[ -d "$BSSL_PATH/build" ]]; then
-        echo "Using prebuilt BoringSSL from $BSSL_PATH"
-        export BORING_BSSL_PATH="$BSSL_PATH/build"
-        export BORING_BSSL_INCLUDE_PATH="$(pwd)/lib/boringssl/include"
-    else
-        echo "Warning: No prebuilt BoringSSL found at $BSSL_PATH"
-        echo "BoringSSL will be built from source (slower)"
-    fi
+    # Resolve prebuilt BoringSSL: env var -> ~/boringssl -> lib/boringssl -> from-source.
+    # Shared helper covers all four cargo recipes; see scripts/lib-bssl-env.sh.
+    . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
 
     # Set up compiler wrappers
     export CC="$WRAPPER_CC"
@@ -97,21 +90,15 @@ zigbuild target="aarch64-unknown-linux-gnu":
 build:
     #!/usr/bin/env bash
     set -euo pipefail
-    
-    # Detect architecture
+
     if [[ "$(uname -m)" == "arm64" ]]; then
         TARGET="aarch64-apple-darwin"
     else
         TARGET="x86_64-apple-darwin"
     fi
-    
-    BSSL_PATH="$(pwd)/lib/boringssl/$TARGET"
-    if [[ -d "$BSSL_PATH/build" ]]; then
-        echo "Using prebuilt BoringSSL from $BSSL_PATH"
-        export BORING_BSSL_PATH="$BSSL_PATH/build"
-        export BORING_BSSL_INCLUDE_PATH="$(pwd)/lib/boringssl/include"
-    fi
-    
+
+    . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
+
     cargo build --release
 
 # =============================================================================
@@ -175,20 +162,15 @@ build-boringssl *TARGETS:
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    
-    # Detect architecture
+
     if [[ "$(uname -m)" == "arm64" ]]; then
         TARGET="aarch64-apple-darwin"
     else
         TARGET="x86_64-apple-darwin"
     fi
-    
-    BSSL_PATH="$(pwd)/lib/boringssl/$TARGET"
-    if [[ -d "$BSSL_PATH/build" ]]; then
-        export BORING_BSSL_PATH="$BSSL_PATH/build"
-        export BORING_BSSL_INCLUDE_PATH="$(pwd)/lib/boringssl/include"
-    fi
-    
+
+    . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
+
     cargo nextest run --all-features
 
 # Run tests with cargo test (if nextest not available)
@@ -196,19 +178,15 @@ test:
 test-cargo:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     if [[ "$(uname -m)" == "arm64" ]]; then
         TARGET="aarch64-apple-darwin"
     else
         TARGET="x86_64-apple-darwin"
     fi
-    
-    BSSL_PATH="$(pwd)/lib/boringssl/$TARGET"
-    if [[ -d "$BSSL_PATH/build" ]]; then
-        export BORING_BSSL_PATH="$BSSL_PATH/build"
-        export BORING_BSSL_INCLUDE_PATH="$(pwd)/lib/boringssl/include"
-    fi
-    
+
+    . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
+
     cargo test --all-features
 
 # =============================================================================
@@ -251,9 +229,12 @@ clean:
 clean-boringssl-cache:
     rm -rf .boringssl-build
 
-# Clean everything including prebuilt libs
+# Clean cargo target + local BoringSSL build scratch (NOT prebuilt libs)
 [group('cleanup')]
 clean-all:
+    #!/usr/bin/env bash
+    # Does NOT touch lib/boringssl/ (tracked-in-repo prebuilts) or ~/boringssl
+    # (user-wide prebuilts). To rebuild the prebuilts themselves, use
+    # `just build-boringssl` or scripts/build-boringssl.sh.
     cargo clean
     rm -rf .boringssl-build
-    rm -rf lib/boringssl

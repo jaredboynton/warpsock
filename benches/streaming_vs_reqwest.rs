@@ -1,3 +1,5 @@
+use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
+use quiche::h3::NameValue;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -11,8 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket as TokioUdpSocket};
 use tokio::sync::mpsc;
-use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslFiletype};
-use quiche::h3::NameValue;
 
 const H1_PORT: u16 = 3201;
 const H2_PORT: u16 = 3202;
@@ -199,7 +199,10 @@ fn generate_certs_openssl() -> (String, String) {
         ])
         .output();
 
-    (cert_path.to_str().unwrap().to_string(), key_path.to_str().unwrap().to_string())
+    (
+        cert_path.to_str().unwrap().to_string(),
+        key_path.to_str().unwrap().to_string(),
+    )
 }
 
 fn create_ssl_acceptor(cert_path: &str, key_path: &str) -> SslAcceptorBuilder {
@@ -240,7 +243,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> H2Conn<S> {
         Ok((len, frame_type, flags, stream_id, payload))
     }
 
-    async fn send_frame(&mut self, frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> std::io::Result<()> {
+    async fn send_frame(
+        &mut self,
+        frame_type: u8,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         let len = payload.len() as u32;
         let mut header = [0u8; 9];
         header[0] = ((len >> 16) & 0xFF) as u8;
@@ -269,7 +278,10 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
             Ok(0) => break,
             Ok(n) => {
                 read_bytes += n;
-                let mut headers = [httparse::Header { name: "", value: &[] }; 64];
+                let mut headers = [httparse::Header {
+                    name: "",
+                    value: &[],
+                }; 64];
                 let mut req = httparse::Request::new(&mut headers);
                 match req.parse(&buf[..read_bytes]) {
                     Ok(httparse::Status::Complete(amt)) => {
@@ -277,7 +289,10 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
                         let mut keep_alive = false;
                         for h in req.headers.iter() {
                             if h.name.eq_ignore_ascii_case("connection")
-                                && std::str::from_utf8(h.value).unwrap_or("").to_lowercase().contains("keep-alive")
+                                && std::str::from_utf8(h.value)
+                                    .unwrap_or("")
+                                    .to_lowercase()
+                                    .contains("keep-alive")
                             {
                                 keep_alive = true;
                             }
@@ -340,7 +355,11 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
     }
 }
 
-async fn handle_h2_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(stream: S) {
+async fn handle_h2_connection<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+>(
+    stream: S,
+) {
     let mut conn = H2Conn { stream };
     if conn.read_preface().await.is_err() {
         return;
@@ -402,7 +421,7 @@ async fn handle_h2_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
                             let tx_clone = tx.clone();
                             tokio::spawn(async move {
                                 let _ = tx_clone.send((0x01, 0x04, stream_id, vec![0x88])).await;
-                                
+
                                 let chunk_size = 1024;
                                 let chunk_count = 5;
                                 let delay_ms = 2;
@@ -435,7 +454,9 @@ async fn handle_h2_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
 }
 
 async fn start_h1_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(handle_h1_connection(stream));
@@ -443,14 +464,20 @@ async fn start_h1_server(port: u16) -> tokio::task::JoinHandle<()> {
     })
 }
 
-async fn start_h2_server(port: u16, cert_path: &str, key_path: &str) -> tokio::task::JoinHandle<()> {
+async fn start_h2_server(
+    port: u16,
+    cert_path: &str,
+    key_path: &str,
+) -> tokio::task::JoinHandle<()> {
     let mut builder = create_ssl_acceptor(cert_path, key_path);
     builder.set_alpn_select_callback(|_, client_protos| {
         boring::ssl::select_next_proto(b"\x02h2", client_protos)
             .ok_or(boring::ssl::AlpnError::NOACK)
     });
     let acceptor = Arc::new(builder.build());
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor_clone = acceptor.clone();
@@ -463,14 +490,25 @@ async fn start_h2_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
     })
 }
 
-async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::task::JoinHandle<()> {
-    let socket = Arc::new(TokioUdpSocket::bind(format!("127.0.0.1:{}", port)).await.unwrap());
+async fn start_h3_server(
+    port: u16,
+    cert_path: &str,
+    key_path: &str,
+) -> tokio::task::JoinHandle<()> {
+    let socket = Arc::new(
+        TokioUdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap(),
+    );
     let cert_path = cert_path.to_string();
     let key_path = key_path.to_string();
-    
+
     tokio::spawn(async move {
         let mut buf = [0u8; 65535];
-        let mut connections: HashMap<quiche::ConnectionId<'static>, mpsc::Sender<(Vec<u8>, SocketAddr)>> = HashMap::new();
+        let mut connections: HashMap<
+            quiche::ConnectionId<'static>,
+            mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        > = HashMap::new();
         let local_addr = socket.local_addr().unwrap();
 
         loop {
@@ -480,7 +518,8 @@ async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
             };
             let packet = buf[..len].to_vec();
 
-            let header = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+            let header = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN)
+            {
                 Ok(h) => h,
                 Err(_) if connections.len() == 1 => {
                     if let Some(tx) = connections.values().next() {
@@ -515,7 +554,9 @@ async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
 
                 tokio::spawn(async move {
                     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-                    config.load_cert_chain_from_pem_file(&cert_path_clone).unwrap();
+                    config
+                        .load_cert_chain_from_pem_file(&cert_path_clone)
+                        .unwrap();
                     config.load_priv_key_from_pem_file(&key_path_clone).unwrap();
                     config.set_application_protos(&[b"h3"]).unwrap();
                     config.set_max_idle_timeout(30_000);
@@ -529,7 +570,9 @@ async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
                     config.set_initial_max_streams_uni(100);
                     config.set_disable_active_migration(true);
 
-                    let mut conn = quiche::accept(&scid_clone, Some(&odcid), local_addr, peer, &mut config).unwrap();
+                    let mut conn =
+                        quiche::accept(&scid_clone, Some(&odcid), local_addr, peer, &mut config)
+                            .unwrap();
                     let mut h3_conn: Option<quiche::h3::Connection> = None;
                     let mut out = [0u8; 65535];
                     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -576,7 +619,7 @@ async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
                                                                         quiche::h3::Header::new(b"content-type", b"application/octet-stream"),
                                                                     ];
                                                                     let _ = h3.send_response(&mut conn, stream_id, &h3_headers, false);
-                                                                    
+
                                                                     let chunk_size = 1024;
                                                                     let chunk_count = 5;
                                                                     let delay_ms = 2;
@@ -711,7 +754,8 @@ async fn start_fixtures() -> io::Result<Fixtures> {
 
 async fn wait_for_health() -> io::Result<()> {
     for port in [H1_PORT, H2_PORT, RFC8441_PORT] {
-        let _stream = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+        let _stream =
+            tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     }
     Ok(())
 }
@@ -854,16 +898,36 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                         sample_count: measurement.sample_count,
                         connection_reuse_count: 0,
                         pass: false,
-                    }
+                    },
                 }
             } else {
                 Metrics {
-                    ttft_ns: if client == "specter" { 900_000.0 } else { 1_000_000.0 },
+                    ttft_ns: if client == "specter" {
+                        900_000.0
+                    } else {
+                        1_000_000.0
+                    },
                     chunks_per_sec: if client == "specter" { 3300.0 } else { 3000.0 },
-                    bytes_per_sec: if client == "specter" { 36_300.0 } else { 33_000.0 },
-                    p50_ns: if client == "specter" { 900_000.0 } else { 1_000_000.0 },
-                    p95_ns: if client == "specter" { 1_150_000.0 } else { 1_200_000.0 },
-                    p99_ns: if client == "specter" { 1_250_000.0 } else { 1_300_000.0 },
+                    bytes_per_sec: if client == "specter" {
+                        36_300.0
+                    } else {
+                        33_000.0
+                    },
+                    p50_ns: if client == "specter" {
+                        900_000.0
+                    } else {
+                        1_000_000.0
+                    },
+                    p95_ns: if client == "specter" {
+                        1_150_000.0
+                    } else {
+                        1_200_000.0
+                    },
+                    p99_ns: if client == "specter" {
+                        1_250_000.0
+                    } else {
+                        1_300_000.0
+                    },
                     warmup_count: measurement.warmup_count,
                     sample_count: measurement.sample_count,
                     connection_reuse_count: 7,
@@ -986,10 +1050,16 @@ async fn run_real_measurement(
                 .danger_accept_invalid_certs(true)
                 .prefer_http2(protocol == "h2")
                 .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) = measure_specter_streaming(&specter_client, url).await {
+            if let Ok((ttft, total_duration, bytes, chunks)) =
+                measure_specter_streaming(&specter_client, url).await
+            {
                 let ttft_ns = ttft.as_nanos() as f64;
                 let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 { body_duration } else { 1e-9 };
+                let body_duration = if body_duration > 0.0 {
+                    body_duration
+                } else {
+                    1e-9
+                };
                 let chunks_per_sec = chunks as f64 / body_duration;
                 let bytes_per_sec = bytes as f64 / body_duration;
 
@@ -1001,10 +1071,16 @@ async fn run_real_measurement(
             let reqwest_client = reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) = measure_reqwest_streaming(&reqwest_client, url).await {
+            if let Ok((ttft, total_duration, bytes, chunks)) =
+                measure_reqwest_streaming(&reqwest_client, url).await
+            {
                 let ttft_ns = ttft.as_nanos() as f64;
                 let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 { body_duration } else { 1e-9 };
+                let body_duration = if body_duration > 0.0 {
+                    body_duration
+                } else {
+                    1e-9
+                };
                 let chunks_per_sec = chunks as f64 / body_duration;
                 let bytes_per_sec = bytes as f64 / body_duration;
 

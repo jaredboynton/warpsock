@@ -1,12 +1,16 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use specter::{Client, HttpVersion};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn test_h1_streaming_local() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
 
     // Start H1 server in a background task
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3201").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3201")
+        .await
+        .unwrap();
     let server_task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -20,23 +24,28 @@ async fn test_h1_streaming_local() {
         }
     });
 
-    let client = Client::builder()
-        .prefer_http2(false)
-        .build()
-        .unwrap();
+    let client = Client::builder().prefer_http2(false).build().unwrap();
 
     // High-level send_streaming currently only supports H2, so H1 streaming should fail or fall back.
     // Let's verify that send_streaming returns an error if version is forced to H1.
-    let req = client.get("http://127.0.0.1:3201/stream").version(HttpVersion::Http1_1);
+    let req = client
+        .get("http://127.0.0.1:3201/stream")
+        .version(HttpVersion::Http1_1);
     let res = req.send_streaming().await;
-    assert!(res.is_err(), "Expected error because H1 streaming is not supported at high-level yet: {:?}", res);
+    assert!(
+        res.is_err(),
+        "Expected error because H1 streaming is not supported at high-level yet: {:?}",
+        res
+    );
 
     server_task.abort();
 }
 
 #[tokio::test]
 async fn test_h2_streaming_local() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
 
     // Start H2 server in background task
     let client = Client::builder()
@@ -45,5 +54,12 @@ async fn test_h2_streaming_local() {
         .build()
         .unwrap();
 
-    assert!(client.get("https://127.0.0.1:3202/stream").send_streaming().await.is_err() || true);
+    assert!(
+        client
+            .get("https://127.0.0.1:3202/stream")
+            .send_streaming()
+            .await
+            .is_err()
+            || true
+    );
 }
