@@ -12,24 +12,36 @@ use tokio::sync::RwLock;
 use tracing;
 
 use crate::error::Result;
+use crate::fingerprint::FingerprintProfile;
 use crate::transport::connector::MaybeHttpsStream;
+use crate::transport::h2::PseudoHeaderOrder;
 use crate::version::HttpVersion;
 
-/// Connection pool key identifying a unique host/port combination
+/// Connection pool key identifying a unique host/port combination with fingerprint settings
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PoolKey {
     pub host: String,
     pub port: u16,
     pub is_https: bool,
+    pub fingerprint: FingerprintProfile,
+    pub pseudo_order: PseudoHeaderOrder,
 }
 
 impl PoolKey {
     /// Create a new pool key
-    pub fn new(host: String, port: u16, is_https: bool) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        is_https: bool,
+        fingerprint: FingerprintProfile,
+        pseudo_order: PseudoHeaderOrder,
+    ) -> Self {
         Self {
             host,
             port,
             is_https,
+            fingerprint,
+            pseudo_order,
         }
     }
 }
@@ -376,9 +388,27 @@ mod tests {
 
     #[test]
     fn test_pool_key_equality() {
-        let key1 = PoolKey::new("example.com".to_string(), 443, true);
-        let key2 = PoolKey::new("example.com".to_string(), 443, true);
-        let key3 = PoolKey::new("example.com".to_string(), 80, false);
+        let key1 = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
+        let key2 = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
+        let key3 = PoolKey::new(
+            "example.com".to_string(),
+            80,
+            false,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
@@ -431,7 +461,13 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_http11() {
         let pool = ConnectionPool::new();
-        let key = PoolKey::new("example.com".to_string(), 443, true);
+        let key = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
 
         // HTTP/1.1 should always return None (no pooling)
         let result = pool
@@ -444,7 +480,13 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_http2_multiplexing() {
         let pool = ConnectionPool::new();
-        let key = PoolKey::new("example.com".to_string(), 443, true);
+        let key = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
 
         // First request creates connection
         let entry1 = pool.get_or_create(&key, HttpVersion::Http2).await.unwrap();
@@ -463,7 +505,13 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_release() {
         let pool = ConnectionPool::new();
-        let key = PoolKey::new("example.com".to_string(), 443, true);
+        let key = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
 
         let _entry = pool.get_or_create(&key, HttpVersion::Http2).await.unwrap();
 
@@ -477,7 +525,13 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_invalidation() {
         let pool = ConnectionPool::new();
-        let key = PoolKey::new("example.com".to_string(), 443, true);
+        let key = PoolKey::new(
+            "example.com".to_string(),
+            443,
+            true,
+            FingerprintProfile::Chrome142,
+            PseudoHeaderOrder::Chrome,
+        );
 
         let _entry = pool.get_or_create(&key, HttpVersion::Http2).await.unwrap();
 

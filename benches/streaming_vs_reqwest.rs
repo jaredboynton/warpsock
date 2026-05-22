@@ -20,6 +20,18 @@ const H3_PORT: u16 = 3203;
 const RFC8441_PORT: u16 = 3204;
 
 #[derive(Serialize)]
+struct Rfc8441CoexistenceResult {
+    concurrency_level: usize,
+    tunnel_stream_id: u32,
+    streaming_stream_id: u32,
+    messages_sent: Vec<String>,
+    messages_received: Vec<String>,
+    chunks_received: Vec<String>,
+    contamination_detected: bool,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
 struct Artifact {
     benchmark: &'static str,
     benchmark_version: &'static str,
@@ -30,6 +42,7 @@ struct Artifact {
     measurement_config: MeasurementConfig,
     metric_definitions: BTreeMap<&'static str, &'static str>,
     rows: Vec<Row>,
+    rfc8441_coexistence: Rfc8441CoexistenceResult,
     threshold_summary: ThresholdSummary,
     public_provider_threshold_inputs: Vec<String>,
     port_preflight: PortCheck,
@@ -986,6 +999,63 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         }
     }
 
+    // Run RFC 8441 coexistence check
+    let client_coexist = specter::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .prefer_http2(true)
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    let ws_url = format!("wss://127.0.0.1:{}/socket", RFC8441_PORT);
+    let stream_url = format!("https://127.0.0.1:{}/stream", RFC8441_PORT);
+
+    // 1. Open tunnel
+    let mut tunnel = client_coexist
+        .websocket_h2(&ws_url)
+        .open()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    // 2. Open streaming response concurrently
+    let (_resp, mut rx) = client_coexist
+        .get(&stream_url)
+        .send_streaming()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    // 3. Send and receive tunnel message
+    tunnel
+        .send_bytes(bytes::Bytes::from("bench-coexist-msg"), false)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let t_msg = tunnel
+        .recv_bytes()
+        .await
+        .unwrap()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let tunnel_received = String::from_utf8(t_msg.to_vec()).unwrap_or_default();
+
+    // 4. Consume stream chunks
+    let mut chunks = Vec::new();
+    while let Some(chunk_res) = rx.recv().await {
+        let chunk = chunk_res.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap_or_default());
+    }
+
+    let contamination =
+        tunnel_received.contains("stream") || chunks.iter().any(|c| c.contains("bench-coexist"));
+
+    let coexistence_result = Rfc8441CoexistenceResult {
+        concurrency_level: 2,
+        tunnel_stream_id: 1,    // first stream is tunnel CONNECT
+        streaming_stream_id: 3, // second stream is GET /stream
+        messages_sent: vec!["bench-coexist-msg".to_string()],
+        messages_received: vec![tunnel_received],
+        chunks_received: chunks,
+        contamination_detected: contamination,
+        status: if !contamination { "pass" } else { "fail" },
+    };
+
     Ok(Artifact {
         benchmark: "streaming_vs_reqwest",
         benchmark_version: "foundation-1",
@@ -1004,6 +1074,7 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         measurement_config: measurement,
         metric_definitions: metric_definitions(),
         rows,
+        rfc8441_coexistence: coexistence_result,
         threshold_summary: ThresholdSummary {
             required_thresholds_passed,
             failed_rows,

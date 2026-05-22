@@ -72,6 +72,8 @@ pub struct Client {
     redirect_policy: RedirectPolicy,
     /// Optional cookie store
     cookie_store: Option<Arc<RwLock<CookieJar>>>,
+    /// Fingerprint profile
+    fingerprint: FingerprintProfile,
 }
 
 /// Builder for HTTP requests.
@@ -296,7 +298,7 @@ impl<'a> WebSocketH2Builder<'a> {
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
 
         let headers = self.headers.to_vec();
-        let pool_key = Client::make_pool_key(&uri);
+        let pool_key = self.client.make_pool_key(&uri);
 
         if let Some(conn) = {
             let pool = self.client.h2_pool.read().await;
@@ -643,7 +645,7 @@ impl<'a> RequestBuilder<'a> {
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
 
         let request_url = request.url.clone();
-        let pool_key = Client::make_pool_key(&uri);
+        let pool_key = client.make_pool_key(&uri);
 
         // Check for existing pooled connection
         let pooled = {
@@ -1052,7 +1054,7 @@ impl Client {
 
         // For HTTP/2, try to use pooled connection first
         if prefer_http2 {
-            let pool_key = Self::make_pool_key(&uri);
+            let pool_key = self.make_pool_key(&uri);
 
             // Check for existing pooled connection
             let pooled = {
@@ -1163,7 +1165,7 @@ impl Client {
         }
 
         // HTTP/1.1 path (with connection pooling)
-        let pool_key = Self::make_pool_key(&uri);
+        let pool_key = self.make_pool_key(&uri);
 
         // Try to get a pooled connection first
         let mut stream_opt = self.h1_pool.get_h1(&pool_key).await;
@@ -1353,11 +1355,11 @@ impl Client {
     }
 
     /// Create a pool key from a URI.
-    fn make_pool_key(uri: &Uri) -> PoolKey {
+    fn make_pool_key(&self, uri: &Uri) -> PoolKey {
         let host = uri.host().unwrap_or("localhost").to_string();
         let is_https = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
-        PoolKey::new(host, port, is_https)
+        PoolKey::new(host, port, is_https, self.fingerprint, self.pseudo_order)
     }
 
     async fn do_send_http1(
@@ -1679,6 +1681,7 @@ impl ClientBuilder {
             default_headers: self.default_headers,
             redirect_policy: self.redirect_policy,
             cookie_store: self.cookie_store,
+            fingerprint: self.fingerprint,
         })
     }
 }

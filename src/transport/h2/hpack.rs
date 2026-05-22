@@ -12,7 +12,7 @@ use bytes::Bytes;
 ///
 /// Different browsers/clients send pseudo-headers in different orders.
 /// This order is visible in the Akamai HTTP/2 fingerprint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PseudoHeaderOrder {
     /// Chrome order: :method, :scheme, :authority, :path (m,s,a,p)
     #[default]

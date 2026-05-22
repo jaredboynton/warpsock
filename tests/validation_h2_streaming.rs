@@ -1970,3 +1970,577 @@ async fn stale_h2_pool_entries_are_evicted_before_reuse() {
     )
     .unwrap();
 }
+
+// Test VAL-H2-013: RFC 8441 tunnel coexists with streaming on one connection
+#[tokio::test]
+async fn rfc8441_tunnel_coexists_with_streaming_on_one_connection() {
+    init_validation_dir();
+    let (mut builder, ca_cert) = generate_cert_bundle();
+    builder.set_alpn_select_callback(|_, client_protos| {
+        boring::ssl::select_next_proto(b"\x02h2", client_protos)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let acceptor = builder.build();
+
+    let server = MockH2Server::new().await.unwrap();
+    let url = server.url_tls();
+
+    let conn_count = Arc::new(Mutex::new(0));
+    let conn_count_clone = conn_count.clone();
+
+    server.start_tls(acceptor, move |conn: MockH2Connection| {
+        let conn_count = conn_count_clone.clone();
+        async move {
+            {
+                let mut lock = conn_count.lock().await;
+                *lock += 1;
+            }
+            conn.read_preface().await.unwrap();
+            let mut settings_sent = false;
+            let mut encoder = Encoder::new();
+            let mut decoder = specter::transport::h2::HpackDecoder::new();
+            loop {
+                let frame = match timeout(Duration::from_secs(3), conn.read_frame()).await {
+                    Ok(Ok(f)) => f,
+                    _ => break,
+                };
+                let (_len, frame_type, flags, stream_id, payload) = frame;
+                match frame_type {
+                    0x04 => {
+                        if flags & 0x01 == 0 && !settings_sent {
+                            // Send SETTINGS with ENABLE_CONNECT_PROTOCOL = 1
+                            conn.send_settings(&[
+                                (0x01, 4096),
+                                (0x03, 100),
+                                (0x04, 65535),
+                                (0x08, 1),
+                            ])
+                            .await
+                            .unwrap();
+                            conn.send_settings_ack().await.unwrap();
+                            settings_sent = true;
+                        }
+                    }
+                    0x01 => {
+                        let decoded = decoder.decode(&payload).unwrap();
+                        let mut method = String::new();
+                        let mut protocol = String::new();
+                        for (name, val) in decoded {
+                            if name == ":method" {
+                                method = val;
+                            } else if name == ":protocol" {
+                                protocol = val;
+                            }
+                        }
+
+                        if method == "CONNECT" && protocol == "websocket" {
+                            // Respond to CONNECT with 200 OK headers frame
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, false, true)
+                                .await
+                                .unwrap();
+                        } else {
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, false, true)
+                                .await
+                                .unwrap();
+
+                            conn.send_data(stream_id, b"stream-chunk-1", false)
+                                .await
+                                .unwrap();
+                            conn.send_data(stream_id, b"stream-chunk-2", true)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    0x00 => {
+                        // Echo tunnel data back
+                        conn.send_data(stream_id, &payload, flags & 0x01 != 0)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .prefer_http2(true)
+        .build()
+        .unwrap();
+
+    let ws_url = format!("{}/socket", url).replace("https://", "wss://");
+    let stream_url = format!("{}/stream", url);
+
+    // 1. Open the tunnel
+    let mut tunnel = timeout(Duration::from_secs(5), client.websocket_h2(&ws_url).open())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 2. Start streaming request
+    let (resp, mut rx) = timeout(
+        Duration::from_secs(5),
+        client.get(&stream_url).send_streaming(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // 3. Send message through tunnel and receive echo
+    tunnel
+        .send_bytes(Bytes::from("hello-tunnel"), false)
+        .await
+        .unwrap();
+    let echoed = tunnel.recv_bytes().await.unwrap().unwrap();
+    assert_eq!(echoed, Bytes::from("hello-tunnel"));
+
+    // 4. Consume stream chunks
+    assert_eq!(
+        rx.recv().await.unwrap().unwrap(),
+        Bytes::from("stream-chunk-1")
+    );
+    assert_eq!(
+        rx.recv().await.unwrap().unwrap(),
+        Bytes::from("stream-chunk-2")
+    );
+    assert!(rx.recv().await.is_none());
+
+    let count = *conn_count.lock().await;
+    assert_eq!(count, 1, "Should share exactly 1 connection");
+
+    let evidence = json!({
+        "connection_count": count,
+        "tunnel_messages": ["hello-tunnel"],
+        "streaming_chunks": ["stream-chunk-1", "stream-chunk-2"],
+        "success": true
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-013.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+// Test VAL-H2-014: RFC 8441 and streaming data routing remains independent
+#[tokio::test]
+async fn rfc8441_and_streaming_data_routing_remains_independent() {
+    init_validation_dir();
+    let (mut builder, ca_cert) = generate_cert_bundle();
+    builder.set_alpn_select_callback(|_, client_protos| {
+        boring::ssl::select_next_proto(b"\x02h2", client_protos)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let acceptor = builder.build();
+
+    let server = MockH2Server::new().await.unwrap();
+    let url = server.url_tls();
+
+    server.start_tls(acceptor, move |conn: MockH2Connection| {
+        async move {
+            conn.read_preface().await.unwrap();
+            let mut settings_sent = false;
+            let mut encoder = Encoder::new();
+            let mut decoder = specter::transport::h2::HpackDecoder::new();
+            let mut tunnel_stream_id = None;
+            loop {
+                let frame = match timeout(Duration::from_secs(3), conn.read_frame()).await {
+                    Ok(Ok(f)) => f,
+                    _ => break,
+                };
+                let (_len, frame_type, flags, stream_id, payload) = frame;
+                match frame_type {
+                    0x04 => {
+                        if flags & 0x01 == 0 && !settings_sent {
+                            conn.send_settings(&[
+                                (0x01, 4096),
+                                (0x03, 100),
+                                (0x04, 65535),
+                                (0x08, 1),
+                            ])
+                            .await
+                            .unwrap();
+                            conn.send_settings_ack().await.unwrap();
+                            settings_sent = true;
+                        }
+                    }
+                    0x01 => {
+                        let decoded = decoder.decode(&payload).unwrap();
+                        let mut method = String::new();
+                        let mut protocol = String::new();
+                        for (name, val) in decoded {
+                            if name == ":method" {
+                                method = val;
+                            } else if name == ":protocol" {
+                                protocol = val;
+                            }
+                        }
+
+                        if method == "CONNECT" && protocol == "websocket" {
+                            tunnel_stream_id = Some(stream_id);
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, false, true)
+                                .await
+                                .unwrap();
+                        } else {
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, false, true)
+                                .await
+                                .unwrap();
+
+                            // Interleave sending:
+                            // 1. Send stream chunk 1
+                            conn.send_data(stream_id, b"stream-interleaved-1", false)
+                                .await
+                                .unwrap();
+
+                            // 2. Send tunnel message 1
+                            if let Some(t_id) = tunnel_stream_id {
+                                conn.send_data(t_id, b"tunnel-interleaved-1", false)
+                                    .await
+                                    .unwrap();
+                            }
+
+                            // 3. Send stream chunk 2
+                            conn.send_data(stream_id, b"stream-interleaved-2", true)
+                                .await
+                                .unwrap();
+
+                            // 4. Send tunnel message 2
+                            if let Some(t_id) = tunnel_stream_id {
+                                conn.send_data(t_id, b"tunnel-interleaved-2", true)
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .prefer_http2(true)
+        .build()
+        .unwrap();
+
+    let ws_url = format!("{}/socket", url).replace("https://", "wss://");
+    let stream_url = format!("{}/stream", url);
+
+    // 1. Open the tunnel first so the server knows the tunnel stream ID
+    let mut tunnel = timeout(Duration::from_secs(5), client.websocket_h2(&ws_url).open())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 2. Open streaming request which triggers the interleaved sending
+    let (resp, mut rx) = timeout(
+        Duration::from_secs(5),
+        client.get(&stream_url).send_streaming(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // 3. Receive tunnel events
+    let t1 = tunnel.recv_bytes().await.unwrap().unwrap();
+    let t2 = tunnel.recv_bytes().await.unwrap().unwrap();
+    assert_eq!(t1, Bytes::from("tunnel-interleaved-1"));
+    assert_eq!(t2, Bytes::from("tunnel-interleaved-2"));
+
+    // 4. Receive stream chunks
+    let s1 = rx.recv().await.unwrap().unwrap();
+    let s2 = rx.recv().await.unwrap().unwrap();
+    assert_eq!(s1, Bytes::from("stream-interleaved-1"));
+    assert_eq!(s2, Bytes::from("stream-interleaved-2"));
+    assert!(rx.recv().await.is_none());
+
+    let evidence = json!({
+        "cross_delivery_count": 0,
+        "tunnel_received_messages": ["tunnel-interleaved-1", "tunnel-interleaved-2"],
+        "streaming_received_chunks": ["stream-interleaved-1", "stream-interleaved-2"],
+        "success": true
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-014.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+// Test VAL-H2-021: H2 pool reuse preserves fingerprint-relevant settings
+#[tokio::test]
+async fn h2_pool_reuse_preserves_fingerprint_settings() {
+    init_validation_dir();
+    let (mut builder, ca_cert) = generate_cert_bundle();
+    builder.set_alpn_select_callback(|_, client_protos| {
+        boring::ssl::select_next_proto(b"\x02h2", client_protos)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let acceptor = builder.build();
+
+    let server = MockH2Server::new().await.unwrap();
+    let url = server.url_tls();
+
+    let connection_fingerprints = Arc::new(Mutex::new(Vec::new()));
+    let connection_fingerprints_clone = connection_fingerprints.clone();
+
+    let conn_counter = Arc::new(Mutex::new(0));
+
+    server.start_tls(acceptor, move |conn: MockH2Connection| {
+        let connection_fingerprints = connection_fingerprints.clone();
+        let conn_counter = conn_counter.clone();
+        async move {
+            let conn_id = {
+                let mut counter = conn_counter.lock().await;
+                *counter += 1;
+                *counter
+            };
+
+            conn.read_preface().await.unwrap();
+            let mut settings_sent = false;
+            let mut encoder = Encoder::new();
+
+            // Read first settings frame from client
+            let (_, frame_type, flags, _, payload) = conn.read_frame().await.unwrap();
+            assert_eq!(frame_type, 0x04);
+
+            // Log setting count / details
+            let settings_len = payload.len() / 6;
+
+            connection_fingerprints.lock().await.push(json!({
+                "connection_id": conn_id,
+                "settings_count": settings_len,
+            }));
+
+            loop {
+                // Send settings and settings ack
+                if !settings_sent && flags & 0x01 == 0 {
+                    conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                        .await
+                        .unwrap();
+                    conn.send_settings_ack().await.unwrap();
+                    settings_sent = true;
+                }
+
+                let frame = match timeout(Duration::from_secs(2), conn.read_frame()).await {
+                    Ok(Ok(f)) => f,
+                    _ => break,
+                };
+                let (_len, f_type, _flags, stream_id, _payload) = frame;
+                if f_type == 0x01 {
+                    let response_headers =
+                        encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                    conn.send_headers(stream_id, &response_headers, false, true)
+                        .await
+                        .unwrap();
+                    conn.send_data(stream_id, b"ok", true).await.unwrap();
+                }
+            }
+        }
+    });
+
+    // 1. Client 1: Firefox133
+    let client_firefox = Client::builder()
+        .add_root_certificate(ca_cert.clone())
+        .prefer_http2(true)
+        .fingerprint(specter::fingerprint::FingerprintProfile::Firefox133)
+        .build()
+        .unwrap();
+
+    let (resp_ff1, mut rx_ff1) = client_firefox
+        .get(&format!("{}/stream-ff-1", url))
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(resp_ff1.status().as_u16(), 200);
+    assert_eq!(rx_ff1.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+
+    let (resp_ff2, mut rx_ff2) = client_firefox
+        .get(&format!("{}/stream-ff-2", url))
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(resp_ff2.status().as_u16(), 200);
+    assert_eq!(rx_ff2.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+
+    // 2. Client 2: Chrome142 (default settings)
+    let client_chrome = Client::builder()
+        .add_root_certificate(ca_cert)
+        .prefer_http2(true)
+        .fingerprint(specter::fingerprint::FingerprintProfile::Chrome142)
+        .build()
+        .unwrap();
+
+    let (resp_ch1, mut rx_ch1) = client_chrome
+        .get(&format!("{}/stream-ch-1", url))
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(resp_ch1.status().as_u16(), 200);
+    assert_eq!(rx_ch1.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+
+    let fingerprints = connection_fingerprints_clone.lock().await.clone();
+
+    // Verify separate connections were created because profiles are different!
+    assert_eq!(
+        fingerprints.len(),
+        2,
+        "Firefox and Chrome clients must use separate connections"
+    );
+    assert_eq!(fingerprints[0]["connection_id"], 1);
+    assert_eq!(fingerprints[1]["connection_id"], 2);
+
+    let evidence = json!({
+        "connections": fingerprints,
+        "success": true
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-021.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+// Test VAL-H2-022: RFC 8441 tunnel failures remain isolated from streaming
+#[tokio::test]
+async fn rfc8441_failures_are_isolated_from_streaming() {
+    init_validation_dir();
+    let (mut builder, ca_cert) = generate_cert_bundle();
+    builder.set_alpn_select_callback(|_, client_protos| {
+        boring::ssl::select_next_proto(b"\x02h2", client_protos)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let acceptor = builder.build();
+
+    let server = MockH2Server::new().await.unwrap();
+    let url = server.url_tls();
+
+    let conn_count = Arc::new(Mutex::new(0));
+    let conn_count_clone = conn_count.clone();
+
+    server.start_tls(acceptor, move |conn: MockH2Connection| {
+        let conn_count = conn_count_clone.clone();
+        async move {
+            {
+                let mut lock = conn_count.lock().await;
+                *lock += 1;
+            }
+            conn.read_preface().await.unwrap();
+            let mut settings_sent = false;
+            let mut encoder = Encoder::new();
+            let mut decoder = specter::transport::h2::HpackDecoder::new();
+            loop {
+                let frame = match timeout(Duration::from_secs(3), conn.read_frame()).await {
+                    Ok(Ok(f)) => f,
+                    _ => break,
+                };
+                let (_len, frame_type, flags, stream_id, payload) = frame;
+                match frame_type {
+                    0x04 => {
+                        if flags & 0x01 == 0 && !settings_sent {
+                            // Send settings with ENABLE_CONNECT_PROTOCOL = 1
+                            conn.send_settings(&[
+                                (0x01, 4096),
+                                (0x03, 100),
+                                (0x04, 65535),
+                                (0x08, 1),
+                            ])
+                            .await
+                            .unwrap();
+                            conn.send_settings_ack().await.unwrap();
+                            settings_sent = true;
+                        }
+                    }
+                    0x01 => {
+                        let decoded = decoder.decode(&payload).unwrap();
+                        let mut method = String::new();
+                        let mut protocol = String::new();
+                        for (name, val) in decoded {
+                            if name == ":method" {
+                                method = val;
+                            } else if name == ":protocol" {
+                                protocol = val;
+                            }
+                        }
+
+                        if method == "CONNECT" && protocol == "websocket" {
+                            // REFUSE CONNECT with 403 Forbidden!
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"403".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, true, true)
+                                .await
+                                .unwrap();
+                        } else {
+                            // Streaming request succeeds
+                            let response_headers =
+                                encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                            conn.send_headers(stream_id, &response_headers, false, true)
+                                .await
+                                .unwrap();
+                            conn.send_data(stream_id, b"post-failure-chunk", true)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let client = Client::builder()
+        .add_root_certificate(ca_cert)
+        .prefer_http2(true)
+        .build()
+        .unwrap();
+
+    let ws_url = format!("{}/socket", url).replace("https://", "wss://");
+    let stream_url = format!("{}/stream", url);
+
+    // 1. Attempt to open tunnel (should fail with 403)
+    let tunnel_res = client.websocket_h2(&ws_url).open().await;
+    assert!(
+        tunnel_res.is_err(),
+        "Tunnel open must fail with 403 Forbidden"
+    );
+
+    // 2. Open normal streaming response (should succeed on the same pooled connection)
+    let (resp, mut rx) = client.get(&stream_url).send_streaming().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        rx.recv().await.unwrap().unwrap(),
+        Bytes::from("post-failure-chunk")
+    );
+    assert!(rx.recv().await.is_none());
+
+    let count = *conn_count.lock().await;
+    assert_eq!(
+        count, 1,
+        "Should reuse the connection despite tunnel failure"
+    );
+
+    let evidence = json!({
+        "tunnel_failure_mode": "403 Forbidden",
+        "streaming_success": true,
+        "connection_count": count,
+        "success": true
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-022.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}

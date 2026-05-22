@@ -8,7 +8,7 @@ use super::tls::TlsFingerprint;
 /// Both Chrome 110+ and Firefox 133+ randomize TLS extension order,
 /// making static JA3 fingerprints unreliable. Modern fingerprint detection
 /// systems use JA4 which sorts extensions alphabetically for stable fingerprints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FingerprintProfile {
     /// Chrome 142 on macOS
     #[default]
