@@ -1,181 +1,12 @@
-use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
-use std::env;
-use std::fs;
-use std::io;
-use std::net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket};
-use std::path::PathBuf;
-use std::process::Command;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket as TokioUdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslFiletype};
 use quiche::h3::NameValue;
-
-const H1_PORT: u16 = 3201;
-const H2_PORT: u16 = 3202;
-const H3_PORT: u16 = 3203;
-const RFC8441_PORT: u16 = 3204;
-
-#[derive(Serialize)]
-struct Artifact {
-    benchmark: &'static str,
-    benchmark_version: &'static str,
-    environment: Environment,
-    git: Git,
-    fixture_config: FixtureConfig,
-    workload: Workload,
-    measurement_config: MeasurementConfig,
-    metric_definitions: BTreeMap<&'static str, &'static str>,
-    rows: Vec<Row>,
-    threshold_summary: ThresholdSummary,
-    public_provider_threshold_inputs: Vec<String>,
-    port_preflight: PortCheck,
-    cleanup: Cleanup,
-}
-
-#[derive(Serialize)]
-struct Environment {
-    os: String,
-    arch: String,
-    cpu_count: usize,
-    memory: String,
-    rustc: String,
-    crate_versions: BTreeMap<&'static str, &'static str>,
-}
-
-#[derive(Serialize)]
-struct Git {
-    commit_sha: String,
-    dirty_state_classification: String,
-    release_evidence_eligible: bool,
-}
-
-#[derive(Serialize)]
-struct FixtureConfig {
-    fixtures: Vec<Fixture>,
-    deterministic_payload_schedule: Vec<u64>,
-}
-
-#[derive(Serialize)]
-struct Fixture {
-    protocol: &'static str,
-    address: String,
-    health: &'static str,
-    origin_classification: &'static str,
-}
-
-#[derive(Serialize)]
-struct Workload {
-    request_count: usize,
-    concurrency_levels: Vec<usize>,
-    chunk_size: usize,
-    chunk_count: usize,
-    payload_schedule_ms: Vec<u64>,
-    tokio_runtime: &'static str,
-    pools: &'static str,
-}
-
-#[derive(Serialize)]
-struct MeasurementConfig {
-    warmup_count: usize,
-    sample_count: usize,
-    thresholded_origins: Vec<&'static str>,
-    comparable_clients_share_workload: bool,
-}
-
-#[derive(Serialize)]
-struct Row {
-    protocol: &'static str,
-    client: &'static str,
-    endpoint: String,
-    comparable: bool,
-    skip_reason: Option<&'static str>,
-    client_config: ClientConfig,
-    metrics: Metrics,
-    threshold: Threshold,
-    specter_api_path: Option<&'static str>,
-    protocol_selected_by_normal_dispatch: bool,
-    pool_reuse_metadata: PoolReuse,
-}
-
-#[derive(Serialize)]
-struct ClientConfig {
-    runtime: &'static str,
-    payload_schedule_ms: Vec<u64>,
-    chunk_size: usize,
-    request_count: usize,
-    concurrency: usize,
-    warmup_count: usize,
-    sample_count: usize,
-    decompression: &'static str,
-    byte_accounting: &'static str,
-}
-
-#[derive(Serialize, Clone)]
-struct Metrics {
-    ttft_ns: f64,
-    chunks_per_sec: f64,
-    bytes_per_sec: f64,
-    p50_ns: f64,
-    p95_ns: f64,
-    p99_ns: f64,
-    warmup_count: usize,
-    sample_count: usize,
-    connection_reuse_count: usize,
-    pass: bool,
-}
-
-#[derive(Serialize)]
-struct Threshold {
-    required: bool,
-    ttft_improvement_required_pct: f64,
-    throughput_improvement_required_pct: f64,
-    p95_regression_allowed_pct: f64,
-    status: &'static str,
-    reason: &'static str,
-}
-
-#[derive(Serialize)]
-struct PoolReuse {
-    connection_reuse_count: usize,
-    cold_or_warm_pool: &'static str,
-}
-
-#[derive(Serialize)]
-struct ThresholdSummary {
-    required_thresholds_passed: bool,
-    failed_rows: Vec<String>,
-    negative_threshold_self_check: &'static str,
-}
-
-#[derive(Serialize)]
-struct PortCheck {
-    checked_range: &'static str,
-    tcp_ports_clear_before_start: bool,
-    udp_ports_clear_before_start: bool,
-}
-
-#[derive(Serialize)]
-struct Cleanup {
-    fixture_shutdown_status: &'static str,
-    post_run_tcp_scan_clear: bool,
-    post_run_udp_scan_clear: bool,
-}
-
-struct Fixtures {
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for Fixtures {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
 
 fn generate_certs_openssl() -> (String, String) {
     let cert_path = std::env::temp_dir().join("specter_fixtures.crt");
@@ -434,6 +265,21 @@ async fn handle_h2_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
     }
 }
 
+async fn start_control_server(port: u16) -> tokio::task::JoinHandle<()> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    })
+}
+
 async fn start_h1_server(port: u16) -> tokio::task::JoinHandle<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
     tokio::spawn(async move {
@@ -464,7 +310,7 @@ async fn start_h2_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
 }
 
 async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::task::JoinHandle<()> {
-    let socket = Arc::new(TokioUdpSocket::bind(format!("127.0.0.1:{}", port)).await.unwrap());
+    let socket = Arc::new(UdpSocket::bind(format!("127.0.0.1:{}", port)).await.unwrap());
     let cert_path = cert_path.to_string();
     let key_path = key_path.to_string();
     
@@ -628,484 +474,64 @@ async fn start_h3_server(port: u16, cert_path: &str, key_path: &str) -> tokio::t
     })
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let require_thresholds = args.iter().any(|arg| arg == "--require-thresholds");
-    let json_path = json_path(&args);
+    let args: Vec<String> = std::env::args().collect();
+    let mut control_port = Some(3200);
+    let mut h1_port = Some(3201);
+    let mut h2_port = Some(3202);
+    let mut h3_port = Some(3203);
+    let mut ws_h2_port = Some(3204);
 
-    let preflight = preflight_ports()?;
-    let fixtures = start_fixtures().await?;
-    wait_for_health().await?;
+    let h1_only = args.iter().any(|arg| arg == "--h1-only");
+    let h2_only = args.iter().any(|arg| arg == "--h2-only");
+    let h3_only = args.iter().any(|arg| arg == "--h3-only");
+    let ws_h2_only = args.iter().any(|arg| arg == "--ws-h2-only");
 
-    let artifact = build_artifact(preflight).await?;
-    if let Some(path) = json_path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, serde_json::to_vec_pretty(&artifact)?)?;
-        println!("wrote benchmark artifact {}", path.display());
-    } else {
-        println!("{}", serde_json::to_string_pretty(&artifact)?);
+    if h1_only || h2_only || h3_only || ws_h2_only {
+        control_port = None;
+        if !h1_only { h1_port = None; }
+        if !h2_only { h2_port = None; }
+        if !h3_only { h3_port = None; }
+        if !ws_h2_only { ws_h2_port = None; }
     }
 
-    drop(fixtures);
-    tokio::time::sleep(Duration::from_millis(75)).await;
-
-    if require_thresholds && !artifact.threshold_summary.required_thresholds_passed {
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-fn json_path(args: &[String]) -> Option<PathBuf> {
-    args.windows(2)
-        .find(|pair| pair[0] == "--json")
-        .map(|pair| PathBuf::from(&pair[1]))
-        .or_else(|| {
-            Some(PathBuf::from(
-                "target/bench-results/streaming-vs-reqwest.json",
-            ))
-        })
-}
-
-fn preflight_ports() -> io::Result<PortCheck> {
-    for port in 3200..=3299 {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if let Ok(listener) = StdTcpListener::bind(addr) {
-            drop(listener);
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("Port {} is already in use", port),
-            ));
+    // Parse specific port overrides
+    for i in 0..args.len().saturating_sub(1) {
+        match args[i].as_str() {
+            "--control-port" => control_port = Some(args[i+1].parse().unwrap()),
+            "--h1-port" => h1_port = Some(args[i+1].parse().unwrap()),
+            "--h2-port" => h2_port = Some(args[i+1].parse().unwrap()),
+            "--h3-port" => h3_port = Some(args[i+1].parse().unwrap()),
+            "--ws-h2-port" => ws_h2_port = Some(args[i+1].parse().unwrap()),
+            _ => {}
         }
     }
-    if let Ok(udp) = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], H3_PORT))) {
-        drop(udp);
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "UDP Port 3203 is already in use",
-        ));
-    }
-    Ok(PortCheck {
-        checked_range: "127.0.0.1:3200-3299",
-        tcp_ports_clear_before_start: true,
-        udp_ports_clear_before_start: true,
-    })
-}
 
-async fn start_fixtures() -> io::Result<Fixtures> {
     let (cert_path, key_path) = generate_certs_openssl();
-    let mut tasks = Vec::new();
 
-    tasks.push(start_h1_server(H1_PORT).await);
-    tasks.push(start_h2_server(H2_PORT, &cert_path, &key_path).await);
-    tasks.push(start_h3_server(H3_PORT, &cert_path, &key_path).await);
-    tasks.push(start_h2_server(RFC8441_PORT, &cert_path, &key_path).await);
+    let mut handles = Vec::new();
 
-    Ok(Fixtures { tasks })
-}
-
-async fn wait_for_health() -> io::Result<()> {
-    for port in [H1_PORT, H2_PORT, RFC8441_PORT] {
-        let _stream = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+    if let Some(port) = control_port {
+        handles.push(start_control_server(port).await);
     }
+    if let Some(port) = h1_port {
+        handles.push(start_h1_server(port).await);
+    }
+    if let Some(port) = h2_port {
+        handles.push(start_h2_server(port, &cert_path, &key_path).await);
+    }
+    if let Some(port) = h3_port {
+        handles.push(start_h3_server(port, &cert_path, &key_path).await);
+    }
+    if let Some(port) = ws_h2_port {
+        handles.push(start_h2_server(port, &cert_path, &key_path).await);
+    }
+
+    println!("specter-bench-fixtures started");
+    for handle in handles {
+        let _ = handle.await;
+    }
+
     Ok(())
-}
-
-async fn measure_specter_streaming(
-    client: &specter::Client,
-    url: &str,
-) -> Result<(Duration, Duration, usize, usize), Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-    let (_response, mut rx) = client.get(url).send_streaming().await?;
-
-    let mut first_chunk_time = None;
-    let mut bytes_received = 0;
-    let mut chunk_count = 0;
-
-    while let Some(chunk_res) = rx.recv().await {
-        if first_chunk_time.is_none() {
-            first_chunk_time = Some(start.elapsed());
-        }
-        if let Ok(chunk) = chunk_res {
-            bytes_received += chunk.len();
-            chunk_count += 1;
-        }
-    }
-
-    let ttft = first_chunk_time.unwrap_or_else(|| start.elapsed());
-    let total_duration = start.elapsed();
-    Ok((ttft, total_duration, bytes_received, chunk_count))
-}
-
-async fn measure_reqwest_streaming(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(Duration, Duration, usize, usize), Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-    let mut response = client.get(url).send().await?;
-    let mut first_chunk_time = None;
-    let mut bytes_received = 0;
-    let mut chunk_count = 0;
-
-    while let Some(chunk) = response.chunk().await? {
-        if first_chunk_time.is_none() {
-            first_chunk_time = Some(start.elapsed());
-        }
-        bytes_received += chunk.len();
-        chunk_count += 1;
-    }
-
-    let ttft = first_chunk_time.unwrap_or_else(|| start.elapsed());
-    let total_duration = start.elapsed();
-    Ok((ttft, total_duration, bytes_received, chunk_count))
-}
-
-fn calculate_percentiles(mut values: Vec<f64>) -> (f64, f64, f64) {
-    if values.is_empty() {
-        return (0.0, 0.0, 0.0);
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let len = values.len();
-
-    let p50_idx = ((len as f64 * 0.5).ceil() as usize).saturating_sub(1);
-    let p95_idx = ((len as f64 * 0.95).ceil() as usize).saturating_sub(1);
-    let p99_idx = ((len as f64 * 0.99).ceil() as usize).saturating_sub(1);
-
-    (
-        values[p50_idx],
-        values[p95_idx.min(len - 1)],
-        values[p99_idx.min(len - 1)],
-    )
-}
-
-fn calculate_median(mut values: Vec<f64>) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let len = values.len();
-    values[len / 2]
-}
-
-async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
-    let workload = Workload {
-        request_count: 8,
-        concurrency_levels: vec![1, 8],
-        chunk_size: 1024,
-        chunk_count: 5,
-        payload_schedule_ms: vec![0, 2, 2, 2, 2],
-        tokio_runtime: "tokio multi_thread",
-        pools: "warm",
-    };
-
-    let measurement = MeasurementConfig {
-        warmup_count: 1,
-        sample_count: 3,
-        thresholded_origins: vec![
-            "127.0.0.1:3201",
-            "127.0.0.1:3202",
-            "127.0.0.1:3203/udp",
-            "127.0.0.1:3204",
-        ],
-        comparable_clients_share_workload: true,
-    };
-
-    let mut rows = Vec::new();
-    let mut required_thresholds_passed = true;
-    let mut failed_rows = Vec::new();
-
-    let use_real = env::var("SPECTER_BENCH_REAL").is_ok();
-
-    for (protocol, endpoint) in [
-        ("h1", format!("127.0.0.1:{}", H1_PORT)),
-        ("h2", format!("127.0.0.1:{}", H2_PORT)),
-        ("h3", format!("127.0.0.1:{}", H3_PORT)),
-        ("rfc8441", format!("127.0.0.1:{}", RFC8441_PORT)),
-    ] {
-        let is_comparable = matches!(protocol, "h1" | "h2");
-
-        for client in ["reqwest", "specter"] {
-            let url = if protocol == "h3" {
-                format!("https://{}", endpoint)
-            } else if protocol == "rfc8441" {
-                format!("wss://{}/socket", endpoint)
-            } else if protocol == "h2" {
-                format!("https://{}/stream", endpoint)
-            } else {
-                format!("http://{}/stream", endpoint)
-            };
-
-            let metrics = if use_real && is_comparable {
-                match run_real_measurement(protocol, client, &url, workload.chunk_size).await {
-                    Ok(m) => m,
-                    Err(_) => Metrics {
-                        ttft_ns: 1_000_000.0,
-                        chunks_per_sec: 1000.0,
-                        bytes_per_sec: 10000.0,
-                        p50_ns: 1_000_000.0,
-                        p95_ns: 1_000_000.0,
-                        p99_ns: 1_000_000.0,
-                        warmup_count: measurement.warmup_count,
-                        sample_count: measurement.sample_count,
-                        connection_reuse_count: 0,
-                        pass: false,
-                    }
-                }
-            } else {
-                Metrics {
-                    ttft_ns: if client == "specter" { 900_000.0 } else { 1_000_000.0 },
-                    chunks_per_sec: if client == "specter" { 3300.0 } else { 3000.0 },
-                    bytes_per_sec: if client == "specter" { 36_300.0 } else { 33_000.0 },
-                    p50_ns: if client == "specter" { 900_000.0 } else { 1_000_000.0 },
-                    p95_ns: if client == "specter" { 1_150_000.0 } else { 1_200_000.0 },
-                    p99_ns: if client == "specter" { 1_250_000.0 } else { 1_300_000.0 },
-                    warmup_count: measurement.warmup_count,
-                    sample_count: measurement.sample_count,
-                    connection_reuse_count: 7,
-                    pass: true,
-                }
-            };
-
-            let is_row_pass = metrics.pass;
-
-            rows.push(Row {
-                protocol,
-                client,
-                endpoint: endpoint.clone(),
-                comparable: is_comparable,
-                skip_reason: if !is_comparable {
-                    Some("reqwest does not expose a stable directly comparable high-level H3/RFC8441 streaming API in this harness")
-                } else {
-                    None
-                },
-                client_config: ClientConfig {
-                    runtime: workload.tokio_runtime,
-                    payload_schedule_ms: workload.payload_schedule_ms.clone(),
-                    chunk_size: workload.chunk_size,
-                    request_count: workload.request_count,
-                    concurrency: 1,
-                    warmup_count: measurement.warmup_count,
-                    sample_count: measurement.sample_count,
-                    decompression: "disabled",
-                    byte_accounting: "body bytes only; headers excluded",
-                },
-                metrics,
-                threshold: Threshold {
-                    required: is_comparable,
-                    ttft_improvement_required_pct: 5.0,
-                    throughput_improvement_required_pct: 5.0,
-                    p95_regression_allowed_pct: 0.0,
-                    status: if is_row_pass { "pass" } else { "fail" },
-                    reason: "foundation deterministic row; transport workers replace synthetic metrics with measured optimized transport rows",
-                },
-                specter_api_path: if client == "specter" {
-                    Some("specter::Client -> RequestBuilder::send_streaming")
-                } else {
-                    None
-                },
-                protocol_selected_by_normal_dispatch: client == "specter",
-                pool_reuse_metadata: PoolReuse {
-                    connection_reuse_count: 7,
-                    cold_or_warm_pool: "warm",
-                },
-            });
-
-            if is_comparable && !is_row_pass {
-                required_thresholds_passed = false;
-                failed_rows.push(format!("{} - {}", protocol, client));
-            }
-        }
-    }
-
-    Ok(Artifact {
-        benchmark: "streaming_vs_reqwest",
-        benchmark_version: "foundation-1",
-        environment: environment(),
-        git: git(),
-        fixture_config: FixtureConfig {
-            fixtures: vec![
-                Fixture { protocol: "h1", address: format!("127.0.0.1:{}", H1_PORT), health: "healthy", origin_classification: "localhost-threshold" },
-                Fixture { protocol: "h2", address: format!("127.0.0.1:{}", H2_PORT), health: "healthy", origin_classification: "localhost-threshold" },
-                Fixture { protocol: "h3", address: format!("127.0.0.1:{}", H3_PORT), health: "healthy", origin_classification: "localhost-threshold" },
-                Fixture { protocol: "rfc8441", address: format!("127.0.0.1:{}", RFC8441_PORT), health: "healthy", origin_classification: "localhost-threshold" },
-            ],
-            deterministic_payload_schedule: workload.payload_schedule_ms.clone(),
-        },
-        workload,
-        measurement_config: measurement,
-        metric_definitions: metric_definitions(),
-        rows,
-        threshold_summary: ThresholdSummary {
-            required_thresholds_passed,
-            failed_rows,
-            negative_threshold_self_check: "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false",
-        },
-        public_provider_threshold_inputs: Vec::new(),
-        port_preflight: preflight,
-        cleanup: Cleanup {
-            fixture_shutdown_status: "all fixture tasks aborted before process exit",
-            post_run_tcp_scan_clear: true,
-            post_run_udp_scan_clear: true,
-        },
-    })
-}
-
-async fn run_real_measurement(
-    protocol: &str,
-    client: &str,
-    url: &str,
-    _chunk_size: usize,
-) -> Result<Metrics, Box<dyn std::error::Error>> {
-    let mut ttft_values = Vec::new();
-    let mut throughput_values = Vec::new();
-    let mut chunk_rates = Vec::new();
-
-    if client == "specter" {
-        let specter_client = specter::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .prefer_http2(protocol == "h2")
-            .build()?;
-        let _ = measure_specter_streaming(&specter_client, url).await;
-    } else {
-        let reqwest_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-        let _ = measure_reqwest_streaming(&reqwest_client, url).await;
-    }
-
-    let sample_count = 3;
-
-    for _ in 0..sample_count {
-        if client == "specter" {
-            let specter_client = specter::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .prefer_http2(protocol == "h2")
-                .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) = measure_specter_streaming(&specter_client, url).await {
-                let ttft_ns = ttft.as_nanos() as f64;
-                let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 { body_duration } else { 1e-9 };
-                let chunks_per_sec = chunks as f64 / body_duration;
-                let bytes_per_sec = bytes as f64 / body_duration;
-
-                ttft_values.push(ttft_ns);
-                throughput_values.push(bytes_per_sec);
-                chunk_rates.push(chunks_per_sec);
-            }
-        } else {
-            let reqwest_client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) = measure_reqwest_streaming(&reqwest_client, url).await {
-                let ttft_ns = ttft.as_nanos() as f64;
-                let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 { body_duration } else { 1e-9 };
-                let chunks_per_sec = chunks as f64 / body_duration;
-                let bytes_per_sec = bytes as f64 / body_duration;
-
-                ttft_values.push(ttft_ns);
-                throughput_values.push(bytes_per_sec);
-                chunk_rates.push(chunks_per_sec);
-            }
-        }
-    }
-
-    if ttft_values.is_empty() {
-        return Err("No successful samples".into());
-    }
-
-    let (p50, p95, p99) = calculate_percentiles(ttft_values.clone());
-    let median_throughput = calculate_median(throughput_values);
-    let median_chunk_rate = calculate_median(chunk_rates);
-
-    Ok(Metrics {
-        ttft_ns: p50,
-        chunks_per_sec: median_chunk_rate,
-        bytes_per_sec: median_throughput,
-        p50_ns: p50,
-        p95_ns: p95,
-        p99_ns: p99,
-        warmup_count: 1,
-        sample_count,
-        connection_reuse_count: 7,
-        pass: true,
-    })
-}
-
-fn environment() -> Environment {
-    let mut crate_versions = BTreeMap::new();
-    crate_versions.insert("specters", env!("CARGO_PKG_VERSION"));
-    crate_versions.insert("reqwest", "0.12");
-
-    Environment {
-        os: env::consts::OS.into(),
-        arch: env::consts::ARCH.into(),
-        cpu_count: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        memory: "not_collected".into(),
-        rustc: command_output("rustc", &["--version"]),
-        crate_versions,
-    }
-}
-
-fn git() -> Git {
-    Git {
-        commit_sha: command_output("git", &["rev-parse", "HEAD"]),
-        dirty_state_classification: "target/validation/state-isolation.json if present; benchmark rows mark dirty evidence ineligible until release gate".into(),
-        release_evidence_eligible: false,
-    }
-}
-
-fn metric_definitions() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        (
-            "ttft_ns",
-            "elapsed nanoseconds from request start until first body byte is observable",
-        ),
-        (
-            "chunks_per_sec",
-            "decoded body chunks received divided by body receive duration",
-        ),
-        (
-            "bytes_per_sec",
-            "decoded body bytes received divided by body receive duration; body bytes only",
-        ),
-        (
-            "p50_ns",
-            "nearest-rank 50th percentile over sample TTFT values",
-        ),
-        (
-            "p95_ns",
-            "nearest-rank 95th percentile over sample TTFT values",
-        ),
-        (
-            "p99_ns",
-            "nearest-rank 99th percentile over sample TTFT values",
-        ),
-        (
-            "connection_reuse_count",
-            "number of requests after the first that used an existing warm connection",
-        ),
-        (
-            "p95_regression_allowed_pct",
-            "0 means Specter p95 TTFT must be less than or equal to reqwest p95 TTFT",
-        ),
-    ])
-}
-
-fn command_output(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
 }
