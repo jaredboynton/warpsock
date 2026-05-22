@@ -137,8 +137,10 @@ impl MockH3Server {
 
         // Ring usage removed (unused)
 
-        let mut connections: HashMap<ConnectionId<'static>, mpsc::Sender<(Vec<u8>, SocketAddr)>> =
-            HashMap::new();
+        let connections = Arc::new(Mutex::new(HashMap::<
+            Vec<u8>,
+            mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        >::new()));
         let socket = self.socket.clone();
         // Need local addr for accept
         let local_addr = socket.local_addr().unwrap();
@@ -161,26 +163,42 @@ impl MockH3Server {
             };
             let packet = buf[..len].to_vec();
 
-            let header = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN)
-            {
+            let header = match quiche::Header::from_slice(&mut buf[..len], 16) {
                 Ok(h) => h,
-                Err(_) if connections.len() == 1 => {
-                    if let Some(tx) = connections.values().next() {
-                        let _ = tx.send((packet, peer)).await;
+                Err(_) => {
+                    let conns = connections.lock().await;
+                    if conns.len() == 1 {
+                        if let Some(tx) = conns.values().next() {
+                            let _ = tx.send((packet, peer)).await;
+                        }
                     }
                     continue;
                 }
-                Err(_) => continue,
             };
 
-            let conn_id = header.dcid.clone();
+            let conn_id = header.dcid.as_ref().to_vec();
+            println!(
+                "MockH3Server: received packet, dcid: {:?}, type: {:?}",
+                header.dcid, header.ty
+            );
 
             // If new connection
-            if !connections.contains_key(&conn_id) {
+            let is_new = {
+                let conns = connections.lock().await;
+                !conns.contains_key(&conn_id)
+            };
+
+            if is_new {
+                let mut conns = connections.lock().await;
                 if header.ty != quiche::Type::Initial {
-                    if connections.len() == 1 {
-                        if let Some(tx) = connections.values().next() {
-                            let _ = tx.send((packet, peer)).await;
+                    println!(
+                        "MockH3Server: non-initial packet for unknown connection, dcid: {:?}",
+                        header.dcid
+                    );
+                    if conns.len() == 1 {
+                        if let Some(tx) = conns.values().next().cloned() {
+                            drop(conns);
+                            let _ = tx.send((packet.clone(), peer)).await;
                         }
                     }
                     continue;
@@ -193,9 +211,12 @@ impl MockH3Server {
 
                 // Actually need to clone it to static
                 let scid = header.dcid.into_owned();
+                println!("MockH3Server: new connection, client scid: {:?}", scid);
 
                 let (tx, mut rx) = mpsc::channel(100);
-                connections.insert(scid.clone(), tx.clone());
+                conns.insert(scid.as_ref().to_vec(), tx.clone());
+                drop(conns);
+
                 connection_count.fetch_add(1, Ordering::SeqCst);
 
                 // Spawn connection handler
@@ -227,6 +248,8 @@ impl MockH3Server {
 
                 let cert_path_clone = cert_path.clone();
                 let key_path_clone = key_path.clone();
+                let connections_clone = connections.clone();
+                let tx_clone = tx.clone();
 
                 tokio::spawn(async move {
                     // Create configuration for this connection
@@ -255,6 +278,14 @@ impl MockH3Server {
                         quiche::accept(&scid_clone, Some(&odcid), local_addr, peer, &mut config)
                             .unwrap();
 
+                    // Register the server's generated source connection ID!
+                    let server_scid = conn.source_id().as_ref().to_vec();
+                    println!(
+                        "MockH3Server: registering server source connection ID: {:?}",
+                        conn.source_id()
+                    );
+                    connections_clone.lock().await.insert(server_scid, tx_clone);
+
                     let mut h3_conn: Option<quiche::h3::Connection> = None;
 
                     let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
@@ -278,12 +309,14 @@ impl MockH3Server {
                             res = rx.recv() => {
                                 match res {
                                     Some((packet, from)) => {
+                                        println!("MockH3Server Task: rx.recv received packet of len {}", packet.len());
                                         let recv_info = quiche::RecvInfo {
                                             to: socket_clone.local_addr().unwrap(),
                                             from,
                                         };
                                         match conn.recv(&mut packet.clone(), recv_info) {
                                             Ok(_) => {
+                                                println!("MockH3Server Task: conn.recv succeeded");
                                                 if conn.is_established() && h3_conn.is_none() {
                                                     let mut h3_config = quiche::h3::Config::new().unwrap();
                                                     if enable_extended_connect {
@@ -394,22 +427,60 @@ impl MockH3Server {
                         }
 
                         while let Ok((len, send_info)) = conn.send(&mut out) {
+                            println!(
+                                "MockH3Server Task: conn.send sending packet of len {} to {}",
+                                len, send_info.to
+                            );
                             let _ = socket_clone.send_to(&out[..len], send_info.to).await;
                         }
 
                         if conn.is_closed() {
+                            println!("MockH3Server Task: connection is closed, breaking loop");
                             break;
                         }
                     }
                 });
             }
 
-            if let Some(tx) = connections.get(&conn_id) {
-                let _ = tx.send((packet, peer)).await;
-            } else if connections.len() == 1 {
-                if let Some(tx) = connections.values().next() {
-                    let _ = tx.send((packet, peer)).await;
+            let tx_to_send = {
+                let conns = connections.lock().await;
+                if let Some(tx) = conns.get(&conn_id).cloned() {
+                    println!(
+                        "MockH3Server: routed packet of len {} to connection {:?}",
+                        packet.len(),
+                        conn_id
+                    );
+                    Some(tx)
+                } else if let Some((matched_id, tx)) =
+                    conns.iter().find(|(k, _)| k.starts_with(&conn_id))
+                {
+                    println!(
+                        "MockH3Server: routed packet of len {} to prefix-matched connection {:?}",
+                        packet.len(),
+                        matched_id
+                    );
+                    Some(tx.clone())
+                } else if conns.len() == 1 {
+                    if let Some(tx) = conns.values().next().cloned() {
+                        println!(
+                            "MockH3Server: routed packet of len {} to single connection fallback",
+                            packet.len()
+                        );
+                        Some(tx)
+                    } else {
+                        None
+                    }
+                } else {
+                    println!(
+                        "MockH3Server: dropped packet of len {} with no matching connection",
+                        packet.len()
+                    );
+                    None
                 }
+            };
+
+            if let Some(tx) = tx_to_send {
+                let _ = tx.send((packet, peer)).await;
             }
         }
     }

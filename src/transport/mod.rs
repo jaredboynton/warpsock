@@ -5,6 +5,7 @@
 //! - HTTP/3 via quiche
 
 pub mod connector;
+pub mod dns;
 pub mod h1;
 pub mod h1_h2;
 pub mod h2;

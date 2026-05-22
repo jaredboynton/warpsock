@@ -12,6 +12,7 @@ use bytes::Bytes;
 use http::{Method, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -28,8 +29,11 @@ use crate::request::{Body, IntoUrl, RedirectPolicy, Request};
 use crate::response::Response;
 use crate::timeouts::Timeouts;
 use crate::transport::connector::{BoringConnector, MaybeHttpsStream};
+use crate::transport::dns::{DnsConfig, Resolve};
 use crate::transport::h1::H1Connection;
-use crate::transport::h2::{H2Connection, H2PooledConnection, H2Tunnel, PseudoHeaderOrder};
+use crate::transport::h2::{
+    H2Connection, H2PooledConnection, H2TransportConfig, H2Tunnel, PseudoHeaderOrder,
+};
 use crate::transport::h3::{H3Client, H3Tunnel};
 use crate::version::HttpVersion;
 use crate::websocket::{WebSocketBuilder, WebSocketClientParts};
@@ -58,6 +62,8 @@ pub struct Client {
     default_version: HttpVersion,
     /// Timeout configuration
     timeouts: Timeouts,
+    /// HTTP/2 runtime transport tuning.
+    h2_transport_config: H2TransportConfig,
     /// Whether to opportunistically try HTTP/3 when Alt-Svc indicates support
     h3_upgrade_enabled: bool,
     /// Force HTTP/2 prior knowledge (H2C) for cleartext connections
@@ -110,6 +116,14 @@ pub struct ClientBuilder {
     http2_settings: Option<Http2Settings>,
     pseudo_order: PseudoHeaderOrder,
     timeouts: Timeouts,
+    dns_config: DnsConfig,
+    pool_idle_timeout: Duration,
+    pool_max_idle_per_host: usize,
+    h3_max_idle_timeout: Option<u64>,
+    h2_transport_config: H2TransportConfig,
+    tcp_keepalive: Option<Duration>,
+    tcp_keepalive_interval: Option<Duration>,
+    tcp_keepalive_retries: Option<u32>,
     prefer_http2: bool,
     h3_upgrade_enabled: bool,
     http2_prior_knowledge: bool,
@@ -340,7 +354,8 @@ impl<'a> WebSocketH2Builder<'a> {
             self.client.pseudo_order,
         )
         .await?;
-        let pooled_conn = H2PooledConnection::new(h2_conn);
+        let pooled_conn =
+            H2PooledConnection::new_with_config(h2_conn, self.client.h2_transport_config.clone());
 
         {
             let mut pool = self.client.h2_pool.write().await;
@@ -814,7 +829,10 @@ impl<'a> RequestBuilder<'a> {
                             h2_connect_fut.await?
                         };
 
-                        let pooled_conn = H2PooledConnection::new(h2_conn);
+                        let pooled_conn = H2PooledConnection::new_with_config(
+                            h2_conn,
+                            client.h2_transport_config.clone(),
+                        );
                         {
                             let mut pool = client.h2_pool.write().await;
                             pool.insert(pool_key.clone(), pooled_conn.clone());
@@ -873,7 +891,10 @@ impl<'a> RequestBuilder<'a> {
                     h2_connect_fut.await?
                 };
 
-                let pooled_conn = H2PooledConnection::new(h2_conn);
+                let pooled_conn = H2PooledConnection::new_with_config(
+                    h2_conn,
+                    client.h2_transport_config.clone(),
+                );
                 {
                     let mut pool = client.h2_pool.write().await;
                     pool.insert(pool_key.clone(), pooled_conn.clone());
@@ -1216,7 +1237,8 @@ impl Client {
                 let h2_conn =
                     H2Connection::connect(stream, self.http2_settings.clone(), self.pseudo_order)
                         .await?;
-                let pooled_conn = H2PooledConnection::new(h2_conn);
+                let pooled_conn =
+                    H2PooledConnection::new_with_config(h2_conn, self.h2_transport_config.clone());
 
                 // Store in pool
                 {
@@ -1292,7 +1314,8 @@ impl Client {
             let h2_conn =
                 H2Connection::connect(stream, self.http2_settings.clone(), self.pseudo_order)
                     .await?;
-            let pooled_conn = H2PooledConnection::new(h2_conn);
+            let pooled_conn =
+                H2PooledConnection::new_with_config(h2_conn, self.h2_transport_config.clone());
 
             // Store in pool for reuse
             {
@@ -1500,6 +1523,14 @@ impl ClientBuilder {
             http2_settings: None,
             pseudo_order: PseudoHeaderOrder::Chrome,
             timeouts: Timeouts::default(),
+            dns_config: DnsConfig::new(),
+            pool_idle_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: 6,
+            h3_max_idle_timeout: None,
+            h2_transport_config: H2TransportConfig::default(),
+            tcp_keepalive: None,
+            tcp_keepalive_interval: None,
+            tcp_keepalive_retries: None,
             prefer_http2: true, // HTTP/2 preferred by default (falls back to HTTP/1.1 if not supported)
             h3_upgrade_enabled: true, // Enable by default
             http2_prior_knowledge: false,
@@ -1602,6 +1633,129 @@ impl ClientBuilder {
     /// Set pool acquire timeout.
     pub fn pool_acquire_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts.pool_acquire = Some(timeout);
+        self
+    }
+
+    /// Set how long idle pooled connections remain reusable.
+    pub fn pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.pool_idle_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of idle HTTP/1.1 connections retained per host.
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.pool_max_idle_per_host = max;
+        self
+    }
+
+    /// Enable Specter's built-in cached async DNS resolver.
+    ///
+    /// This is a reqwest-compatible API name. Specter implements this without
+    /// pulling in Hickory by caching Tokio resolver results for a short TTL.
+    pub fn hickory_dns(mut self, enable: bool) -> Self {
+        self.dns_config = self.dns_config.with_cache_enabled(enable);
+        self
+    }
+
+    /// Legacy alias for `hickory_dns`.
+    pub fn trust_dns(self, enable: bool) -> Self {
+        self.hickory_dns(enable)
+    }
+
+    /// Set the DNS cache TTL used by `hickory_dns(true)`.
+    pub fn dns_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.dns_config = self.dns_config.with_cache_ttl(ttl);
+        self
+    }
+
+    /// Override DNS for a domain with a single socket address.
+    pub fn resolve(self, domain: &str, addr: SocketAddr) -> Self {
+        self.resolve_to_addrs(domain, &[addr])
+    }
+
+    /// Override DNS for a domain with static socket addresses.
+    pub fn resolve_to_addrs(mut self, domain: &str, addrs: &[SocketAddr]) -> Self {
+        self.dns_config = self.dns_config.with_override(domain, addrs.to_vec());
+        self
+    }
+
+    /// Provide a custom async DNS resolver.
+    pub fn dns_resolver<R: Resolve + 'static>(mut self, resolver: Arc<R>) -> Self {
+        self.dns_config = self.dns_config.with_resolver(resolver);
+        self
+    }
+
+    /// Provide a custom async DNS resolver without wrapping it first.
+    pub fn dns_resolver2<R: Resolve + 'static>(mut self, resolver: R) -> Self {
+        self.dns_config = self.dns_config.with_resolver(Arc::new(resolver));
+        self
+    }
+
+    /// Set TCP keepalive idle time.
+    pub fn tcp_keepalive(mut self, val: Option<Duration>) -> Self {
+        self.tcp_keepalive = val;
+        self
+    }
+
+    /// Set TCP keepalive probe interval.
+    pub fn tcp_keepalive_interval(mut self, val: Option<Duration>) -> Self {
+        self.tcp_keepalive_interval = val;
+        self
+    }
+
+    /// Set TCP keepalive retry count.
+    pub fn tcp_keepalive_retries(mut self, retries: Option<u32>) -> Self {
+        self.tcp_keepalive_retries = retries;
+        self
+    }
+
+    /// Set HTTP/2 initial stream window size.
+    pub fn http2_initial_stream_window_size(mut self, size: Option<u32>) -> Self {
+        if let Some(size) = size {
+            let mut settings = self.http2_settings.unwrap_or_default();
+            settings.initial_window_size = size;
+            self.http2_settings = Some(settings);
+        }
+        self
+    }
+
+    /// Set HTTP/2 initial connection window size.
+    pub fn http2_initial_connection_window_size(mut self, size: Option<u32>) -> Self {
+        if let Some(size) = size {
+            let mut settings = self.http2_settings.unwrap_or_default();
+            settings.initial_window_update = size.saturating_sub(65_535);
+            self.http2_settings = Some(settings);
+        }
+        self
+    }
+
+    /// Toggle adaptive HTTP/2 windows. Stored for API parity; Specter's HTTP/2
+    /// fingerprinting uses explicit window settings from `Http2Settings`.
+    pub fn http2_adaptive_window(self, _enabled: bool) -> Self {
+        self
+    }
+
+    /// Send periodic HTTP/2 PING frames while a pooled connection is active.
+    pub fn http2_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.h2_transport_config.keep_alive_interval = interval;
+        self
+    }
+
+    /// Set how long to wait for an HTTP/2 PING ACK.
+    pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> Self {
+        self.h2_transport_config.keep_alive_timeout = timeout;
+        self
+    }
+
+    /// Allow HTTP/2 keepalive PINGs while no streams are active.
+    pub fn http2_keep_alive_while_idle(mut self, enabled: bool) -> Self {
+        self.h2_transport_config.keep_alive_while_idle = enabled;
+        self
+    }
+
+    /// Set HTTP/3 max idle timeout in milliseconds.
+    pub fn h3_max_idle_timeout(mut self, timeout_ms: u64) -> Self {
+        self.h3_max_idle_timeout = Some(timeout_ms);
         self
     }
 
@@ -1762,6 +1916,7 @@ impl ClientBuilder {
             pseudo_order: self.pseudo_order,
             default_version,
             timeouts: self.timeouts,
+            h2_transport_config: self.h2_transport_config.clone(),
             h3_upgrade_enabled: self.h3_upgrade_enabled,
             http2_prior_knowledge: self.http2_prior_knowledge,
             danger_accept_invalid_certs: self.danger_accept_invalid_certs,

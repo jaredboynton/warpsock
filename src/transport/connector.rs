@@ -7,12 +7,14 @@ use std::io;
 use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
 use crate::error::Error;
 use crate::fingerprint::tls::TlsFingerprint;
+use crate::transport::dns::DnsConfig;
 use crate::transport::tcp::{configure_tcp_socket, TcpFingerprint};
 
 // FFI bindings for BoringSSL extension control
@@ -109,11 +111,20 @@ unsafe extern "C" fn decompress_zlib_cert(
 pub struct BoringConnector {
     tls_config: Option<TlsFingerprint>,
     tcp_fingerprint: Option<TcpFingerprint>,
+    dns_config: DnsConfig,
+    tcp_keepalive: TcpKeepaliveConfig,
     root_certs: Vec<Vec<u8>>,
     /// Load root certificates from the OS certificate store at runtime
     use_platform_roots: bool,
     /// Skip TLS certificate verification (DANGEROUS - for testing only)
     danger_accept_invalid_certs: bool,
+}
+
+#[derive(Clone, Default)]
+struct TcpKeepaliveConfig {
+    time: Option<Duration>,
+    interval: Option<Duration>,
+    retries: Option<u32>,
 }
 
 impl BoringConnector {
@@ -126,6 +137,8 @@ impl BoringConnector {
         Self {
             tls_config: None,
             tcp_fingerprint: None,
+            dns_config: DnsConfig::new(),
+            tcp_keepalive: TcpKeepaliveConfig::default(),
             root_certs: Vec::new(),
             use_platform_roots: false,
             danger_accept_invalid_certs: false,
@@ -137,6 +150,8 @@ impl BoringConnector {
         Self {
             tls_config: Some(fp),
             tcp_fingerprint: None,
+            dns_config: DnsConfig::new(),
+            tcp_keepalive: TcpKeepaliveConfig::default(),
             root_certs: Vec::new(),
             use_platform_roots: false,
             danger_accept_invalid_certs: false,
@@ -148,6 +163,8 @@ impl BoringConnector {
         Self {
             tls_config: Some(tls_fp),
             tcp_fingerprint: Some(tcp_fp),
+            dns_config: DnsConfig::new(),
+            tcp_keepalive: TcpKeepaliveConfig::default(),
             root_certs: Vec::new(),
             use_platform_roots: false,
             danger_accept_invalid_certs: false,
@@ -157,6 +174,30 @@ impl BoringConnector {
     /// Set TCP fingerprint configuration.
     pub fn with_tcp_fingerprint(mut self, tcp_fp: TcpFingerprint) -> Self {
         self.tcp_fingerprint = Some(tcp_fp);
+        self
+    }
+
+    /// Set DNS resolution configuration.
+    pub fn with_dns_config(mut self, dns_config: DnsConfig) -> Self {
+        self.dns_config = dns_config;
+        self
+    }
+
+    /// Set TCP keepalive idle time.
+    pub fn tcp_keepalive(mut self, time: Option<Duration>) -> Self {
+        self.tcp_keepalive.time = time;
+        self
+    }
+
+    /// Set TCP keepalive probe interval.
+    pub fn tcp_keepalive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.tcp_keepalive.interval = interval;
+        self
+    }
+
+    /// Set TCP keepalive retry count.
+    pub fn tcp_keepalive_retries(mut self, retries: Option<u32>) -> Self {
+        self.tcp_keepalive.retries = retries;
         self
     }
 
@@ -488,54 +529,49 @@ impl BoringConnector {
                 80
             });
 
-        let addr = format!("{}:{}", host, port);
+        let addrs = self.dns_config.resolve(host, port).await?;
 
         // Configure TCP socket options if fingerprint is provided
         let tcp_stream = if let Some(ref tcp_fp) = self.tcp_fingerprint {
             // Create socket2 socket, configure it, then connect and convert to tokio TcpStream
             use socket2::{Domain, Socket, Type};
-            use std::net::SocketAddr;
-            use tokio::net::lookup_host;
             use tokio::task;
-
-            // Resolve hostname to IP address (tokio handles async DNS resolution)
-            let socket_addr: SocketAddr = lookup_host(&addr)
-                .await
-                .map_err(|e| {
-                    Error::Connection(format!("DNS resolution failed for {}: {}", addr, e))
-                })?
-                .next()
-                .ok_or_else(|| Error::Connection(format!("No addresses found for {}", addr)))?;
-
-            let domain = match socket_addr {
-                SocketAddr::V4(_) => Domain::IPV4,
-                SocketAddr::V6(_) => Domain::IPV6,
-            };
 
             // Perform blocking socket operations in a blocking task
             let tcp_fp_clone = tcp_fp.clone();
-            let socket_addr_copy = socket_addr;
+            let keepalive = self.tcp_keepalive.clone();
+            let host_for_error = host.to_string();
             let std_stream = task::spawn_blocking(move || -> Result<std::net::TcpStream, Error> {
-                let socket = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP))
-                    .map_err(|e| Error::Connection(format!("Failed to create socket: {}", e)))?;
+                let mut last_error = None;
+                for socket_addr in addrs {
+                    let domain = match socket_addr {
+                        std::net::SocketAddr::V4(_) => Domain::IPV4,
+                        std::net::SocketAddr::V6(_) => Domain::IPV6,
+                    };
+                    let socket = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP))
+                        .map_err(|e| Error::Connection(format!("Failed to create socket: {e}")))?;
 
-                // Configure TCP fingerprint options
-                configure_tcp_socket(&socket, &tcp_fp_clone).map_err(|e| {
-                    Error::Connection(format!("Failed to configure TCP socket: {}", e))
-                })?;
+                    configure_tcp_socket(&socket, &tcp_fp_clone).map_err(|e| {
+                        Error::Connection(format!("Failed to configure TCP socket: {e}"))
+                    })?;
+                    apply_tcp_keepalive(socket2::SockRef::from(&socket), &keepalive)?;
 
-                // Connect synchronously (socket2 handles this)
-                socket
-                    .connect(&socket_addr_copy.into())
-                    .map_err(|e| Error::Connection(format!("Failed to connect: {}", e)))?;
-
-                // Set to non-blocking mode for tokio compatibility (required by tokio 1.48+)
-                socket
-                    .set_nonblocking(true)
-                    .map_err(|e| Error::Connection(format!("Failed to set non-blocking: {}", e)))?;
-
-                // Convert to std::net::TcpStream
-                Ok(socket.into())
+                    match socket.connect(&socket_addr.into()) {
+                        Ok(()) => {
+                            socket.set_nonblocking(true).map_err(|e| {
+                                Error::Connection(format!("Failed to set non-blocking: {e}"))
+                            })?;
+                            return Ok(socket.into());
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(Error::Connection(format!(
+                    "Failed to connect to {host_for_error}:{port}: {}",
+                    last_error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no addresses resolved".to_string())
+                )))
             })
             .await
             .map_err(|e| Error::Connection(format!("Blocking task failed: {}", e)))??;
@@ -546,9 +582,27 @@ impl BoringConnector {
             })?
         } else {
             // Default connection without TCP fingerprinting
-            TcpStream::connect(&addr)
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to connect to {}: {}", addr, e)))?
+            let mut last_error = None;
+            let mut connected = None;
+            for addr in addrs {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            let stream = connected.ok_or_else(|| {
+                Error::Connection(format!(
+                    "Failed to connect to {host}:{port}: {}",
+                    last_error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no addresses resolved".to_string())
+                ))
+            })?;
+            apply_tcp_keepalive_to_stream(&stream, &self.tcp_keepalive)?;
+            stream
         };
 
         if uri.scheme_str() == Some("https") {
@@ -578,4 +632,40 @@ impl Default for BoringConnector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn apply_tcp_keepalive_to_stream(
+    stream: &TcpStream,
+    config: &TcpKeepaliveConfig,
+) -> Result<(), Error> {
+    apply_tcp_keepalive(socket2::SockRef::from(stream), config)
+}
+
+fn apply_tcp_keepalive(
+    socket: socket2::SockRef<'_>,
+    config: &TcpKeepaliveConfig,
+) -> Result<(), Error> {
+    let Some(params) = tcp_keepalive_params(config) else {
+        return Ok(());
+    };
+    socket
+        .set_tcp_keepalive(&params)
+        .map_err(|e| Error::Connection(format!("Failed to set TCP keepalive: {e}")))
+}
+
+fn tcp_keepalive_params(config: &TcpKeepaliveConfig) -> Option<socket2::TcpKeepalive> {
+    if config.time.is_none() && config.interval.is_none() && config.retries.is_none() {
+        return None;
+    }
+    let mut params = socket2::TcpKeepalive::new();
+    if let Some(time) = config.time {
+        params = params.with_time(time);
+    }
+    if let Some(interval) = config.interval {
+        params = params.with_interval(interval);
+    }
+    if let Some(retries) = config.retries {
+        params = params.with_retries(retries);
+    }
+    Some(params)
 }

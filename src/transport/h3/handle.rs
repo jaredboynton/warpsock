@@ -18,17 +18,29 @@ use crate::transport::h3::H3Tunnel;
 pub struct H3Handle {
     /// Channel for sending commands to the driver
     command_tx: mpsc::Sender<DriverCommand>,
+    is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl H3Handle {
     /// Create a new handle with a command channel to the driver
-    pub fn new(command_tx: mpsc::Sender<DriverCommand>) -> Self {
-        Self { command_tx }
+    pub fn new(
+        command_tx: mpsc::Sender<DriverCommand>,
+        is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            command_tx,
+            is_draining,
+        }
     }
 
     /// Return true when the backing driver command channel has closed.
     pub fn is_closed(&self) -> bool {
         self.command_tx.is_closed()
+    }
+
+    /// Return true when the connection is draining (GOAWAY received)
+    pub fn is_draining(&self) -> bool {
+        self.is_draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Send an HTTP/3 request and receive the response.

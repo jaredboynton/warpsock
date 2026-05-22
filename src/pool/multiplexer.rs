@@ -212,11 +212,17 @@ impl ConnectionPool {
 
     /// Return an HTTP/1.1 connection to the pool
     pub async fn put_h1(&self, key: PoolKey, stream: MaybeHttpsStream) {
+        if self.max_connections_per_host == 0 {
+            return;
+        }
         let start = Instant::now();
         tracing::debug!("H1 Pool: Returning connection for {:?}", key);
         let mut pool = self.h1_idle.write().await;
         let entries = pool.entry(key.clone()).or_default();
         let count_before = entries.len();
+        while entries.len() >= self.max_connections_per_host {
+            entries.remove(0);
+        }
         entries.push(H1PoolEntry::new(stream));
         tracing::debug!(
             "H1 Pool: Returned connection for {:?} (pool size: {} -> {}, took {:?})",

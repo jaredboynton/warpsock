@@ -19,6 +19,7 @@ pub use tunnel::{H3Tunnel, H3TunnelEvent, H3TunnelOutbound};
 use crate::error::{Error, Result};
 use crate::fingerprint::tls::TlsFingerprint;
 use crate::response::Response;
+use crate::transport::dns::DnsConfig;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +37,8 @@ struct H3PoolKey {
 pub struct H3Client {
     tls_fingerprint: Option<TlsFingerprint>,
     verify_peer: bool,
+    max_idle_timeout: Option<u64>,
+    dns_config: DnsConfig,
     pool: Arc<RwLock<HashMap<H3PoolKey, H3Handle>>>,
 }
 
@@ -50,6 +53,8 @@ impl H3Client {
         Self {
             tls_fingerprint: None,
             verify_peer: true,
+            max_idle_timeout: None,
+            dns_config: DnsConfig::new(),
             pool: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -58,8 +63,22 @@ impl H3Client {
         Self {
             tls_fingerprint: Some(fp),
             verify_peer: true,
+            max_idle_timeout: None,
+            dns_config: DnsConfig::new(),
             pool: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Set a custom idle timeout (in milliseconds)
+    pub fn with_max_idle_timeout(mut self, timeout_ms: u64) -> Self {
+        self.max_idle_timeout = Some(timeout_ms);
+        self
+    }
+
+    /// Set DNS resolution configuration.
+    pub fn with_dns_config(mut self, dns_config: DnsConfig) -> Self {
+        self.dns_config = dns_config;
+        self
     }
 
     /// Disable server certificate verification (for testing)
@@ -77,7 +96,32 @@ impl H3Client {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
-        let handle = self.pooled_handle(url).await?;
+        let is_idempotent = method == "GET"
+            || method == "HEAD"
+            || method == "OPTIONS"
+            || method == "PUT"
+            || method == "DELETE";
+        let mut tried_pooled = false;
+        let key = self.pool_key(url)?;
+
+        let mut handle = {
+            let pool = self.pool.read().await;
+            if let Some(h) = pool.get(&key).cloned() {
+                if !h.is_closed() && !h.is_draining() {
+                    tried_pooled = true;
+                    h
+                } else {
+                    drop(pool);
+                    let mut pool_write = self.pool.write().await;
+                    pool_write.remove(&key);
+                    drop(pool_write);
+                    self.pooled_handle(url).await?
+                }
+            } else {
+                drop(pool);
+                self.pooled_handle(url).await?
+            }
+        };
 
         // Convert body
         let body_bytes = body.map(bytes::Bytes::from);
@@ -89,9 +133,32 @@ impl H3Client {
             .parse()
             .map_err(|_| Error::HttpProtocol("Invalid Method".into()))?;
 
-        handle
-            .send_request(method_http, &uri, headers, body_bytes)
-            .await
+        let res = handle
+            .send_request(
+                method_http.clone(),
+                &uri,
+                headers.clone(),
+                body_bytes.clone(),
+            )
+            .await;
+
+        match res {
+            Err(e) if tried_pooled && is_idempotent => {
+                tracing::debug!(
+                    "H3: Pooled connection failed: {}. Retrying on a fresh connection",
+                    e
+                );
+                let mut pool = self.pool.write().await;
+                pool.remove(&key);
+                drop(pool);
+
+                handle = self.pooled_handle(url).await?;
+                handle
+                    .send_request(method_http, &uri, headers, body_bytes)
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// Send a request and stream the response body incrementally.
@@ -102,7 +169,33 @@ impl H3Client {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
-        let handle = self.pooled_handle(url).await?;
+        let is_idempotent = method == "GET"
+            || method == "HEAD"
+            || method == "OPTIONS"
+            || method == "PUT"
+            || method == "DELETE";
+        let mut tried_pooled = false;
+        let key = self.pool_key(url)?;
+
+        let mut handle = {
+            let pool = self.pool.read().await;
+            if let Some(h) = pool.get(&key).cloned() {
+                if !h.is_closed() && !h.is_draining() {
+                    tried_pooled = true;
+                    h
+                } else {
+                    drop(pool);
+                    let mut pool_write = self.pool.write().await;
+                    pool_write.remove(&key);
+                    drop(pool_write);
+                    self.pooled_handle(url).await?
+                }
+            } else {
+                drop(pool);
+                self.pooled_handle(url).await?
+            }
+        };
+
         let uri: http::Uri = url
             .parse()
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
@@ -111,9 +204,32 @@ impl H3Client {
             .map_err(|_| Error::HttpProtocol("Invalid Method".into()))?;
         let body_bytes = body.map(Bytes::from);
 
-        handle
-            .send_streaming_request(method_http, &uri, headers, body_bytes)
-            .await
+        let res = handle
+            .send_streaming_request(
+                method_http.clone(),
+                &uri,
+                headers.clone(),
+                body_bytes.clone(),
+            )
+            .await;
+
+        match res {
+            Err(e) if tried_pooled && is_idempotent => {
+                tracing::debug!(
+                    "H3: Pooled streaming connection failed: {}. Retrying on a fresh connection",
+                    e
+                );
+                let mut pool = self.pool.write().await;
+                pool.remove(&key);
+                drop(pool);
+
+                handle = self.pooled_handle(url).await?;
+                handle
+                    .send_streaming_request(method_http, &uri, headers, body_bytes)
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// Open a WebSocket-over-HTTP/3 tunnel using RFC 9220 Extended CONNECT.
@@ -134,21 +250,27 @@ impl H3Client {
         let key = self.pool_key(url)?;
 
         if let Some(handle) = self.pool.read().await.get(&key).cloned() {
-            if !handle.is_closed() {
+            if !handle.is_closed() && !handle.is_draining() {
                 return Ok(handle);
             }
         }
 
         let mut pool = self.pool.write().await;
         if let Some(handle) = pool.get(&key).cloned() {
-            if !handle.is_closed() {
+            if !handle.is_closed() && !handle.is_draining() {
                 return Ok(handle);
             }
             pool.remove(&key);
         }
 
         let config = self.create_quic_config()?;
-        let handle = H3Connection::connect(url, config).await?;
+        let handle = H3Connection::connect(
+            url,
+            config,
+            self.max_idle_timeout.unwrap_or(30_000),
+            &self.dns_config,
+        )
+        .await?;
         pool.insert(key, handle.clone());
         Ok(handle)
     }

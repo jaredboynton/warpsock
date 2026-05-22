@@ -2,8 +2,9 @@ use bytes::Bytes;
 use http::Uri;
 use specter::fingerprint::http2::Http2Settings;
 use specter::transport::h2::{
-    flags, DriverCommand, FrameHeader, FrameType, H2Driver, H2Handle, H2TunnelEvent,
-    PseudoHeaderOrder, RawH2Connection, SettingsFrame, CONNECTION_PREFACE, FRAME_HEADER_SIZE,
+    flags, DriverCommand, FrameHeader, FrameType, H2Driver, H2Handle, H2TransportConfig,
+    H2TunnelEvent, PseudoHeaderOrder, RawH2Connection, SettingsFrame, CONNECTION_PREFACE,
+    FRAME_HEADER_SIZE,
 };
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
@@ -105,7 +106,13 @@ fn spawn_driver() -> (H2Handle, DuplexStream, tokio::task::JoinHandle<()>) {
             RawH2Connection::connect(client, Http2Settings::default(), PseudoHeaderOrder::Chrome)
                 .await
                 .unwrap();
-        let driver = H2Driver::new(conn, driver_command_tx, command_rx, goaway_received);
+        let driver = H2Driver::new(
+            conn,
+            driver_command_tx,
+            command_rx,
+            goaway_received,
+            H2TransportConfig::default(),
+        );
         let _ = driver.drive().await;
     });
     (handle, server, driver_task)

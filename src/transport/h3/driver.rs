@@ -139,6 +139,9 @@ pub struct H3Driver {
     tunnels: HashMap<u64, DriverTunnelState>,
     pending_commands: VecDeque<DriverCommand>,
     goaway_id: Option<u64>,
+    is_draining: Arc<std::sync::atomic::AtomicBool>,
+    max_idle_timeout: std::time::Duration,
+    last_activity: std::time::Instant,
 }
 
 impl H3Driver {
@@ -149,6 +152,8 @@ impl H3Driver {
         h3_conn: quiche::h3::Connection,
         socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
+        is_draining: Arc<std::sync::atomic::AtomicBool>,
+        max_idle_timeout_ms: u64,
     ) -> Self {
         Self {
             command_tx,
@@ -161,6 +166,9 @@ impl H3Driver {
             tunnels: HashMap::new(),
             pending_commands: VecDeque::new(),
             goaway_id: None,
+            is_draining,
+            max_idle_timeout: std::time::Duration::from_millis(max_idle_timeout_ms),
+            last_activity: std::time::Instant::now(),
         }
     }
 
@@ -217,10 +225,27 @@ impl H3Driver {
                 }
             }
 
-            let timeout_duration = self.conn.timeout().unwrap_or(Duration::from_secs(60));
+            if self.last_activity.elapsed() > self.max_idle_timeout
+                && self.streams.is_empty()
+                && self.tunnels.is_empty()
+            {
+                tracing::info!("H3 Driver: Manual idle timeout");
+                let _ = self.conn.close(true, 0x00, b"Idle timeout");
+            }
+
+            let remaining_idle = self
+                .max_idle_timeout
+                .checked_sub(self.last_activity.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let timeout_duration = self
+                .conn
+                .timeout()
+                .unwrap_or(Duration::from_secs(60))
+                .min(remaining_idle);
 
             tokio::select! {
                 cmd = self.command_rx.recv() => {
+                    self.last_activity = std::time::Instant::now();
                     match cmd {
                         Some(c) => self.handle_command(c).await?,
                         None => {
@@ -237,6 +262,7 @@ impl H3Driver {
                 }
 
                 res = self.socket.recv_from(&mut buf) => {
+                    self.last_activity = std::time::Instant::now();
                     match res {
                         Ok((len, from)) => {
                             if from == self.peer_addr {
@@ -793,6 +819,8 @@ impl H3Driver {
 
     async fn handle_goaway_event(&mut self, id: u64) -> Result<()> {
         self.goaway_id = Some(id);
+        self.is_draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let tunnel_ids: Vec<u64> = self.tunnels.keys().copied().collect();
         for stream_id in tunnel_ids {

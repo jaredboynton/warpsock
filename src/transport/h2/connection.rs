@@ -69,6 +69,8 @@ pub enum ControlAction {
     RstStream(u32, ErrorCode),
     /// GOAWAY received.
     GoAway(u32),
+    /// PING ACK received.
+    PingAck([u8; 8]),
     /// PUSH_PROMISE received (stream_id, promised_stream_id).
     RefusePush(u32, u32),
 }
@@ -944,6 +946,9 @@ where
             }
             FrameType::Ping => {
                 if let Some(ping) = PingFrame::parse(header.flags, &payload) {
+                    if ping.ack {
+                        return Ok(ControlAction::PingAck(ping.data));
+                    }
                     if !ping.ack {
                         let pong = PingFrame::ack(ping.data);
                         self.stream

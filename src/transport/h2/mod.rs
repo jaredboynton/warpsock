@@ -56,11 +56,30 @@ pub use tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
 // Re-export wrapper types for convenience
 use bytes::Bytes;
 use http::{Method, Uri};
+use std::time::Duration;
 
 use crate::error::Result;
 use crate::fingerprint::http2::Http2Settings;
 use crate::response::Response;
 use crate::transport::connector::MaybeHttpsStream;
+
+/// Runtime HTTP/2 transport tuning that does not affect SETTINGS fingerprint values.
+#[derive(Debug, Clone)]
+pub struct H2TransportConfig {
+    pub keep_alive_interval: Option<Duration>,
+    pub keep_alive_timeout: Duration,
+    pub keep_alive_while_idle: bool,
+}
+
+impl Default for H2TransportConfig {
+    fn default() -> Self {
+        Self {
+            keep_alive_interval: None,
+            keep_alive_timeout: Duration::from_secs(20),
+            keep_alive_while_idle: false,
+        }
+    }
+}
 
 /// Native HTTP/2 connection with full fingerprint control.
 pub struct H2Connection {
@@ -151,6 +170,11 @@ impl H2PooledConnection {
     /// Create a new pooled connection from an H2Connection wrapper.
     /// Spawns a driver task to handle frame I/O.
     pub fn new(conn: H2Connection) -> Self {
+        Self::new_with_config(conn, H2TransportConfig::default())
+    }
+
+    /// Create a new pooled connection with runtime transport config.
+    pub fn new_with_config(conn: H2Connection, config: H2TransportConfig) -> Self {
         const CHANNEL_BUFFER: usize = 32;
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER);
         let goaway_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -161,6 +185,7 @@ impl H2PooledConnection {
             command_tx.clone(),
             command_rx,
             goaway_received.clone(),
+            config,
         );
 
         // Spawn driver task
@@ -171,7 +196,6 @@ impl H2PooledConnection {
         });
 
         let handle = H2Handle::new(command_tx, goaway_received);
-
         Self { handle }
     }
 

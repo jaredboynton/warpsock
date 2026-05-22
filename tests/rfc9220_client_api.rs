@@ -1,11 +1,13 @@
 use specter::transport::h3::{DriverCommand, H3Handle};
 use specter::{Client, Error};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn rfc9220_handle_open_websocket_tunnel_sends_driver_command() {
     let (command_tx, mut command_rx) = mpsc::channel(1);
-    let handle = H3Handle::new(command_tx);
+    let handle = H3Handle::new(command_tx, Arc::new(AtomicBool::new(false)));
     let uri: http::Uri = "https://example.com/chat".parse().unwrap();
 
     let open = tokio::spawn({

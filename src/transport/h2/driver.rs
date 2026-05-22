@@ -7,6 +7,9 @@
 use bytes::{Bytes, BytesMut};
 use http::{Method, Uri};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing;
@@ -19,6 +22,7 @@ use crate::transport::h2::connection::{
 };
 use crate::transport::h2::frame::{flags, ErrorCode, FrameHeader, FrameType};
 use crate::transport::h2::tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
+use crate::transport::h2::H2TransportConfig;
 
 /// Command sent from handle to driver
 #[derive(Debug)]
@@ -127,6 +131,10 @@ pub struct H2Driver<S> {
     pending_requests: std::collections::VecDeque<DriverCommand>,
     /// Shared flag set when GOAWAY frame is received
     goaway_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime keepalive and flow-control tuning.
+    config: H2TransportConfig,
+    /// Outstanding keepalive ping payload and send time.
+    pending_ping: Option<([u8; 8], Instant)>,
 }
 
 impl<S> H2Driver<S>
@@ -139,6 +147,7 @@ where
         command_tx: mpsc::Sender<DriverCommand>,
         command_rx: mpsc::Receiver<DriverCommand>,
         goaway_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        config: H2TransportConfig,
     ) -> Self {
         Self {
             command_rx,
@@ -148,6 +157,8 @@ where
             tunnels: HashMap::new(),
             pending_requests: std::collections::VecDeque::new(),
             goaway_received,
+            config,
+            pending_ping: None,
         }
     }
 
@@ -160,6 +171,8 @@ where
             // Try to flush any pending data (flow control)
             self.flush_pending_data().await?;
             self.flush_tunnel_data().await?;
+            self.check_keepalive_timeout()?;
+            let mut keepalive_timer = self.keepalive_timer();
 
             tokio::select! {
                 // Handle incoming commands (send requests)
@@ -206,9 +219,38 @@ where
                         }
                     }
                 }
+
+                _ = &mut keepalive_timer => {
+                    let ping = self.connection.send_ping().await?;
+                    self.pending_ping = Some((ping, Instant::now()));
+                }
             }
         }
         Ok(())
+    }
+
+    fn check_keepalive_timeout(&self) -> Result<()> {
+        if let Some((_, sent_at)) = self.pending_ping {
+            if sent_at.elapsed() >= self.config.keep_alive_timeout {
+                return Err(Error::HttpProtocol(
+                    "HTTP/2 keepalive ping timed out".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn keepalive_timer(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let Some(interval) = self.config.keep_alive_interval else {
+            return Box::pin(std::future::pending());
+        };
+        if self.pending_ping.is_some() {
+            return Box::pin(std::future::pending());
+        }
+        if !self.config.keep_alive_while_idle && self.active_stream_count() == 0 {
+            return Box::pin(std::future::pending());
+        }
+        Box::pin(tokio::time::sleep(interval))
     }
 
     /// Handle SendRequest command
@@ -668,6 +710,15 @@ where
                         e
                     );
                 }
+            }
+            ControlAction::PingAck(data) => {
+                if self
+                    .pending_ping
+                    .is_some_and(|(pending_data, _)| pending_data == data)
+                {
+                    self.pending_ping = None;
+                }
+                return Ok(());
             }
             ControlAction::None => {
                 // Continue to specific processing

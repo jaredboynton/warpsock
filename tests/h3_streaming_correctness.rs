@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use specter::transport::h3::H3Client;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 mod helpers;
@@ -84,4 +85,35 @@ async fn h3_streaming_sends_request_body() {
         Bytes::from_static(b"accepted")
     );
     assert!(body_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn h3_streaming_does_not_duplicate_partial_non_idempotent_requests() {
+    let server = MockH3Server::new().await.unwrap();
+    let connection_count = server.connection_count();
+    let url = server.url();
+
+    server.start(|conn| async move {
+        // First request is a POST (non-idempotent)
+        let _stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+
+        // We close the connection (or drop it) to simulate a failure after request progressed
+        // (we won't respond to the stream, simulating a failure)
+    });
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+    let res = client
+        .send_streaming(&url, "POST", vec![], Some(b"some body".to_vec()))
+        .await;
+
+    // It should fail and NOT retry (which means connection count should be 1, and we should get an error)
+    assert!(res.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(connection_count.load(Ordering::SeqCst), 1);
 }

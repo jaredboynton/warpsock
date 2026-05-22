@@ -7,6 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
+use crate::transport::dns::DnsConfig;
 use crate::transport::h3::driver::H3Driver;
 use crate::transport::h3::handle::H3Handle;
 
@@ -18,13 +19,19 @@ pub struct H3Connection;
 impl H3Connection {
     /// Connect to an HTTP/3 server and return a handle.
     /// This spawns a background driver task.
-    pub async fn connect(url: &str, mut config: quiche::Config) -> Result<H3Handle> {
+    pub async fn connect(
+        url: &str,
+        mut config: quiche::Config,
+        max_idle_timeout: u64,
+        dns_config: &DnsConfig,
+    ) -> Result<H3Handle> {
         let (host, port, _path) = parse_url(url)?;
 
         // Resolve peer
-        let peer_addr = tokio::net::lookup_host(format!("{}:{}", host, port))
-            .await
-            .map_err(|e| Error::Connection(format!("DNS Resolve failed: {}", e)))?
+        let peer_addr = dns_config
+            .resolve(&host, port)
+            .await?
+            .into_iter()
             .next()
             .ok_or_else(|| Error::Connection("DNS/IP not found".into()))?;
 
@@ -34,7 +41,7 @@ impl H3Connection {
         let socket = Arc::new(socket);
 
         // Generate CID
-        let mut scid = [0u8; 20];
+        let mut scid = [0u8; 16];
         getrandom_fill(&mut scid).map_err(|e| Error::Quic(format!("RNG error: {}", e)))?;
         let scid = quiche::ConnectionId::from_ref(&scid);
 
@@ -113,7 +120,17 @@ impl H3Connection {
 
         // Spawn Driver
         let (tx, rx) = mpsc::channel(32);
-        let driver = H3Driver::new(tx.clone(), rx, conn, h3_conn, socket.clone(), peer_addr);
+        let is_draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let driver = H3Driver::new(
+            tx.clone(),
+            rx,
+            conn,
+            h3_conn,
+            socket.clone(),
+            peer_addr,
+            is_draining.clone(),
+            max_idle_timeout,
+        );
 
         tokio::spawn(async move {
             if let Err(e) = driver.drive().await {
@@ -121,7 +138,7 @@ impl H3Connection {
             }
         });
 
-        Ok(H3Handle::new(tx))
+        Ok(H3Handle::new(tx, is_draining))
     }
 }
 
