@@ -17,7 +17,7 @@ async fn test_h1_streaming_local() {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
                 // Simple H1 stream response
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 15\r\n\r\nchunk1\nchunk2\n";
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 14\r\n\r\nchunk1\nchunk2\n";
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
             });
@@ -31,12 +31,14 @@ async fn test_h1_streaming_local() {
     let req = client
         .get("http://127.0.0.1:3201/stream")
         .version(HttpVersion::Http1_1);
-    let res = req.send_streaming().await;
-    assert!(
-        res.is_err(),
-        "Expected error because H1 streaming is not supported at high-level yet: {:?}",
-        res
-    );
+    let (response, mut rx) = req.send_streaming().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(body, b"chunk1\nchunk2\n");
 
     server_task.abort();
 }

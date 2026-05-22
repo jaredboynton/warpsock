@@ -1,4 +1,13 @@
-use specter::Client;
+use bytes::Bytes;
+use specter::{Client, HttpVersion};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 mod helpers;
 use helpers::mock_server::MockHttpServer;
@@ -89,4 +98,208 @@ async fn test_h1_multiple_sequential_requests() {
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(resp.text().unwrap(), "Hello");
     }
+}
+
+#[derive(Clone, Debug)]
+struct PoolLog {
+    connection_id: usize,
+    path: String,
+}
+
+struct PoolFixture {
+    url: String,
+    logs: Arc<Mutex<Vec<PoolLog>>>,
+}
+
+impl PoolFixture {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let next_id = Arc::new(AtomicUsize::new(1));
+        let logs_for_task = logs.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let id = next_id.fetch_add(1, Ordering::SeqCst);
+                let logs = logs_for_task.clone();
+                tokio::spawn(handle_pool_connection(id, stream, logs));
+            }
+        });
+        Self { url, logs }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.url, path)
+    }
+
+    async fn logs(&self) -> Vec<PoolLog> {
+        self.logs.lock().await.clone()
+    }
+}
+
+async fn handle_pool_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec<PoolLog>>>) {
+    let mut buffer = Vec::new();
+    loop {
+        let mut read_buf = [0u8; 1024];
+        while !buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = match stream.read(&mut read_buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buffer.extend_from_slice(&read_buf[..n]);
+        }
+
+        let header_end = buffer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let request = String::from_utf8_lossy(&buffer[..header_end]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        buffer.drain(..header_end);
+        logs.lock().await.push(PoolLog {
+            connection_id: id,
+            path: path.clone(),
+        });
+
+        match path.as_str() {
+            "/chunked" => {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            "/malformed" => {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nabc")
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                return;
+            }
+            "/abort" => {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\nfirst")
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = stream.write_all(b"-second").await;
+                let _ = stream.flush().await;
+            }
+            _ => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+        }
+    }
+}
+
+async fn drain(mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, specter::Error>>) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    body
+}
+
+#[tokio::test]
+async fn h1_reuses_connection_after_stream_drain() {
+    let fixture = PoolFixture::start().await;
+    let client = Client::builder().prefer_http2(false).build().unwrap();
+
+    let (_response, rx) = client
+        .get(fixture.endpoint("/chunked"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(drain(rx).await, b"hello");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let response = client
+        .get(fixture.endpoint("/ok"))
+        .version(HttpVersion::Http1_1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+
+    let logs = fixture.logs().await;
+    assert_eq!(logs[0].path, "/chunked");
+    assert_eq!(logs[1].path, "/ok");
+    assert_eq!(logs[0].connection_id, logs[1].connection_id);
+}
+
+#[tokio::test]
+async fn h1_discards_connection_after_malformed_stream() {
+    let fixture = PoolFixture::start().await;
+    let client = Client::builder().prefer_http2(false).build().unwrap();
+
+    let (_response, mut rx) = client
+        .get(fixture.endpoint("/malformed"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    let err = timeout(Duration::from_secs(1), async move {
+        while let Some(chunk) = rx.recv().await {
+            if chunk.is_err() {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(err);
+
+    let response = client
+        .get(fixture.endpoint("/ok"))
+        .version(HttpVersion::Http1_1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+    let logs = fixture.logs().await;
+    assert_eq!(logs[0].path, "/malformed");
+    assert_eq!(logs[1].path, "/ok");
+    assert_ne!(logs[0].connection_id, logs[1].connection_id);
+}
+
+#[tokio::test]
+async fn h1_discards_connection_after_aborted_stream() {
+    let fixture = PoolFixture::start().await;
+    let client = Client::builder().prefer_http2(false).build().unwrap();
+
+    let (_response, mut rx) = client
+        .get(fixture.endpoint("/abort"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(
+        rx.recv().await.unwrap().unwrap(),
+        Bytes::from_static(b"first")
+    );
+    drop(rx);
+
+    let response = client
+        .get(fixture.endpoint("/ok"))
+        .version(HttpVersion::Http1_1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+    let logs = fixture.logs().await;
+    assert_eq!(logs[0].path, "/abort");
+    assert_eq!(logs[1].path, "/ok");
+    assert_ne!(logs[0].connection_id, logs[1].connection_id);
 }

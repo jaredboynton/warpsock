@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use http::{Method, Uri};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
@@ -23,6 +24,13 @@ pub struct H1Connection {
     stream: MaybeHttpsStream,
     /// Whether the connection should be closed after the current response.
     should_close: bool,
+}
+
+enum H1BodyMode {
+    Empty,
+    Fixed { remaining: usize, buffer: Vec<u8> },
+    Chunked { buffer: Vec<u8> },
+    CloseDelimited { buffer: Vec<u8> },
 }
 
 impl H1Connection {
@@ -74,6 +82,53 @@ impl H1Connection {
 
         // Read and parse the response, passing the request method for body determination
         self.read_response(&method).await
+    }
+
+    /// Send an HTTP/1.1 request and stream the response body without buffering it.
+    ///
+    /// The returned response contains status and headers with an empty body. The
+    /// body receiver yields decoded HTTP/1.1 body bytes. The reuse receiver
+    /// resolves to the underlying stream only when the response was fully and
+    /// successfully drained and the connection is safe to reuse.
+    pub async fn send_request_streaming(
+        mut self,
+        method: Method,
+        uri: &Uri,
+        headers: Vec<(String, String)>,
+        body: Option<Bytes>,
+    ) -> Result<(
+        Response,
+        mpsc::Receiver<std::result::Result<Bytes, Error>>,
+        oneshot::Receiver<Option<MaybeHttpsStream>>,
+    )> {
+        let request_bytes = self.build_request(&method, uri, &headers, body.as_ref())?;
+        self.stream
+            .write_all(&request_bytes)
+            .await
+            .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
+
+        if let Some(body) = body {
+            self.stream
+                .write_all(&body)
+                .await
+                .map_err(|e| Error::HttpProtocol(format!("Failed to write body: {}", e)))?;
+        }
+
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| Error::HttpProtocol(format!("Failed to flush: {}", e)))?;
+
+        let (response, mode) = self.read_streaming_response_headers(&method).await?;
+        let (body_tx, body_rx) = mpsc::channel(32);
+        let (reuse_tx, reuse_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let reusable = self.stream_body(mode, body_tx).await;
+            let _ = reuse_tx.send(reusable);
+        });
+
+        Ok((response, body_rx, reuse_rx))
     }
 
     /// Build the HTTP/1.1 request as bytes.
@@ -238,6 +293,302 @@ impl H1Connection {
             }
 
             return Ok(response);
+        }
+    }
+
+    async fn read_streaming_response_headers(
+        &mut self,
+        method: &Method,
+    ) -> Result<(Response, H1BodyMode)> {
+        let mut buffer = Vec::with_capacity(MAX_HEADERS_SIZE);
+
+        loop {
+            let _header_end = loop {
+                if buffer.len() >= MAX_HEADERS_SIZE {
+                    return Err(Error::HttpProtocol("Response headers too large".into()));
+                }
+
+                if let Some(header_end) = find_header_end(&buffer) {
+                    break header_end;
+                }
+
+                let mut read_buf = vec![0u8; 8192];
+                let n =
+                    self.stream.read(&mut read_buf).await.map_err(|e| {
+                        Error::HttpProtocol(format!("Failed to read response: {}", e))
+                    })?;
+
+                if n == 0 {
+                    return Err(Error::HttpProtocol(
+                        "Connection closed before response complete".into(),
+                    ));
+                }
+
+                buffer.extend_from_slice(&read_buf[..n]);
+            };
+
+            let (response, mode) = self.parse_streaming_response(&buffer, method)?;
+
+            if response.status >= 100 && response.status < 200 {
+                let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS_COUNT];
+                let mut informational = httparse::Response::new(&mut headers);
+                let headers_len = match informational.parse(&buffer) {
+                    Ok(httparse::Status::Complete(len)) => len,
+                    Ok(httparse::Status::Partial) => {
+                        return Err(Error::HttpProtocol("Incomplete response headers".into()))
+                    }
+                    Err(e) => {
+                        return Err(Error::HttpProtocol(format!(
+                            "Failed to parse response: {}",
+                            e
+                        )))
+                    }
+                };
+                buffer = buffer[headers_len..].to_vec();
+                continue;
+            }
+
+            return Ok((response, mode));
+        }
+    }
+
+    fn parse_streaming_response(
+        &mut self,
+        buffer: &[u8],
+        request_method: &Method,
+    ) -> Result<(Response, H1BodyMode)> {
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS_COUNT];
+        let mut response = httparse::Response::new(&mut headers);
+
+        let parsed = response
+            .parse(buffer)
+            .map_err(|e| Error::HttpProtocol(format!("Failed to parse response: {}", e)))?;
+
+        let headers_len = match parsed {
+            httparse::Status::Complete(len) => len,
+            httparse::Status::Partial => {
+                return Err(Error::HttpProtocol("Incomplete response headers".into()));
+            }
+        };
+
+        let status = response
+            .code
+            .ok_or_else(|| Error::HttpProtocol("Missing status code".into()))?;
+        let version = format!("HTTP/1.{}", response.version.unwrap_or(1));
+        let response_headers: Vec<(String, String)> = response
+            .headers
+            .iter()
+            .filter(|h| !h.name.is_empty())
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    String::from_utf8_lossy(h.value).to_string(),
+                )
+            })
+            .collect();
+        let response_headers = Headers::from(response_headers);
+
+        if let Some(conn) = find_header_value(&response_headers, "connection") {
+            if conn.to_ascii_lowercase().contains("close") {
+                self.should_close = true;
+            }
+        }
+
+        let has_body = !matches!(status, 100..=199 | 204 | 304) && *request_method != Method::HEAD;
+        let response = Response::new(status, response_headers.clone(), Bytes::new(), version);
+        let initial = buffer[headers_len..].to_vec();
+
+        if !has_body {
+            return Ok((response, H1BodyMode::Empty));
+        }
+
+        let transfer_encoding = find_header_value(&response_headers, "transfer-encoding");
+        let content_length_str = find_header_value(&response_headers, "content-length");
+        let is_chunked = transfer_encoding
+            .map(|v| {
+                v.split(',')
+                    .next_back()
+                    .map(|s| s.trim().eq_ignore_ascii_case("chunked"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        let mode = if is_chunked {
+            H1BodyMode::Chunked { buffer: initial }
+        } else if transfer_encoding.is_some() {
+            self.should_close = true;
+            H1BodyMode::CloseDelimited { buffer: initial }
+        } else if let Some(cl_str) = content_length_str {
+            H1BodyMode::Fixed {
+                remaining: parse_content_length(cl_str)?,
+                buffer: initial,
+            }
+        } else {
+            self.should_close = true;
+            H1BodyMode::CloseDelimited { buffer: initial }
+        };
+
+        Ok((response, mode))
+    }
+
+    async fn stream_body(
+        mut self,
+        mode: H1BodyMode,
+        tx: mpsc::Sender<std::result::Result<Bytes, Error>>,
+    ) -> Option<MaybeHttpsStream> {
+        let result = match mode {
+            H1BodyMode::Empty => Ok(true),
+            H1BodyMode::Fixed { remaining, buffer } => self
+                .stream_fixed_body(buffer, remaining, &tx)
+                .await
+                .map(|_| true),
+            H1BodyMode::Chunked { buffer } => {
+                self.stream_chunked_body(buffer, &tx).await.map(|_| true)
+            }
+            H1BodyMode::CloseDelimited { buffer } => {
+                self.stream_until_close(buffer, &tx).await.map(|_| false)
+            }
+        };
+
+        match result {
+            Ok(true) if !self.should_close => Some(self.stream),
+            Ok(_) => None,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                None
+            }
+        }
+    }
+
+    async fn stream_until_close(
+        &mut self,
+        initial: Vec<u8>,
+        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
+    ) -> Result<()> {
+        if !initial.is_empty() && tx.send(Ok(Bytes::from(initial))).await.is_err() {
+            return Err(Error::HttpProtocol("Streaming receiver dropped".into()));
+        }
+
+        let mut read_buf = vec![0u8; 8192];
+        loop {
+            let n = self.stream.read(&mut read_buf).await.map_err(|e| {
+                Error::HttpProtocol(format!("Failed to read body (close-delimited): {}", e))
+            })?;
+            if n == 0 {
+                return Ok(());
+            }
+            if tx
+                .send(Ok(Bytes::copy_from_slice(&read_buf[..n])))
+                .await
+                .is_err()
+            {
+                return Err(Error::HttpProtocol("Streaming receiver dropped".into()));
+            }
+        }
+    }
+
+    async fn stream_fixed_body(
+        &mut self,
+        initial: Vec<u8>,
+        content_length: usize,
+        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
+    ) -> Result<()> {
+        let initial_len = initial.len().min(content_length);
+        if initial_len > 0
+            && tx
+                .send(Ok(Bytes::copy_from_slice(&initial[..initial_len])))
+                .await
+                .is_err()
+        {
+            return Err(Error::HttpProtocol("Streaming receiver dropped".into()));
+        }
+
+        let mut received = initial_len;
+        while received < content_length {
+            let remaining = content_length - received;
+            let mut chunk = vec![0u8; remaining.min(8192)];
+            let n = self
+                .stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| Error::HttpProtocol(format!("Failed to read body: {}", e)))?;
+
+            if n == 0 {
+                return Err(Error::HttpProtocol(format!(
+                    "Connection closed before receiving full body (got {} of {} bytes)",
+                    received, content_length
+                )));
+            }
+            received += n;
+            if tx
+                .send(Ok(Bytes::copy_from_slice(&chunk[..n])))
+                .await
+                .is_err()
+            {
+                return Err(Error::HttpProtocol("Streaming receiver dropped".into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stream_chunked_body(
+        &mut self,
+        mut buffer: Vec<u8>,
+        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
+    ) -> Result<()> {
+        let mut read_buf = vec![0u8; 8192];
+
+        loop {
+            let (chunk_size, line_end) = loop {
+                if let Some((size, end)) = find_chunk_size(&buffer) {
+                    break (size, end);
+                }
+                let n = self.stream.read(&mut read_buf).await.map_err(|e| {
+                    Error::HttpProtocol(format!("Failed to read chunk size: {}", e))
+                })?;
+                if n == 0 {
+                    return Err(Error::HttpProtocol(
+                        "Connection closed while reading chunk size".into(),
+                    ));
+                }
+                buffer.extend_from_slice(&read_buf[..n]);
+            };
+
+            buffer = buffer[line_end..].to_vec();
+
+            if chunk_size == 0 {
+                self.consume_trailers(&mut buffer).await?;
+                return Ok(());
+            }
+
+            let chunk_end = chunk_size + 2;
+            while buffer.len() < chunk_end {
+                let n = self.stream.read(&mut read_buf).await.map_err(|e| {
+                    Error::HttpProtocol(format!("Failed to read chunk data: {}", e))
+                })?;
+                if n == 0 {
+                    return Err(Error::HttpProtocol(
+                        "Connection closed while reading chunk data".into(),
+                    ));
+                }
+                buffer.extend_from_slice(&read_buf[..n]);
+            }
+
+            if &buffer[chunk_size..chunk_end] != b"\r\n" {
+                return Err(Error::HttpProtocol(
+                    "Malformed chunk: missing trailing CRLF".into(),
+                ));
+            }
+            if chunk_size > 0
+                && tx
+                    .send(Ok(Bytes::copy_from_slice(&buffer[..chunk_size])))
+                    .await
+                    .is_err()
+            {
+                return Err(Error::HttpProtocol("Streaming receiver dropped".into()));
+            }
+            buffer = buffer[chunk_end..].to_vec();
         }
     }
 

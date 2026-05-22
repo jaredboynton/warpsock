@@ -608,7 +608,7 @@ impl<'a> RequestBuilder<'a> {
         self,
     ) -> Result<(
         Response,
-        tokio::sync::mpsc::Receiver<std::result::Result<Bytes, crate::transport::h2::H2Error>>,
+        tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
     )> {
         let client = self.client.clone();
         let request = self.build()?;
@@ -630,10 +630,9 @@ impl<'a> RequestBuilder<'a> {
 
         let version = request.version.unwrap_or(client.default_version);
 
-        // Only HTTP/2 supports streaming currently
-        if !matches!(version, HttpVersion::Http2 | HttpVersion::Auto) {
+        if matches!(version, HttpVersion::Http3 | HttpVersion::Http3Only) {
             return Err(Error::HttpProtocol(
-                "Streaming only supported for HTTP/2".into(),
+                "Streaming only supported for HTTP/1.1 and HTTP/2".into(),
             ));
         }
 
@@ -645,131 +644,21 @@ impl<'a> RequestBuilder<'a> {
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
 
         let request_url = request.url.clone();
+        let prefer_http2 = match version {
+            HttpVersion::Http1_1 => false,
+            HttpVersion::Http2 => true,
+            HttpVersion::Auto => matches!(client.default_version, HttpVersion::Http2),
+            HttpVersion::Http3 | HttpVersion::Http3Only => unreachable!(),
+        };
         let pool_key = client.make_pool_key(&uri);
 
-        // Check for existing pooled connection
-        let pooled = {
-            let mut pool = client.h2_pool.write().await;
-            if let Some(conn) = pool.get(&pool_key) {
-                if conn.is_alive() {
-                    Some(conn.clone())
-                } else {
-                    pool.remove(&pool_key);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        let (response, rx) = if let Some(conn) = pooled {
-            let body_bytes = if request.body.is_empty() {
-                None
-            } else {
-                Some(request.body.clone().into_bytes()?)
-            };
-
-            let send_fut = conn.send_streaming_request(
-                request.method.clone(),
-                &uri,
-                headers.to_vec(),
-                body_bytes,
-            );
-            let res = if let Some(ttfb_timeout) = timeouts.ttfb {
-                tokio_timeout(ttfb_timeout, send_fut)
-                    .await
-                    .map_err(|_| Error::TtfbTimeout(ttfb_timeout))?
-            } else {
-                send_fut.await
-            };
-
-            match res {
-                Ok((response, rx)) => {
-                    let response = response.with_url(request_url.clone());
-                    if let Some(jar) = &client.cookie_store {
-                        jar.write()
-                            .await
-                            .store_from_headers(response.headers(), request_url.as_str());
-                    }
-                    (response, rx)
-                }
-                Err(e) => {
-                    // Connection failed - remove from pool and create new one
-                    tracing::debug!(
-                        "Pooled HTTP/2 connection failed for streaming, creating new: {}",
-                        e
-                    );
-                    let mut pool = client.h2_pool.write().await;
-                    pool.remove(&pool_key);
-
-                    // Re-establish connection since the pooled one failed
-                    let connector = client.connector_for_uri(&uri);
-                    let connect_fut = connector.connect(&uri);
-                    let stream = if let Some(connect_timeout) = timeouts.connect {
-                        tokio_timeout(connect_timeout, connect_fut)
-                            .await
-                            .map_err(|_| Error::ConnectTimeout(connect_timeout))??
-                    } else {
-                        connect_fut.await?
-                    };
-
-                    // Ensure ALPN negotiated h2
-                    let alpn = stream.alpn_protocol();
-                    if !alpn.is_h2() {
-                        return Err(Error::HttpProtocol(format!(
-                            "Expected h2 ALPN, got {:?}",
-                            alpn
-                        )));
-                    }
-
-                    // Create H2 connection (part of connect phase)
-                    let h2_connect_fut = H2Connection::connect(
-                        stream,
-                        client.http2_settings.clone(),
-                        client.pseudo_order,
-                    );
-                    let h2_conn = if let Some(connect_timeout) = timeouts.connect {
-                        tokio_timeout(connect_timeout, h2_connect_fut)
-                            .await
-                            .map_err(|_| Error::ConnectTimeout(connect_timeout))??
-                    } else {
-                        h2_connect_fut.await?
-                    };
-
-                    // Wrap in H2PooledConnection and insert into pool
-                    let pooled_conn = H2PooledConnection::new(h2_conn);
-                    {
-                        let mut pool = client.h2_pool.write().await;
-                        pool.insert(pool_key.clone(), pooled_conn.clone());
-                    }
-
-                    let body_bytes = if request.body.is_empty() {
-                        None
-                    } else {
-                        Some(request.body.clone().into_bytes()?)
-                    };
-
-                    let send_fut = pooled_conn.send_streaming_request(
-                        request.method.clone(),
-                        &uri,
-                        headers.to_vec(),
-                        body_bytes,
-                    );
-                    if let Some(ttfb_timeout) = timeouts.ttfb {
-                        tokio_timeout(ttfb_timeout, send_fut)
-                            .await
-                            .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
-                    } else {
-                        send_fut.await?
-                    }
-                }
-            }
-        } else {
-            // No pooled connection or it failed - create new one
-            // Apply connect timeout to TCP + TLS handshake
+        let (response, rx) = if !prefer_http2 {
+            let pooled_h1_stream = client.h1_pool.get_h1(&pool_key).await;
             let connector = client.connector_for_uri(&uri);
-            let connect_fut = connector.connect(&uri);
-            let stream = if let Some(connect_timeout) = timeouts.connect {
+            let connect_fut = connector.connect_h1_only(&uri);
+            let stream = if let Some(stream) = pooled_h1_stream {
+                stream
+            } else if let Some(connect_timeout) = timeouts.connect {
                 tokio_timeout(connect_timeout, connect_fut)
                     .await
                     .map_err(|_| Error::ConnectTimeout(connect_timeout))??
@@ -777,53 +666,32 @@ impl<'a> RequestBuilder<'a> {
                 connect_fut.await?
             };
 
-            // Ensure ALPN negotiated h2
-            let alpn = stream.alpn_protocol();
-            if !alpn.is_h2() {
-                return Err(Error::HttpProtocol(format!(
-                    "Expected h2 ALPN, got {:?}",
-                    alpn
-                )));
-            }
-
-            // Create H2 connection (part of connect phase)
-            let h2_connect_fut =
-                H2Connection::connect(stream, client.http2_settings.clone(), client.pseudo_order);
-            let h2_conn = if let Some(connect_timeout) = timeouts.connect {
-                tokio_timeout(connect_timeout, h2_connect_fut)
-                    .await
-                    .map_err(|_| Error::ConnectTimeout(connect_timeout))??
-            } else {
-                h2_connect_fut.await?
-            };
-
-            // Wrap in H2PooledConnection and insert into pool
-            let pooled_conn = H2PooledConnection::new(h2_conn);
-            {
-                let mut pool = client.h2_pool.write().await;
-                pool.insert(pool_key.clone(), pooled_conn.clone());
-            }
-
             let body_bytes = if request.body.is_empty() {
                 None
             } else {
                 Some(request.body.clone().into_bytes()?)
             };
-
-            // Send streaming request on the newly established pooled connection
-            let send_fut = pooled_conn.send_streaming_request(
+            let h1_pool = client.h1_pool.clone();
+            let conn = H1Connection::new(stream);
+            let send_fut = conn.send_request_streaming(
                 request.method.clone(),
                 &uri,
                 headers.to_vec(),
                 body_bytes,
             );
-            let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+            let (response, rx, reuse_rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
                 tokio_timeout(ttfb_timeout, send_fut)
                     .await
                     .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
             } else {
                 send_fut.await?
             };
+
+            tokio::spawn(async move {
+                if let Ok(Some(stream)) = reuse_rx.await {
+                    h1_pool.put_h1(pool_key, stream).await;
+                }
+            });
 
             let response = response.with_url(request_url.clone());
             if let Some(jar) = &client.cookie_store {
@@ -832,6 +700,185 @@ impl<'a> RequestBuilder<'a> {
                     .store_from_headers(response.headers(), request_url.as_str());
             }
             (response, rx)
+        } else {
+            // Check for existing pooled connection
+            let pooled = {
+                let mut pool = client.h2_pool.write().await;
+                if let Some(conn) = pool.get(&pool_key) {
+                    if conn.is_alive() {
+                        Some(conn.clone())
+                    } else {
+                        pool.remove(&pool_key);
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(conn) = pooled {
+                let body_bytes = if request.body.is_empty() {
+                    None
+                } else {
+                    Some(request.body.clone().into_bytes()?)
+                };
+
+                let send_fut = conn.send_streaming_request(
+                    request.method.clone(),
+                    &uri,
+                    headers.to_vec(),
+                    body_bytes,
+                );
+                let res = if let Some(ttfb_timeout) = timeouts.ttfb {
+                    tokio_timeout(ttfb_timeout, send_fut)
+                        .await
+                        .map_err(|_| Error::TtfbTimeout(ttfb_timeout))?
+                } else {
+                    send_fut.await
+                };
+
+                match res {
+                    Ok((response, rx)) => {
+                        let response = response.with_url(request_url.clone());
+                        if let Some(jar) = &client.cookie_store {
+                            jar.write()
+                                .await
+                                .store_from_headers(response.headers(), request_url.as_str());
+                        }
+                        (response, rx)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Pooled HTTP/2 connection failed for streaming, creating new: {}",
+                            e
+                        );
+                        let mut pool = client.h2_pool.write().await;
+                        pool.remove(&pool_key);
+
+                        let connector = client.connector_for_uri(&uri);
+                        let connect_fut = connector.connect(&uri);
+                        let stream = if let Some(connect_timeout) = timeouts.connect {
+                            tokio_timeout(connect_timeout, connect_fut)
+                                .await
+                                .map_err(|_| Error::ConnectTimeout(connect_timeout))??
+                        } else {
+                            connect_fut.await?
+                        };
+
+                        let alpn = stream.alpn_protocol();
+                        if !alpn.is_h2() {
+                            return Err(Error::HttpProtocol(format!(
+                                "Expected h2 ALPN, got {:?}",
+                                alpn
+                            )));
+                        }
+
+                        let h2_connect_fut = H2Connection::connect(
+                            stream,
+                            client.http2_settings.clone(),
+                            client.pseudo_order,
+                        );
+                        let h2_conn = if let Some(connect_timeout) = timeouts.connect {
+                            tokio_timeout(connect_timeout, h2_connect_fut)
+                                .await
+                                .map_err(|_| Error::ConnectTimeout(connect_timeout))??
+                        } else {
+                            h2_connect_fut.await?
+                        };
+
+                        let pooled_conn = H2PooledConnection::new(h2_conn);
+                        {
+                            let mut pool = client.h2_pool.write().await;
+                            pool.insert(pool_key.clone(), pooled_conn.clone());
+                        }
+
+                        let body_bytes = if request.body.is_empty() {
+                            None
+                        } else {
+                            Some(request.body.clone().into_bytes()?)
+                        };
+
+                        let send_fut = pooled_conn.send_streaming_request(
+                            request.method.clone(),
+                            &uri,
+                            headers.to_vec(),
+                            body_bytes,
+                        );
+                        if let Some(ttfb_timeout) = timeouts.ttfb {
+                            tokio_timeout(ttfb_timeout, send_fut)
+                                .await
+                                .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
+                        } else {
+                            send_fut.await?
+                        }
+                    }
+                }
+            } else {
+                let connector = client.connector_for_uri(&uri);
+                let connect_fut = connector.connect(&uri);
+                let stream = if let Some(connect_timeout) = timeouts.connect {
+                    tokio_timeout(connect_timeout, connect_fut)
+                        .await
+                        .map_err(|_| Error::ConnectTimeout(connect_timeout))??
+                } else {
+                    connect_fut.await?
+                };
+
+                let alpn = stream.alpn_protocol();
+                if !alpn.is_h2() {
+                    return Err(Error::HttpProtocol(format!(
+                        "Expected h2 ALPN, got {:?}",
+                        alpn
+                    )));
+                }
+
+                let h2_connect_fut = H2Connection::connect(
+                    stream,
+                    client.http2_settings.clone(),
+                    client.pseudo_order,
+                );
+                let h2_conn = if let Some(connect_timeout) = timeouts.connect {
+                    tokio_timeout(connect_timeout, h2_connect_fut)
+                        .await
+                        .map_err(|_| Error::ConnectTimeout(connect_timeout))??
+                } else {
+                    h2_connect_fut.await?
+                };
+
+                let pooled_conn = H2PooledConnection::new(h2_conn);
+                {
+                    let mut pool = client.h2_pool.write().await;
+                    pool.insert(pool_key.clone(), pooled_conn.clone());
+                }
+
+                let body_bytes = if request.body.is_empty() {
+                    None
+                } else {
+                    Some(request.body.clone().into_bytes()?)
+                };
+
+                let send_fut = pooled_conn.send_streaming_request(
+                    request.method.clone(),
+                    &uri,
+                    headers.to_vec(),
+                    body_bytes,
+                );
+                let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+                    tokio_timeout(ttfb_timeout, send_fut)
+                        .await
+                        .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
+                } else {
+                    send_fut.await?
+                };
+
+                let response = response.with_url(request_url.clone());
+                if let Some(jar) = &client.cookie_store {
+                    jar.write()
+                        .await
+                        .store_from_headers(response.headers(), request_url.as_str());
+                }
+                (response, rx)
+            }
         };
 
         // Wrap the raw receiver with timeout enforcement (read_idle and total timeout)
