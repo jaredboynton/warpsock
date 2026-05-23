@@ -183,26 +183,6 @@ where
             let retry_streaming_backpressure = self.has_pending_streaming_body();
 
             tokio::select! {
-                biased;
-                // Handle incoming frames
-                read_res = self.connection.read_next_frame() => {
-                    match read_res {
-                        Ok((header, payload)) => {
-                            if let Err(e) = self.handle_frame(header, payload).await {
-                                tracing::error!("H2Driver frame error: {:?}", e);
-                                // Protocol errors are fatal and require connection termination.
-                                // The connection state may be inconsistent after this error.
-                                return Err(e);
-                            }
-                        }
-                        Err(e) => {
-                             // Connection error
-                            tracing::error!("H2Driver read error: {:?}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-
                 // Handle incoming commands (send requests)
                 command = self.command_rx.recv() => {
                     match command {
@@ -225,6 +205,25 @@ where
                         None => {
                             // Channel closed - driver should shutdown
                             break;
+                        }
+                    }
+                }
+
+                // Handle incoming frames
+                read_res = self.connection.read_next_frame() => {
+                    match read_res {
+                        Ok((header, payload)) => {
+                            if let Err(e) = self.handle_frame(header, payload).await {
+                                tracing::error!("H2Driver frame error: {:?}", e);
+                                // Protocol errors are fatal and require connection termination.
+                                // The connection state may be inconsistent after this error.
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => {
+                             // Connection error
+                            tracing::error!("H2Driver read error: {:?}", e);
+                            return Err(e);
                         }
                     }
                 }

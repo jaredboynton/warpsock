@@ -21,7 +21,7 @@ const RFC8441_PORT: u16 = 3204;
 const BENCH_CHUNK_SIZE: usize = 16 * 1024;
 const BENCH_CHUNK_COUNT: usize = 5;
 const BENCH_CHUNK_DELAY_MS: u64 = 1;
-const BENCH_REQUEST_COUNT: usize = 1;
+const BENCH_REQUEST_COUNT: usize = 8;
 const DEFAULT_WARMUP_COUNT: usize = 5;
 const DEFAULT_SAMPLE_COUNT: usize = 30;
 
@@ -1174,24 +1174,6 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         let is_comparable = matches!(protocol, "h1" | "h2");
         let mut protocol_metrics = BTreeMap::new();
         let mut protocol_measurement_sources = BTreeMap::new();
-        let paired_metrics = if is_comparable {
-            let url = if protocol == "h2" {
-                format!("https://{}/stream", endpoint)
-            } else {
-                format!("http://{}/stream", endpoint)
-            };
-            run_real_comparable_measurement(
-                protocol,
-                &url,
-                options.warmup_count,
-                options.sample_count,
-                &workload.payload_schedule_ms,
-            )
-            .await
-            .ok()
-        } else {
-            None
-        };
 
         for client in ["reqwest", "specter"] {
             let endpoint_for_url = if protocol == "h3" {
@@ -1212,28 +1194,20 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
             let mut measurement_source = "not_applicable_non_comparable";
             let mut metrics = if is_comparable || (protocol == "h3" && client == "specter") {
                 measurement_source = "localhost_real_measurement";
-                if let Some((reqwest_metrics, specter_metrics)) = &paired_metrics {
-                    if client == "reqwest" {
-                        reqwest_metrics.clone()
-                    } else {
-                        specter_metrics.clone()
-                    }
-                } else {
-                    match run_real_measurement(
-                        protocol,
-                        client,
-                        &url,
-                        options.warmup_count,
-                        options.sample_count,
-                        &workload.payload_schedule_ms,
-                    )
-                    .await
-                    {
-                        Ok(m) => m,
-                        Err(_) => {
-                            measurement_source = "localhost_real_measurement_failed";
-                            Metrics::failed(options.warmup_count, options.sample_count)
-                        }
+                match run_real_measurement(
+                    protocol,
+                    client,
+                    &url,
+                    options.warmup_count,
+                    options.sample_count,
+                    &workload.payload_schedule_ms,
+                )
+                .await
+                {
+                    Ok(m) => m,
+                    Err(_) => {
+                        measurement_source = "localhost_real_measurement_failed";
+                        Metrics::failed(options.warmup_count, options.sample_count)
                     }
                 }
             } else {
@@ -1691,247 +1665,6 @@ fn pct_lower_is_worse(baseline: f64, candidate: f64) -> f64 {
         return 0.0;
     }
     ((baseline - candidate) / baseline) * 100.0
-}
-
-async fn run_real_comparable_measurement(
-    protocol: &str,
-    url: &str,
-    warmup_count: usize,
-    sample_count: usize,
-    payload_schedule_ms: &[u64],
-) -> Result<(Metrics, Metrics), Box<dyn std::error::Error>> {
-    let mut reqwest_ttft_values = Vec::new();
-    let mut reqwest_throughput_values = Vec::new();
-    let mut reqwest_chunk_rates = Vec::new();
-    let mut reqwest_body_transfer_duration_values = Vec::new();
-    let mut reqwest_client_overhead_duration_values = Vec::new();
-    let mut specter_ttft_values = Vec::new();
-    let mut specter_throughput_values = Vec::new();
-    let mut specter_chunk_rates = Vec::new();
-    let mut specter_body_transfer_duration_values = Vec::new();
-    let mut specter_client_overhead_duration_values = Vec::new();
-    let scheduled_duration = payload_schedule_duration(payload_schedule_ms, BENCH_REQUEST_COUNT);
-
-    let reqwest_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let specter_client = specter::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .prefer_http2(protocol == "h2")
-        .build()?;
-
-    if protocol != "h1" {
-        for _ in 0..warmup_count {
-            let _ =
-                measure_reqwest_streaming_batch(&reqwest_client, url, BENCH_REQUEST_COUNT).await;
-            let _ = measure_specter_streaming_batch(
-                protocol,
-                &specter_client,
-                url,
-                BENCH_REQUEST_COUNT,
-            )
-            .await;
-        }
-    }
-
-    for sample_idx in 0..sample_count {
-        if sample_idx % 2 == 0 {
-            record_reqwest_sample(
-                protocol,
-                url,
-                &reqwest_client,
-                scheduled_duration,
-                &mut reqwest_ttft_values,
-                &mut reqwest_throughput_values,
-                &mut reqwest_chunk_rates,
-                &mut reqwest_body_transfer_duration_values,
-                &mut reqwest_client_overhead_duration_values,
-            )
-            .await?;
-            record_specter_sample(
-                protocol,
-                url,
-                &specter_client,
-                scheduled_duration,
-                &mut specter_ttft_values,
-                &mut specter_throughput_values,
-                &mut specter_chunk_rates,
-                &mut specter_body_transfer_duration_values,
-                &mut specter_client_overhead_duration_values,
-            )
-            .await?;
-        } else {
-            record_specter_sample(
-                protocol,
-                url,
-                &specter_client,
-                scheduled_duration,
-                &mut specter_ttft_values,
-                &mut specter_throughput_values,
-                &mut specter_chunk_rates,
-                &mut specter_body_transfer_duration_values,
-                &mut specter_client_overhead_duration_values,
-            )
-            .await?;
-            record_reqwest_sample(
-                protocol,
-                url,
-                &reqwest_client,
-                scheduled_duration,
-                &mut reqwest_ttft_values,
-                &mut reqwest_throughput_values,
-                &mut reqwest_chunk_rates,
-                &mut reqwest_body_transfer_duration_values,
-                &mut reqwest_client_overhead_duration_values,
-            )
-            .await?;
-        }
-    }
-
-    Ok((
-        metrics_from_samples(
-            protocol,
-            warmup_count,
-            sample_count,
-            reqwest_ttft_values,
-            reqwest_throughput_values,
-            reqwest_chunk_rates,
-            reqwest_body_transfer_duration_values,
-            reqwest_client_overhead_duration_values,
-        )?,
-        metrics_from_samples(
-            protocol,
-            warmup_count,
-            sample_count,
-            specter_ttft_values,
-            specter_throughput_values,
-            specter_chunk_rates,
-            specter_body_transfer_duration_values,
-            specter_client_overhead_duration_values,
-        )?,
-    ))
-}
-
-async fn record_reqwest_sample(
-    protocol: &str,
-    url: &str,
-    warm_client: &reqwest::Client,
-    scheduled_duration: Duration,
-    ttft_values: &mut Vec<f64>,
-    throughput_values: &mut Vec<f64>,
-    chunk_rates: &mut Vec<f64>,
-    body_transfer_duration_values: &mut Vec<f64>,
-    client_overhead_duration_values: &mut Vec<f64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let h1_client;
-    let client = if protocol == "h1" {
-        h1_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-        &h1_client
-    } else {
-        warm_client
-    };
-    let (ttft, total_duration, bytes, chunks) =
-        measure_reqwest_streaming_batch(client, url, BENCH_REQUEST_COUNT).await?;
-    record_sample(
-        ttft,
-        total_duration,
-        scheduled_duration,
-        bytes,
-        chunks,
-        ttft_values,
-        throughput_values,
-        chunk_rates,
-        body_transfer_duration_values,
-        client_overhead_duration_values,
-    );
-    Ok(())
-}
-
-async fn record_specter_sample(
-    protocol: &str,
-    url: &str,
-    warm_client: &specter::Client,
-    scheduled_duration: Duration,
-    ttft_values: &mut Vec<f64>,
-    throughput_values: &mut Vec<f64>,
-    chunk_rates: &mut Vec<f64>,
-    body_transfer_duration_values: &mut Vec<f64>,
-    client_overhead_duration_values: &mut Vec<f64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let h1_client;
-    let client = if protocol == "h1" {
-        h1_client = specter::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .prefer_http2(false)
-            .build()?;
-        &h1_client
-    } else {
-        warm_client
-    };
-    let (ttft, total_duration, bytes, chunks) =
-        measure_specter_streaming_batch(protocol, client, url, BENCH_REQUEST_COUNT).await?;
-    record_sample(
-        ttft,
-        total_duration,
-        scheduled_duration,
-        bytes,
-        chunks,
-        ttft_values,
-        throughput_values,
-        chunk_rates,
-        body_transfer_duration_values,
-        client_overhead_duration_values,
-    );
-    Ok(())
-}
-
-fn metrics_from_samples(
-    protocol: &str,
-    warmup_count: usize,
-    sample_count: usize,
-    ttft_values: Vec<f64>,
-    throughput_values: Vec<f64>,
-    chunk_rates: Vec<f64>,
-    body_transfer_duration_values: Vec<f64>,
-    client_overhead_duration_values: Vec<f64>,
-) -> Result<Metrics, Box<dyn std::error::Error>> {
-    if ttft_values.is_empty() {
-        return Err("No successful samples".into());
-    }
-
-    let (p50, p95, p99) = calculate_percentiles(ttft_values.clone());
-    let (_, p95_throughput, _) = calculate_percentiles(throughput_values.clone());
-    let median_throughput = calculate_median(throughput_values.clone());
-    let median_chunk_rate = calculate_median(chunk_rates);
-    let median_body_transfer_duration_ns = calculate_median(body_transfer_duration_values);
-    let median_client_overhead_duration_ns = calculate_median(client_overhead_duration_values);
-
-    Ok(Metrics {
-        ttft_ns: p50,
-        chunks_per_sec: median_chunk_rate,
-        bytes_per_sec: median_throughput,
-        p95_bytes_per_sec: p95_throughput,
-        body_transfer_duration_ns: median_body_transfer_duration_ns,
-        client_overhead_duration_ns: median_client_overhead_duration_ns,
-        p50_ns: p50,
-        p95_ns: p95,
-        p99_ns: p99,
-        warmup_count,
-        sample_count,
-        connection_reuse_count: if protocol == "h1" {
-            sample_count.saturating_mul(BENCH_REQUEST_COUNT.saturating_sub(1))
-        } else {
-            warmup_count
-                .saturating_add(sample_count)
-                .saturating_mul(BENCH_REQUEST_COUNT)
-                .saturating_sub(1)
-        },
-        pass: true,
-        ttft_samples_ns: ttft_values,
-        bytes_per_sec_samples: throughput_values,
-    })
 }
 
 async fn run_real_measurement(
