@@ -18,6 +18,9 @@ const H1_PORT: u16 = 3201;
 const H2_PORT: u16 = 3202;
 const H3_PORT: u16 = 3203;
 const RFC8441_PORT: u16 = 3204;
+const BENCH_CHUNK_SIZE: usize = 1024;
+const BENCH_CHUNK_COUNT: usize = 5;
+const BENCH_CHUNK_DELAY_MS: u64 = 2;
 
 #[derive(Serialize)]
 struct Rfc8441CoexistenceResult {
@@ -108,6 +111,7 @@ struct Row {
     comparable: bool,
     comparison_mode: &'static str,
     skip_reason: Option<&'static str>,
+    measurement_source: &'static str,
     client_config: ClientConfig,
     metrics: Metrics,
     threshold: Threshold,
@@ -141,6 +145,38 @@ struct Metrics {
     sample_count: usize,
     connection_reuse_count: usize,
     pass: bool,
+}
+
+impl Metrics {
+    fn failed(warmup_count: usize, sample_count: usize) -> Self {
+        Self {
+            ttft_ns: 0.0,
+            chunks_per_sec: 0.0,
+            bytes_per_sec: 0.0,
+            p50_ns: 0.0,
+            p95_ns: 0.0,
+            p99_ns: 0.0,
+            warmup_count,
+            sample_count,
+            connection_reuse_count: 0,
+            pass: false,
+        }
+    }
+
+    fn not_applicable(warmup_count: usize, sample_count: usize) -> Self {
+        Self {
+            ttft_ns: 0.0,
+            chunks_per_sec: 0.0,
+            bytes_per_sec: 0.0,
+            p50_ns: 0.0,
+            p95_ns: 0.0,
+            p99_ns: 0.0,
+            warmup_count,
+            sample_count,
+            connection_reuse_count: 0,
+            pass: true,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -391,9 +427,9 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
                                 break;
                             }
                         } else if path.starts_with("/stream") {
-                            let chunk_size = 1024;
-                            let chunk_count = 5;
-                            let delay_ms = 2;
+                            let chunk_size = BENCH_CHUNK_SIZE;
+                            let chunk_count = BENCH_CHUNK_COUNT;
+                            let delay_ms = BENCH_CHUNK_DELAY_MS;
                             let total_size = chunk_size * chunk_count;
 
                             let response = format!(
@@ -453,6 +489,7 @@ async fn handle_h2_connection<
     }
 
     let mut settings_sent = false;
+    let mut decoder = specter::transport::h2::HpackDecoder::new();
     let (tx, mut rx) = mpsc::channel::<(u8, u8, u32, Vec<u8>)>(100);
 
     loop {
@@ -475,7 +512,6 @@ async fn handle_h2_connection<
                         }
                     }
                     0x01 => {
-                        let mut decoder = specter::transport::h2::HpackDecoder::new();
                         let decoded = decoder.decode(&payload);
                         let headers = decoded.unwrap_or_default();
 
@@ -509,9 +545,9 @@ async fn handle_h2_connection<
                             tokio::spawn(async move {
                                 let _ = tx_clone.send((0x01, 0x04, stream_id, vec![0x88])).await;
 
-                                let chunk_size = 1024;
-                                let chunk_count = 5;
-                                let delay_ms = 2;
+                                let chunk_size = BENCH_CHUNK_SIZE;
+                                let chunk_count = BENCH_CHUNK_COUNT;
+                                let delay_ms = BENCH_CHUNK_DELAY_MS;
                                 let chunk_data = vec![b's'; chunk_size];
 
                                 for i in 0..chunk_count {
@@ -707,9 +743,9 @@ async fn start_h3_server(
                                                                     ];
                                                                     let _ = h3.send_response(&mut conn, stream_id, &h3_headers, false);
 
-                                                                    let chunk_size = 1024;
-                                                                    let chunk_count = 5;
-                                                                    let delay_ms = 2;
+                                                                    let chunk_size = BENCH_CHUNK_SIZE;
+                                                                    let chunk_count = BENCH_CHUNK_COUNT;
+                                                                    let delay_ms = BENCH_CHUNK_DELAY_MS;
                                                                     let chunk_data = vec![b's'; chunk_size];
 
                                                                     for i in 0..chunk_count {
@@ -828,12 +864,10 @@ fn parse_options(args: &[String]) -> BenchmarkOptions {
         concurrency_levels,
         force_comparable_threshold_failure: args
             .iter()
-            .any(|arg| arg == "--self-test-threshold-failure")
-            || env::var("SPECTER_BENCH_FORCE_THRESHOLD_FAIL").is_ok(),
+            .any(|arg| arg == "--self-test-threshold-failure"),
         force_h3_threshold_failure: args
             .iter()
-            .any(|arg| arg == "--self-test-h3-threshold-failure")
-            || env::var("SPECTER_BENCH_FORCE_H3_THRESHOLD_FAIL").is_ok(),
+            .any(|arg| arg == "--self-test-h3-threshold-failure"),
     }
 }
 
@@ -970,11 +1004,11 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
     let workload = Workload {
         request_count: 8,
         concurrency_levels: options.concurrency_levels.clone(),
-        chunk_size: 1024,
-        chunk_count: 5,
-        payload_schedule_ms: vec![0, 2, 2, 2, 2],
+        chunk_size: BENCH_CHUNK_SIZE,
+        chunk_count: BENCH_CHUNK_COUNT,
+        payload_schedule_ms: vec![BENCH_CHUNK_DELAY_MS; BENCH_CHUNK_COUNT],
         tokio_runtime: "tokio multi_thread",
-        pools: "warm",
+        pools: "protocol-specific: H1 cold isolated client per sample; H2/H3 warm pooled",
     };
 
     let measurement = MeasurementConfig {
@@ -988,7 +1022,6 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
     let mut required_thresholds_passed = true;
     let mut failed_rows = Vec::new();
 
-    let use_real = env::var("SPECTER_BENCH_REAL").is_ok();
     let mut h3_specter_metrics = None;
 
     for (protocol, endpoint) in [
@@ -1003,6 +1036,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
 
         let is_comparable = matches!(protocol, "h1" | "h2");
         let mut protocol_metrics = BTreeMap::new();
+        let mut protocol_measurement_sources = BTreeMap::new();
 
         for client in ["reqwest", "specter"] {
             let endpoint_for_url = if protocol == "h3" {
@@ -1020,58 +1054,30 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
                 format!("http://{}/stream", endpoint_for_url)
             };
 
-            let mut metrics = if use_real && is_comparable {
-                match run_real_measurement(protocol, client, &url, workload.chunk_size).await {
+            let mut measurement_source = "not_applicable_non_comparable";
+            let mut metrics = if is_comparable || (protocol == "h3" && client == "specter") {
+                measurement_source = "localhost_real_measurement";
+                match run_real_measurement(
+                    protocol,
+                    client,
+                    &url,
+                    options.warmup_count,
+                    options.sample_count,
+                )
+                .await
+                {
                     Ok(m) => m,
-                    Err(_) => Metrics {
-                        ttft_ns: 1_000_000.0,
-                        chunks_per_sec: 1000.0,
-                        bytes_per_sec: 10000.0,
-                        p50_ns: 1_000_000.0,
-                        p95_ns: 1_000_000.0,
-                        p99_ns: 1_000_000.0,
-                        warmup_count: options.warmup_count,
-                        sample_count: options.sample_count,
-                        connection_reuse_count: 0,
-                        pass: false,
-                    },
+                    Err(_) => {
+                        measurement_source = "localhost_real_measurement_failed";
+                        Metrics::failed(options.warmup_count, options.sample_count)
+                    }
                 }
             } else {
-                Metrics {
-                    ttft_ns: if client == "specter" {
-                        900_000.0
-                    } else {
-                        1_000_000.0
-                    },
-                    chunks_per_sec: if client == "specter" { 3300.0 } else { 3000.0 },
-                    bytes_per_sec: if client == "specter" {
-                        36_300.0
-                    } else {
-                        33_000.0
-                    },
-                    p50_ns: if client == "specter" {
-                        900_000.0
-                    } else {
-                        1_000_000.0
-                    },
-                    p95_ns: if client == "specter" {
-                        1_150_000.0
-                    } else {
-                        1_200_000.0
-                    },
-                    p99_ns: if client == "specter" {
-                        1_250_000.0
-                    } else {
-                        1_300_000.0
-                    },
-                    warmup_count: options.warmup_count,
-                    sample_count: options.sample_count,
-                    connection_reuse_count: 7,
-                    pass: true,
-                }
+                Metrics::not_applicable(options.warmup_count, options.sample_count)
             };
 
             if options.force_comparable_threshold_failure && is_comparable && client == "specter" {
+                measurement_source = "self_test_induced_threshold_failure";
                 metrics.ttft_ns = 1_100_000.0;
                 metrics.chunks_per_sec = 2000.0;
                 metrics.bytes_per_sec = 25_000.0;
@@ -1082,6 +1088,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
             }
 
             if options.force_h3_threshold_failure && protocol == "h3" && client == "specter" {
+                measurement_source = "self_test_induced_h3_threshold_failure";
                 metrics.ttft_ns = 5_000_000.0;
                 metrics.chunks_per_sec = 100.0;
                 metrics.bytes_per_sec = 1_000.0;
@@ -1101,6 +1108,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
             }
 
             protocol_metrics.insert(client, metrics.clone());
+            protocol_measurement_sources.insert(client, measurement_source);
         }
 
         let comparable_threshold = if is_comparable {
@@ -1149,6 +1157,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
                 } else {
                     None
                 },
+                measurement_source: protocol_measurement_sources[client],
                 client_config: ClientConfig {
                     runtime: workload.tokio_runtime,
                     payload_schedule_ms: workload.payload_schedule_ms.clone(),
@@ -1256,7 +1265,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         .danger_accept_invalid_certs(true)
         .prefer_http2(true)
         .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let ws_url = format!("wss://127.0.0.1:{}/socket", RFC8441_PORT);
     let stream_url = format!("https://127.0.0.1:{}/stream", RFC8441_PORT);
@@ -1266,31 +1275,31 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         .websocket_h2(&ws_url)
         .open()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     // 2. Open streaming response concurrently
     let (_resp, mut rx) = client_coexist
         .get(&stream_url)
         .send_streaming()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     // 3. Send and receive tunnel message
     tunnel
         .send_bytes(bytes::Bytes::from("bench-coexist-msg"), false)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let t_msg = tunnel
         .recv_bytes()
         .await
         .unwrap()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let tunnel_received = String::from_utf8(t_msg.to_vec()).unwrap_or_default();
 
     // 4. Consume stream chunks
     let mut chunks = Vec::new();
     while let Some(chunk_res) = rx.recv().await {
-        let chunk = chunk_res.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let chunk = chunk_res.map_err(|e| io::Error::other(e.to_string()))?;
         chunks.push(String::from_utf8(chunk.to_vec()).unwrap_or_default());
     }
 
@@ -1388,70 +1397,84 @@ async fn run_real_measurement(
     protocol: &str,
     client: &str,
     url: &str,
-    _chunk_size: usize,
+    warmup_count: usize,
+    sample_count: usize,
 ) -> Result<Metrics, Box<dyn std::error::Error>> {
     let mut ttft_values = Vec::new();
     let mut throughput_values = Vec::new();
     let mut chunk_rates = Vec::new();
 
     if client == "specter" {
-        let specter_client = specter::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .prefer_http2(protocol == "h2")
-            .build()?;
-        let _ = measure_specter_streaming(&specter_client, url).await;
-    } else {
-        let reqwest_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-        let _ = measure_reqwest_streaming(&reqwest_client, url).await;
-    }
-
-    let sample_count = 3;
-
-    for _ in 0..sample_count {
-        if client == "specter" {
+        for _ in 0..warmup_count {
             let specter_client = specter::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .prefer_http2(protocol == "h2")
                 .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) =
-                measure_specter_streaming(&specter_client, url).await
-            {
-                let ttft_ns = ttft.as_nanos() as f64;
-                let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 {
-                    body_duration
-                } else {
-                    1e-9
-                };
-                let chunks_per_sec = chunks as f64 / body_duration;
-                let bytes_per_sec = bytes as f64 / body_duration;
+            let _ = measure_specter_streaming(&specter_client, url).await;
+        }
 
-                ttft_values.push(ttft_ns);
-                throughput_values.push(bytes_per_sec);
-                chunk_rates.push(chunks_per_sec);
+        let specter_client = specter::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .prefer_http2(protocol == "h2")
+            .build()?;
+        for _ in 0..sample_count {
+            let h1_client;
+            let client_ref = if protocol == "h1" {
+                h1_client = specter::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .prefer_http2(false)
+                    .build()?;
+                &h1_client
+            } else {
+                &specter_client
+            };
+            if let Ok((ttft, total_duration, bytes, chunks)) =
+                measure_specter_streaming(client_ref, url).await
+            {
+                record_sample(
+                    ttft,
+                    total_duration,
+                    bytes,
+                    chunks,
+                    &mut ttft_values,
+                    &mut throughput_values,
+                    &mut chunk_rates,
+                );
             }
-        } else {
+        }
+    } else {
+        for _ in 0..warmup_count {
             let reqwest_client = reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()?;
-            if let Ok((ttft, total_duration, bytes, chunks)) =
-                measure_reqwest_streaming(&reqwest_client, url).await
-            {
-                let ttft_ns = ttft.as_nanos() as f64;
-                let body_duration = (total_duration - ttft).as_secs_f64();
-                let body_duration = if body_duration > 0.0 {
-                    body_duration
-                } else {
-                    1e-9
-                };
-                let chunks_per_sec = chunks as f64 / body_duration;
-                let bytes_per_sec = bytes as f64 / body_duration;
+            let _ = measure_reqwest_streaming(&reqwest_client, url).await;
+        }
 
-                ttft_values.push(ttft_ns);
-                throughput_values.push(bytes_per_sec);
-                chunk_rates.push(chunks_per_sec);
+        let reqwest_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        for _ in 0..sample_count {
+            let h1_client;
+            let client_ref = if protocol == "h1" {
+                h1_client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()?;
+                &h1_client
+            } else {
+                &reqwest_client
+            };
+            if let Ok((ttft, total_duration, bytes, chunks)) =
+                measure_reqwest_streaming(client_ref, url).await
+            {
+                record_sample(
+                    ttft,
+                    total_duration,
+                    bytes,
+                    chunks,
+                    &mut ttft_values,
+                    &mut throughput_values,
+                    &mut chunk_rates,
+                );
             }
         }
     }
@@ -1471,11 +1494,31 @@ async fn run_real_measurement(
         p50_ns: p50,
         p95_ns: p95,
         p99_ns: p99,
-        warmup_count: 1,
+        warmup_count,
         sample_count,
-        connection_reuse_count: 7,
+        connection_reuse_count: if protocol == "h1" {
+            0
+        } else {
+            warmup_count.saturating_add(sample_count).saturating_sub(1)
+        },
         pass: true,
     })
+}
+
+fn record_sample(
+    ttft: Duration,
+    total_duration: Duration,
+    bytes: usize,
+    chunks: usize,
+    ttft_values: &mut Vec<f64>,
+    throughput_values: &mut Vec<f64>,
+    chunk_rates: &mut Vec<f64>,
+) {
+    let ttft_ns = ttft.as_nanos() as f64;
+    let total_duration = total_duration.as_secs_f64().max(1e-9);
+    ttft_values.push(ttft_ns);
+    throughput_values.push(bytes as f64 / total_duration);
+    chunk_rates.push(chunks as f64 / total_duration);
 }
 
 fn environment() -> Environment {
@@ -1511,11 +1554,11 @@ fn metric_definitions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "chunks_per_sec",
-            "decoded body chunks received divided by body receive duration",
+            "decoded body chunks received divided by total request duration from request start through body EOF",
         ),
         (
             "bytes_per_sec",
-            "decoded body bytes received divided by body receive duration; body bytes only",
+            "decoded body bytes received divided by total request duration from request start through body EOF; body bytes only",
         ),
         (
             "p50_ns",

@@ -8,8 +8,8 @@ fn streaming_benchmark_declares_enforceable_h3_gate() {
     assert!(source.contains("struct H3Gate"));
     assert!(source.contains("fixture_address: \"127.0.0.1:3203/udp\""));
     assert!(source.contains("reqwest_h3_unavailable_specter_regression_gate"));
-    assert!(source.contains("SPECTER_BENCH_FORCE_H3_THRESHOLD_FAIL"));
     assert!(source.contains("--self-test-h3-threshold-failure"));
+    assert!(!source.contains("SPECTER_BENCH_FORCE_H3_THRESHOLD_FAIL"));
 }
 
 #[test]
@@ -22,8 +22,10 @@ fn streaming_benchmark_declares_enforceable_h1_h2_threshold_gate() {
     assert!(source.contains("p95_ttft_regression_pct <= 0.0"));
     assert!(source.contains("thresholded_origins: vec![\"127.0.0.1:3201\", \"127.0.0.1:3202\"]"));
     assert!(source.contains("public_provider_threshold_inputs: Vec::new()"));
-    assert!(source.contains("SPECTER_BENCH_FORCE_THRESHOLD_FAIL"));
     assert!(source.contains("--self-test-threshold-failure"));
+    assert!(!source.contains("SPECTER_BENCH_FORCE_THRESHOLD_FAIL"));
+    assert!(!source.contains("SPECTER_BENCH_REAL"));
+    assert!(source.contains("\"localhost_real_measurement\""));
 }
 
 #[test]
