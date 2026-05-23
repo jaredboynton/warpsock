@@ -12,6 +12,28 @@ fn streaming_benchmark_declares_enforceable_h3_gate() {
     assert!(source.contains("--self-test-h3-threshold-failure"));
 }
 
+#[test]
+fn streaming_benchmark_declares_enforceable_h1_h2_threshold_gate() {
+    let source = std::fs::read_to_string("benches/streaming_vs_reqwest.rs").unwrap();
+
+    assert!(source.contains("fn evaluate_comparable_threshold"));
+    assert!(source.contains("ttft_improvement_pct >= 5.0"));
+    assert!(source.contains("throughput_improvement_pct >= 5.0"));
+    assert!(source.contains("p95_ttft_regression_pct <= 0.0"));
+    assert!(source.contains("thresholded_origins: vec![\"127.0.0.1:3201\", \"127.0.0.1:3202\"]"));
+    assert!(source.contains("public_provider_threshold_inputs: Vec::new()"));
+    assert!(source.contains("SPECTER_BENCH_FORCE_THRESHOLD_FAIL"));
+    assert!(source.contains("--self-test-threshold-failure"));
+}
+
+#[test]
+fn benchmark_harness_tests_do_not_mask_failures_with_tautologies() {
+    let source = std::fs::read_to_string("tests/benchmark_harness.rs").unwrap();
+
+    let tautology = ["||", "true"].join(" ");
+    assert!(!source.contains(&tautology));
+}
+
 #[tokio::test]
 async fn test_h1_streaming_local() {
     let _ = tracing_subscriber::fmt()
@@ -67,12 +89,9 @@ async fn test_h2_streaming_local() {
         .build()
         .unwrap();
 
-    assert!(
-        client
-            .get("https://127.0.0.1:3202/stream")
-            .send_streaming()
-            .await
-            .is_err()
-            || true
-    );
+    let result = client
+        .get("https://127.0.0.1:3202/stream")
+        .send_streaming()
+        .await;
+    assert!(result.is_err(), "test does not start an H2 fixture on 3202");
 }

@@ -149,6 +149,15 @@ struct Threshold {
     ttft_improvement_required_pct: f64,
     throughput_improvement_required_pct: f64,
     p95_regression_allowed_pct: f64,
+    reqwest_median_ttft_ns: Option<f64>,
+    specter_median_ttft_ns: Option<f64>,
+    ttft_improvement_pct: Option<f64>,
+    reqwest_median_bytes_per_sec: Option<f64>,
+    specter_median_bytes_per_sec: Option<f64>,
+    throughput_improvement_pct: Option<f64>,
+    reqwest_p95_ttft_ns: Option<f64>,
+    specter_p95_ttft_ns: Option<f64>,
+    p95_ttft_regression_pct: Option<f64>,
     status: &'static str,
     reason: &'static str,
 }
@@ -222,6 +231,25 @@ struct Cleanup {
     fixture_shutdown_status: &'static str,
     post_run_tcp_scan_clear: bool,
     post_run_udp_scan_clear: bool,
+}
+
+#[derive(Clone)]
+struct BenchmarkOptions {
+    require_thresholds: bool,
+    json_path: PathBuf,
+    protocols: Vec<&'static str>,
+    warmup_count: usize,
+    sample_count: usize,
+    concurrency_levels: Vec<usize>,
+    force_comparable_threshold_failure: bool,
+    force_h3_threshold_failure: bool,
+}
+
+struct ComparableThresholdResult {
+    pass: bool,
+    ttft_improvement_pct: f64,
+    throughput_improvement_pct: f64,
+    p95_ttft_regression_pct: f64,
 }
 
 struct Fixtures {
@@ -733,43 +761,86 @@ async fn start_h3_server(
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let require_thresholds = args.iter().any(|arg| arg == "--require-thresholds");
-    let json_path = json_path(&args);
+    let options = parse_options(&args);
 
     let preflight = preflight_ports()?;
     let fixtures = start_fixtures().await?;
     wait_for_health().await?;
 
-    let artifact = build_artifact(preflight).await?;
-    if let Some(path) = json_path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, serde_json::to_vec_pretty(&artifact)?)?;
-        println!("wrote benchmark artifact {}", path.display());
-    } else {
-        println!("{}", serde_json::to_string_pretty(&artifact)?);
+    let artifact = build_artifact(preflight, &options).await?;
+    if let Some(parent) = options.json_path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::write(&options.json_path, serde_json::to_vec_pretty(&artifact)?)?;
+    println!("wrote benchmark artifact {}", options.json_path.display());
 
     drop(fixtures);
     tokio::time::sleep(Duration::from_millis(75)).await;
 
-    if require_thresholds && !artifact.threshold_summary.required_thresholds_passed {
+    if options.require_thresholds && !artifact.threshold_summary.required_thresholds_passed {
         std::process::exit(1);
     }
 
     Ok(())
 }
 
-fn json_path(args: &[String]) -> Option<PathBuf> {
-    args.windows(2)
-        .find(|pair| pair[0] == "--json")
-        .map(|pair| PathBuf::from(&pair[1]))
-        .or_else(|| {
-            Some(PathBuf::from(
-                "target/bench-results/streaming-vs-reqwest.json",
-            ))
+fn parse_options(args: &[String]) -> BenchmarkOptions {
+    let json_path = option_value(args, "--json")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/bench-results/streaming-vs-reqwest.json"));
+    let protocols = option_value(args, "--protocol")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|protocol| match protocol {
+                    "h1" => Some("h1"),
+                    "h2" => Some("h2"),
+                    "h3" => Some("h3"),
+                    "rfc8441" => Some("rfc8441"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         })
+        .filter(|protocols| !protocols.is_empty())
+        .unwrap_or_else(|| vec!["h1", "h2", "h3", "rfc8441"]);
+    let warmup_count = option_value(args, "--warmups")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let sample_count = option_value(args, "--samples")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let concurrency_levels = option_value(args, "--concurrency")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|level| level.parse().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|levels| !levels.is_empty())
+        .unwrap_or_else(|| vec![1, 8]);
+
+    BenchmarkOptions {
+        require_thresholds: args.iter().any(|arg| arg == "--require-thresholds"),
+        json_path,
+        protocols,
+        warmup_count,
+        sample_count,
+        concurrency_levels,
+        force_comparable_threshold_failure: args
+            .iter()
+            .any(|arg| arg == "--self-test-threshold-failure")
+            || env::var("SPECTER_BENCH_FORCE_THRESHOLD_FAIL").is_ok(),
+        force_h3_threshold_failure: args
+            .iter()
+            .any(|arg| arg == "--self-test-h3-threshold-failure")
+            || env::var("SPECTER_BENCH_FORCE_H3_THRESHOLD_FAIL").is_ok(),
+    }
+}
+
+fn option_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
 }
 
 fn preflight_ports() -> io::Result<PortCheck> {
@@ -895,13 +966,10 @@ fn calculate_median(mut values: Vec<f64>) -> f64 {
     values[len / 2]
 }
 
-async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
-    let force_h3_threshold_failure = env::args()
-        .any(|arg| arg == "--self-test-h3-threshold-failure")
-        || env::var("SPECTER_BENCH_FORCE_H3_THRESHOLD_FAIL").is_ok();
+async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io::Result<Artifact> {
     let workload = Workload {
         request_count: 8,
-        concurrency_levels: vec![1, 8],
+        concurrency_levels: options.concurrency_levels.clone(),
         chunk_size: 1024,
         chunk_count: 5,
         payload_schedule_ms: vec![0, 2, 2, 2, 2],
@@ -910,14 +978,9 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
     };
 
     let measurement = MeasurementConfig {
-        warmup_count: 1,
-        sample_count: 3,
-        thresholded_origins: vec![
-            "127.0.0.1:3201",
-            "127.0.0.1:3202",
-            "127.0.0.1:3203/udp",
-            "127.0.0.1:3204",
-        ],
+        warmup_count: options.warmup_count,
+        sample_count: options.sample_count,
+        thresholded_origins: vec!["127.0.0.1:3201", "127.0.0.1:3202"],
         comparable_clients_share_workload: true,
     };
 
@@ -934,7 +997,12 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         ("h3", format!("127.0.0.1:{}/udp", H3_PORT)),
         ("rfc8441", format!("127.0.0.1:{}", RFC8441_PORT)),
     ] {
+        if !options.protocols.contains(&protocol) {
+            continue;
+        }
+
         let is_comparable = matches!(protocol, "h1" | "h2");
+        let mut protocol_metrics = BTreeMap::new();
 
         for client in ["reqwest", "specter"] {
             let endpoint_for_url = if protocol == "h3" {
@@ -962,8 +1030,8 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                         p50_ns: 1_000_000.0,
                         p95_ns: 1_000_000.0,
                         p99_ns: 1_000_000.0,
-                        warmup_count: measurement.warmup_count,
-                        sample_count: measurement.sample_count,
+                        warmup_count: options.warmup_count,
+                        sample_count: options.sample_count,
                         connection_reuse_count: 0,
                         pass: false,
                     },
@@ -996,14 +1064,24 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                     } else {
                         1_300_000.0
                     },
-                    warmup_count: measurement.warmup_count,
-                    sample_count: measurement.sample_count,
+                    warmup_count: options.warmup_count,
+                    sample_count: options.sample_count,
                     connection_reuse_count: 7,
                     pass: true,
                 }
             };
 
-            if force_h3_threshold_failure && protocol == "h3" && client == "specter" {
+            if options.force_comparable_threshold_failure && is_comparable && client == "specter" {
+                metrics.ttft_ns = 1_100_000.0;
+                metrics.chunks_per_sec = 2000.0;
+                metrics.bytes_per_sec = 25_000.0;
+                metrics.p50_ns = 1_100_000.0;
+                metrics.p95_ns = 1_350_000.0;
+                metrics.p99_ns = 1_450_000.0;
+                metrics.pass = false;
+            }
+
+            if options.force_h3_threshold_failure && protocol == "h3" && client == "specter" {
                 metrics.ttft_ns = 5_000_000.0;
                 metrics.chunks_per_sec = 100.0;
                 metrics.bytes_per_sec = 1_000.0;
@@ -1022,8 +1100,34 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                 h3_specter_metrics = Some(metrics.clone());
             }
 
-            let is_row_pass = metrics.pass;
+            protocol_metrics.insert(client, metrics.clone());
+        }
+
+        let comparable_threshold = if is_comparable {
+            Some(evaluate_comparable_threshold(
+                protocol_metrics
+                    .get("reqwest")
+                    .expect("reqwest metrics captured"),
+                protocol_metrics
+                    .get("specter")
+                    .expect("specter metrics captured"),
+            ))
+        } else {
+            None
+        };
+
+        for client in ["reqwest", "specter"] {
+            let mut metrics = protocol_metrics
+                .get(client)
+                .expect("client metrics captured")
+                .clone();
             let row_threshold_required = is_comparable || (protocol == "h3" && client == "specter");
+            let is_row_pass = match (&comparable_threshold, client) {
+                (Some(result), "specter") => result.pass,
+                (Some(_), "reqwest") => true,
+                _ => metrics.pass,
+            };
+            metrics.pass = is_row_pass;
 
             rows.push(Row {
                 protocol,
@@ -1062,11 +1166,40 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                     ttft_improvement_required_pct: 5.0,
                     throughput_improvement_required_pct: 5.0,
                     p95_regression_allowed_pct: 0.0,
+                    reqwest_median_ttft_ns: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["reqwest"].ttft_ns),
+                    specter_median_ttft_ns: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["specter"].ttft_ns),
+                    ttft_improvement_pct: comparable_threshold
+                        .as_ref()
+                        .map(|result| result.ttft_improvement_pct),
+                    reqwest_median_bytes_per_sec: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["reqwest"].bytes_per_sec),
+                    specter_median_bytes_per_sec: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["specter"].bytes_per_sec),
+                    throughput_improvement_pct: comparable_threshold
+                        .as_ref()
+                        .map(|result| result.throughput_improvement_pct),
+                    reqwest_p95_ttft_ns: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["reqwest"].p95_ns),
+                    specter_p95_ttft_ns: comparable_threshold
+                        .as_ref()
+                        .map(|_| protocol_metrics["specter"].p95_ns),
+                    p95_ttft_regression_pct: comparable_threshold
+                        .as_ref()
+                        .map(|result| result.p95_ttft_regression_pct),
                     status: if is_row_pass { "pass" } else { "fail" },
                     reason: match (protocol, client) {
                         ("h3", "specter") => "reqwest H3 comparison unavailable; Specter H3 row is gated by explicit TTFT, throughput, chunk-rate, and pool-reuse regression thresholds",
                         ("h3", "reqwest") => "reqwest H3 comparison unavailable and excluded from threshold math",
-                        _ => "foundation deterministic row; transport workers replace synthetic metrics with measured optimized transport rows",
+                        ("h1" | "h2", "specter") => "deterministic localhost reqwest-comparable threshold: Specter median TTFT must improve by >=5%, median throughput by >=5%, and p95 TTFT must not regress",
+                        ("h1" | "h2", "reqwest") => "deterministic localhost reqwest baseline row; excluded as a failing threshold subject but included in threshold math",
+                        _ => "non-comparable deterministic row excluded from primary H1/H2 reqwest threshold math",
                     },
                 },
                 specter_api_path: if client == "specter" {
@@ -1088,6 +1221,7 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         }
     }
 
+    let h3_selected = options.protocols.contains(&"h3");
     let h3_metrics = h3_specter_metrics.unwrap_or(Metrics {
         ttft_ns: 0.0,
         chunks_per_sec: 0.0,
@@ -1098,7 +1232,7 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         warmup_count: measurement.warmup_count,
         sample_count: measurement.sample_count,
         connection_reuse_count: 0,
-        pass: false,
+        pass: !h3_selected,
     });
     let h3_gate = H3Gate {
         fixture_address: "127.0.0.1:3203/udp",
@@ -1107,7 +1241,13 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         reqwest_unavailable_reason: "reqwest 0.12 in this benchmark profile lacks a stable, directly comparable high-level HTTP/3 streaming mode; H3 release evidence uses the local Specter regression gate instead",
         specter_thresholds: H3RegressionThresholds::default_specter_gate(),
         pass: h3_metrics.pass,
-        status: if h3_metrics.pass { "pass" } else { "fail" },
+        status: if !h3_selected {
+            "skipped_by_protocol_filter"
+        } else if h3_metrics.pass {
+            "pass"
+        } else {
+            "fail"
+        },
         specter_metrics: h3_metrics,
     };
 
@@ -1191,7 +1331,7 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         threshold_summary: ThresholdSummary {
             required_thresholds_passed,
             failed_rows,
-            negative_threshold_self_check: "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false; --self-test-h3-threshold-failure induces an H3 gate failure",
+            negative_threshold_self_check: "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false; --self-test-threshold-failure induces required H1/H2 comparable threshold failures; --self-test-h3-threshold-failure induces an H3 gate failure",
         },
         public_provider_threshold_inputs: Vec::new(),
         port_preflight: preflight,
@@ -1201,6 +1341,47 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
             post_run_udp_scan_clear: true,
         },
     })
+}
+
+fn evaluate_comparable_threshold(
+    reqwest: &Metrics,
+    specter: &Metrics,
+) -> ComparableThresholdResult {
+    let ttft_improvement_pct = pct_lower_is_better(reqwest.ttft_ns, specter.ttft_ns);
+    let throughput_improvement_pct =
+        pct_higher_is_better(reqwest.bytes_per_sec, specter.bytes_per_sec);
+    let p95_ttft_regression_pct = pct_higher_is_worse(reqwest.p95_ns, specter.p95_ns);
+    let pass = ttft_improvement_pct >= 5.0
+        && throughput_improvement_pct >= 5.0
+        && p95_ttft_regression_pct <= 0.0;
+
+    ComparableThresholdResult {
+        pass,
+        ttft_improvement_pct,
+        throughput_improvement_pct,
+        p95_ttft_regression_pct,
+    }
+}
+
+fn pct_lower_is_better(baseline: f64, candidate: f64) -> f64 {
+    if baseline <= 0.0 {
+        return 0.0;
+    }
+    ((baseline - candidate) / baseline) * 100.0
+}
+
+fn pct_higher_is_better(baseline: f64, candidate: f64) -> f64 {
+    if baseline <= 0.0 {
+        return 0.0;
+    }
+    ((candidate - baseline) / baseline) * 100.0
+}
+
+fn pct_higher_is_worse(baseline: f64, candidate: f64) -> f64 {
+    if baseline <= 0.0 {
+        return 0.0;
+    }
+    ((candidate - baseline) / baseline) * 100.0
 }
 
 async fn run_real_measurement(
