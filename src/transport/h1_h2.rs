@@ -219,6 +219,12 @@ impl Client {
         &self.alt_svc_cache
     }
 
+    /// Get the underlying HTTP/3 client for direct access to the H3 transport
+    /// (e.g. when bypassing the Alt-Svc upgrade path).
+    pub fn h3_client(&self) -> &H3Client {
+        &self.h3_client
+    }
+
     /// Check if a host is localhost (localhost, 127.0.0.1, ::1)
     fn is_localhost(host: &str) -> bool {
         host == "localhost" || host == "127.0.0.1" || host == "::1"
@@ -1930,7 +1936,11 @@ impl ClientBuilder {
         let tls_fingerprint = self.fingerprint.tls_fingerprint();
         let mut connector = BoringConnector::with_fingerprint(tls_fingerprint.clone())
             .with_root_certificates(self.root_certs.clone())
-            .with_platform_roots(self.use_platform_roots);
+            .with_platform_roots(self.use_platform_roots)
+            .with_dns_config(self.dns_config.clone())
+            .tcp_keepalive(self.tcp_keepalive)
+            .tcp_keepalive_interval(self.tcp_keepalive_interval)
+            .tcp_keepalive_retries(self.tcp_keepalive_retries);
 
         // Apply global danger_accept_invalid_certs if set
         if self.danger_accept_invalid_certs {
@@ -1941,10 +1951,18 @@ impl ClientBuilder {
         let insecure_connector = BoringConnector::with_fingerprint(tls_fingerprint.clone())
             .with_root_certificates(self.root_certs)
             .with_platform_roots(self.use_platform_roots)
+            .with_dns_config(self.dns_config.clone())
+            .tcp_keepalive(self.tcp_keepalive)
+            .tcp_keepalive_interval(self.tcp_keepalive_interval)
+            .tcp_keepalive_retries(self.tcp_keepalive_retries)
             .danger_accept_invalid_certs(true);
 
         // Create H3 client with same TLS fingerprint
-        let mut h3_client = H3Client::with_fingerprint(tls_fingerprint);
+        let mut h3_client =
+            H3Client::with_fingerprint(tls_fingerprint).with_dns_config(self.dns_config.clone());
+        if let Some(timeout_ms) = self.h3_max_idle_timeout {
+            h3_client = h3_client.with_max_idle_timeout(timeout_ms);
+        }
         if self.danger_accept_invalid_certs {
             h3_client = h3_client.danger_accept_invalid_certs(true);
         }
@@ -1959,13 +1977,22 @@ impl ClientBuilder {
             HttpVersion::Http1_1
         };
 
+        // HTTP/1.1 idle pool with the configured idle timeout and per-host cap.
+        // The third arg is reserved for future H2/H3 multiplexing limits and only
+        // affects the multiplexed-entry path inside `ConnectionPool`.
+        let h1_pool = Arc::new(ConnectionPool::with_config(
+            self.pool_idle_timeout,
+            self.pool_max_idle_per_host,
+            100,
+        ));
+
         Ok(Client {
             connector,
             insecure_connector,
             h3_client,
             alt_svc_cache: Arc::new(AltSvcCache::new()),
             h2_pool: Arc::new(RwLock::new(HashMap::new())),
-            h1_pool: Arc::new(ConnectionPool::new()),
+            h1_pool,
             http2_settings,
             pseudo_order: self.pseudo_order,
             default_version,
