@@ -823,26 +823,25 @@ impl<'a> RequestBuilder<'a> {
                 Some(request.body.clone().into_bytes()?)
             };
             let h1_pool = client.h1_pool.clone();
+            let pool_key_for_reuse = pool_key.clone();
+            let on_reusable: crate::transport::h1::H1ReuseHook = Box::new(move |stream| {
+                Box::pin(async move { h1_pool.put_h1(pool_key_for_reuse, stream).await })
+            });
             let conn = H1Connection::new(stream);
             let send_fut = conn.send_request_streaming(
                 request.method.clone(),
                 &uri,
                 headers.to_vec(),
                 body_bytes,
+                on_reusable,
             );
-            let (response, rx, reuse_rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+            let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
                 tokio_timeout(ttfb_timeout, send_fut)
                     .await
                     .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
             } else {
                 send_fut.await?
             };
-
-            tokio::spawn(async move {
-                if let Ok(Some(stream)) = reuse_rx.await {
-                    h1_pool.put_h1(pool_key, stream).await;
-                }
-            });
 
             let response = response.with_url(request_url.clone());
             if let Some(jar) = &client.cookie_store {

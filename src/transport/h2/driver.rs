@@ -179,6 +179,16 @@ where
             self.flush_tunnel_data().await?;
             self.flush_pending_streaming_bodies().await?;
             self.check_keepalive_timeout()?;
+
+            if let Some(stream_id) = self.single_stream_fast_path_target() {
+                if self
+                    .run_single_stream_streaming_fast_path(stream_id)
+                    .await?
+                {
+                    continue;
+                }
+            }
+
             let keepalive_delay = self.keepalive_delay();
             let retry_streaming_backpressure = self.has_pending_streaming_body();
 
@@ -249,6 +259,135 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Returns the stream ID eligible for the single-stream streaming fast
+    /// path, or `None` when the regular multiplexed driver loop must run.
+    ///
+    /// Fast-path conditions: exactly one active stream, that stream is a
+    /// streaming response with no pending request body left to send, no
+    /// queued multiplexed work, no RFC 8441 tunnels open, no outstanding
+    /// keepalive ping, no streaming backpressure currently buffered, and the
+    /// `command_rx` queue is empty so we will not delay another command.
+    fn single_stream_fast_path_target(&self) -> Option<u32> {
+        if self.streams.len() != 1
+            || !self.tunnels.is_empty()
+            || !self.pending_requests.is_empty()
+            || self.pending_ping.is_some()
+            || !self.command_rx.is_empty()
+        {
+            return None;
+        }
+
+        let (stream_id, stream) = self.streams.iter().next()?;
+        if stream.streaming_body_tx.is_none()
+            || !stream.pending_streaming_body.is_empty()
+            || stream.body_offset < stream.pending_body.len()
+        {
+            return None;
+        }
+
+        Some(*stream_id)
+    }
+
+    /// Tight inner loop that bypasses the multiplexing dispatch when only one
+    /// streaming response is active. Reads frames directly and forwards DATA
+    /// payloads to the single owner channel without iterating the streams
+    /// HashMap or polling the command queue. Returns `Ok(true)` when it
+    /// processed at least one frame and the regular loop should continue,
+    /// `Ok(false)` when the conditions changed before any frame was processed
+    /// (so the caller falls through to the regular `select!`).
+    async fn run_single_stream_streaming_fast_path(&mut self, stream_id: u32) -> Result<bool> {
+        let mut processed_any = false;
+
+        loop {
+            match self.command_rx.try_recv() {
+                Ok(cmd) => {
+                    self.pending_requests.push_back(cmd);
+                    return Ok(processed_any);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Ok(processed_any);
+                }
+            }
+
+            if let Some(stream) = self.streams.get(&stream_id) {
+                if let Some(tx) = stream.streaming_body_tx.as_ref() {
+                    if tx.is_closed() {
+                        self.cancel_stream_for_dropped_receiver(stream_id).await;
+                        return Ok(true);
+                    }
+                } else {
+                    return Ok(processed_any);
+                }
+            } else {
+                return Ok(processed_any);
+            }
+
+            let (header, payload) = match self.connection.read_next_frame().await {
+                Ok(frame) => frame,
+                Err(e) => {
+                    tracing::error!("H2Driver read error (fast path): {:?}", e);
+                    return Err(e);
+                }
+            };
+            processed_any = true;
+
+            if header.stream_id == stream_id && header.frame_type == FrameType::Data {
+                let end_stream = (header.flags & flags::END_STREAM) != 0;
+                let data = self
+                    .connection
+                    .process_inbound_data_frame(stream_id, header.flags, payload)
+                    .await?;
+
+                let mut should_complete = false;
+                let mut backpressured = false;
+                if let Some(stream) = self.streams.get_mut(&stream_id) {
+                    let Some(tx) = stream.streaming_body_tx.as_ref() else {
+                        return Ok(true);
+                    };
+                    if !data.is_empty() {
+                        match tx.try_send(Ok(data)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(item)) => {
+                                stream.pending_streaming_body.push_back(item);
+                                backpressured = true;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                self.cancel_stream_for_dropped_receiver(stream_id).await;
+                                return Ok(true);
+                            }
+                        }
+                    }
+
+                    if end_stream {
+                        if stream.pending_streaming_body.is_empty() {
+                            should_complete = true;
+                        } else {
+                            stream.pending_streaming_end = true;
+                        }
+                    }
+                }
+
+                if should_complete {
+                    self.complete_stream(stream_id);
+                    return Ok(true);
+                }
+
+                if backpressured {
+                    return Ok(true);
+                }
+            } else {
+                if let Err(e) = self.handle_frame(header, payload).await {
+                    tracing::error!("H2Driver frame error (fast path): {:?}", e);
+                    return Err(e);
+                }
+                if self.single_stream_fast_path_target() != Some(stream_id) {
+                    return Ok(true);
+                }
+            }
+        }
     }
 
     fn check_keepalive_timeout(&self) -> Result<()> {
@@ -539,6 +678,14 @@ where
 
     /// Iterate all active streams and try to send pending body data
     async fn flush_pending_data(&mut self) -> Result<()> {
+        if !self
+            .streams
+            .values()
+            .any(|stream| stream.body_offset < stream.pending_body.len())
+        {
+            return Ok(());
+        }
+
         // Collect IDs to avoid borrow conflict
         let stream_ids: Vec<u32> = self.streams.keys().cloned().collect();
 

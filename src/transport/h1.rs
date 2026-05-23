@@ -5,19 +5,33 @@
 
 use bytes::{Bytes, BytesMut};
 use http::{Method, Uri};
+use std::future::Future;
+use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
 use crate::response::Response;
 use crate::transport::connector::MaybeHttpsStream;
 
+/// Callback invoked by the streaming body task when the underlying connection
+/// is safe to return to the pool. Ownership of the stream is transferred to
+/// this hook so the body task can perform the pool insertion inline, avoiding
+/// an extra `tokio::spawn` and an additional channel hop per request.
+pub type H1ReuseHook =
+    Box<dyn FnOnce(MaybeHttpsStream) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 /// Maximum response header size (64KB).
 const MAX_HEADERS_SIZE: usize = 64 * 1024;
 
 /// Maximum number of headers to parse.
 const MAX_HEADERS_COUNT: usize = 100;
+
+/// Per-read buffer used by the streaming body readers. Sized at 16 KiB to
+/// match the typical streaming chunk size and to avoid splitting common
+/// chunks across multiple `read` syscalls.
+const STREAM_READ_BUF_SIZE: usize = 16 * 1024;
 
 /// HTTP/1.1 connection for sending requests.
 pub struct H1Connection {
@@ -87,20 +101,19 @@ impl H1Connection {
     /// Send an HTTP/1.1 request and stream the response body without buffering it.
     ///
     /// The returned response contains status and headers with an empty body. The
-    /// body receiver yields decoded HTTP/1.1 body bytes. The reuse receiver
-    /// resolves to the underlying stream only when the response was fully and
-    /// successfully drained and the connection is safe to reuse.
+    /// body receiver yields decoded HTTP/1.1 body bytes. When the body is fully
+    /// drained and the connection is safe to reuse, `on_reusable` is invoked
+    /// with the underlying stream so the caller can return it to its pool. If
+    /// the response is malformed, aborted, or `Connection: close`, the hook is
+    /// dropped and the stream is discarded.
     pub async fn send_request_streaming(
         mut self,
         method: Method,
         uri: &Uri,
         headers: Vec<(String, String)>,
         body: Option<Bytes>,
-    ) -> Result<(
-        Response,
-        mpsc::Receiver<std::result::Result<Bytes, Error>>,
-        oneshot::Receiver<Option<MaybeHttpsStream>>,
-    )> {
+        on_reusable: H1ReuseHook,
+    ) -> Result<(Response, mpsc::Receiver<std::result::Result<Bytes, Error>>)> {
         let request_bytes = self.build_request(&method, uri, &headers, body.as_ref())?;
         self.stream
             .write_all(&request_bytes)
@@ -121,14 +134,14 @@ impl H1Connection {
 
         let (response, mode) = self.read_streaming_response_headers(&method).await?;
         let (body_tx, body_rx) = mpsc::channel(32);
-        let (reuse_tx, reuse_rx) = oneshot::channel();
 
         tokio::spawn(async move {
-            let reusable = self.stream_body(mode, body_tx).await;
-            let _ = reuse_tx.send(reusable);
+            if let Some(stream) = self.stream_body(mode, body_tx).await {
+                on_reusable(stream).await;
+            }
         });
 
-        Ok((response, body_rx, reuse_rx))
+        Ok((response, body_rx))
     }
 
     /// Build the HTTP/1.1 request as bytes.
@@ -469,7 +482,7 @@ impl H1Connection {
             Self::send_body_chunk(tx, Bytes::from(initial)).await?;
         }
 
-        let mut read_buf = BytesMut::with_capacity(8192);
+        let mut read_buf = BytesMut::with_capacity(STREAM_READ_BUF_SIZE);
         loop {
             read_buf.clear();
             let n = self.stream.read_buf(&mut read_buf).await.map_err(|e| {
@@ -499,11 +512,11 @@ impl H1Connection {
         }
 
         let mut received = initial_len;
-        let mut chunk = BytesMut::with_capacity(8192);
+        let mut chunk = BytesMut::with_capacity(STREAM_READ_BUF_SIZE);
         while received < content_length {
             let remaining = content_length - received;
             chunk.clear();
-            chunk.reserve(remaining.min(8192));
+            chunk.reserve(remaining.min(STREAM_READ_BUF_SIZE));
             let n = self
                 .stream
                 .read_buf(&mut chunk)
@@ -528,7 +541,7 @@ impl H1Connection {
         mut buffer: Vec<u8>,
         tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
     ) -> Result<()> {
-        let mut read_buf = vec![0u8; 8192];
+        let mut read_buf = vec![0u8; STREAM_READ_BUF_SIZE];
 
         loop {
             let (chunk_size, line_end) = loop {

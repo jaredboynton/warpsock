@@ -396,7 +396,7 @@ where
             Stream {
                 id: stream_id,
                 state: StreamState::Open,
-                recv_window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                recv_window: self.settings.initial_window_size as i32,
                 send_window: self.peer_settings.initial_window_size as i32,
                 response_tx: None,
                 streaming_tx: None,
@@ -680,7 +680,7 @@ where
             Stream {
                 id: stream_id,
                 state: stream_state,
-                recv_window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                recv_window: self.settings.initial_window_size as i32,
                 send_window: self.peer_settings.initial_window_size as i32,
                 response_tx: None,
                 streaming_tx: None,
@@ -1014,12 +1014,28 @@ where
         flags: u8,
         payload: Bytes,
     ) -> Result<Bytes> {
-        let data_frame = DataFrame::parse(stream_id, flags, payload)
-            .map_err(|e| Error::HttpProtocol(format!("Invalid DATA frame: {}", e)))?;
+        if stream_id == 0 {
+            return Err(Error::HttpProtocol(
+                "Invalid DATA frame: DATA frame must have non-zero stream ID".into(),
+            ));
+        }
 
-        self.handle_data_frame(&data_frame, stream_id).await?;
+        let end_stream = (flags & flags::END_STREAM) != 0;
+        let padded = (flags & flags::PADDED) != 0;
+        let data = if padded {
+            let data_frame = DataFrame::parse(stream_id, flags, payload)
+                .map_err(|e| Error::HttpProtocol(format!("Invalid DATA frame: {}", e)))?;
+            self.handle_data_payload(stream_id, data_frame.data.len(), data_frame.end_stream)
+                .await?;
+            data_frame.data
+        } else {
+            let payload_len = payload.len();
+            self.handle_data_payload(stream_id, payload_len, end_stream)
+                .await?;
+            payload
+        };
 
-        Ok(data_frame.data)
+        Ok(data)
     }
 
     /// Reads response with streaming body - yields headers then streams DATA frames incrementally.
@@ -1674,67 +1690,58 @@ where
 
     /// Handles incoming DATA frame with proper flow control
     async fn handle_data_frame(&mut self, data_frame: &DataFrame, stream_id: u32) -> Result<()> {
-        let payload_len = data_frame.data.len() as i32;
+        self.handle_data_payload(stream_id, data_frame.data.len(), data_frame.end_stream)
+            .await
+    }
 
-        // Decrement connection-level receive window
+    /// Lower-level DATA-frame bookkeeping that operates on the parsed
+    /// `(stream_id, payload length, end_stream)` triple. Splitting this out
+    /// lets the inbound fast path skip allocating a full `DataFrame` for
+    /// unpadded frames, where the payload `Bytes` is itself already the
+    /// caller-visible body chunk.
+    async fn handle_data_payload(
+        &mut self,
+        stream_id: u32,
+        payload_len: usize,
+        end_stream: bool,
+    ) -> Result<()> {
+        let payload_len = payload_len as i32;
+
         self.conn_recv_window -= payload_len;
 
-        // Decrement stream-level receive window
+        let mut needs_stream_update = false;
         if let Some(stream) = self.streams.get_mut(&stream_id) {
-            // Use stream.id to verify
             if stream.id != stream_id {
                 return Err(Error::HttpProtocol(
                     "Stream ID mismatch in handle_data_frame".into(),
                 ));
             }
             stream.recv_window -= payload_len;
+            needs_stream_update = stream.recv_window < WINDOW_UPDATE_THRESHOLD;
+
+            if end_stream {
+                stream.state = match stream.state {
+                    StreamState::Open => StreamState::HalfClosedRemote,
+                    StreamState::HalfClosedLocal => StreamState::Closed,
+                    StreamState::HalfClosedRemote => StreamState::HalfClosedRemote,
+                    StreamState::Closed => StreamState::Closed,
+                };
+            }
         }
 
-        // Send connection-level WINDOW_UPDATE when window gets low
         if self.conn_recv_window < WINDOW_UPDATE_THRESHOLD {
             let increment = DEFAULT_INITIAL_WINDOW_SIZE;
             self.send_window_update(0, increment).await?;
             self.conn_recv_window += increment as i32;
         }
 
-        // Send stream-level WINDOW_UPDATE when window gets low
-        let needs_stream_update = self
-            .streams
-            .get(&stream_id)
-            .map(|s| {
-                // Use stream.id to verify
-                if s.id != stream_id {
-                    return false;
-                }
-                s.recv_window < WINDOW_UPDATE_THRESHOLD
-            })
-            .unwrap_or(false);
         if needs_stream_update {
             let increment = DEFAULT_INITIAL_WINDOW_SIZE;
             if let Some(stream) = self.streams.get(&stream_id) {
-                // Use stream.id for window update
                 self.send_window_update(stream.id, increment).await?;
             }
             if let Some(stream) = self.streams.get_mut(&stream_id) {
                 stream.recv_window += increment as i32;
-            }
-        }
-
-        // Check END_STREAM flag to update state
-        if data_frame.end_stream {
-            if let Some(stream) = self.streams.get_mut(&stream_id) {
-                stream.state = match stream.state {
-                    StreamState::Open => StreamState::HalfClosedRemote,
-                    StreamState::HalfClosedLocal => StreamState::Closed,
-                    StreamState::HalfClosedRemote => {
-                        // Already half-closed remote, ignore duplicate END_STREAM
-                        StreamState::HalfClosedRemote
-                    }
-                    StreamState::Closed => {
-                        // Stream already closed, ignore
-                        StreamState::Closed
-                    }
-                };
             }
         }
 
@@ -1910,7 +1917,7 @@ where
             Stream {
                 id: stream_id,
                 state: stream_state,
-                recv_window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                recv_window: self.settings.initial_window_size as i32,
                 send_window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
                 response_tx: None,
                 streaming_tx: None,
