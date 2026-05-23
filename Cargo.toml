@@ -74,3 +74,19 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [[bench]]
 name = "streaming_vs_reqwest"
 harness = false
+
+# Inner-loop iteration tuning. These profile sections only affect builds rooted
+# at this crate; downstream consumers ignore them, so they are safe for publish.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test.package."*"]
+debug = 0
