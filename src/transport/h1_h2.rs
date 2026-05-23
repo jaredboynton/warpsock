@@ -631,6 +631,54 @@ impl<'a> RequestBuilder<'a> {
         Response,
         tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
     )> {
+        let client = self.client;
+        let mut request = self.build()?;
+        let policy = client.redirect_policy.clone();
+        let mut redirects = 0u32;
+
+        loop {
+            let builder = RequestBuilder {
+                client,
+                url: Some(request.url.clone()),
+                method: request.method.clone(),
+                headers: request.headers.clone(),
+                body: request.body.clone(),
+                version: request.version,
+                timeout: request.timeout,
+                error: None,
+            };
+
+            let (response, rx) = builder.send_streaming_once().await?;
+
+            if matches!(policy, RedirectPolicy::None) || !response.is_redirect() {
+                return Ok((response, rx));
+            }
+
+            let location = match response.redirect_url() {
+                Some(value) => value.to_string(),
+                None => return Ok((response, rx)),
+            };
+
+            if let RedirectPolicy::Limited(limit) = policy {
+                if redirects >= limit {
+                    return Err(Error::RedirectLimit { count: limit });
+                }
+            }
+
+            drain_streaming_receiver(rx).await?;
+
+            let next_url = request.url.join(&location).map_err(Error::from)?;
+            request = client.redirect_request(&request, &response, next_url);
+            redirects += 1;
+        }
+    }
+
+    async fn send_streaming_once(
+        self,
+    ) -> Result<(
+        Response,
+        tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
+    )> {
         let client = self.client.clone();
         let request = self.build()?;
         let mut timeouts = client.timeouts.clone();
@@ -1044,6 +1092,15 @@ impl<'a> RequestBuilder<'a> {
 
         Ok((response, wrapped_rx))
     }
+}
+
+async fn drain_streaming_receiver(
+    mut rx: tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
+) -> Result<()> {
+    while let Some(chunk) = rx.recv().await {
+        let _ = chunk?;
+    }
+    Ok(())
 }
 
 impl Client {

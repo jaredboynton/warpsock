@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use serde_json::json;
 use specter::transport::h2::hpack_impl::Encoder;
-use specter::{Client, CookieJar, Error, HttpVersion};
+use specter::{Client, CookieJar, Error, HttpVersion, RedirectPolicy};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -150,6 +150,24 @@ async fn handle_h1_connection(mut stream: TcpStream, logs: Arc<Mutex<Vec<H1Log>>
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\nuploaded",
+                    )
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            "/redirect-start" => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /redirect-final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            "/redirect-final" => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: keep-alive\r\n\r\nredirected-final",
                     )
                     .await
                     .unwrap();
@@ -399,7 +417,196 @@ async fn public_streaming_preserves_high_level_request_semantics() {
     assert_eq!(post_resp.status().as_u16(), 200);
     assert_eq!(collect_body(post_rx).await.unwrap(), b"uploaded");
 
-    // 4. Read-idle timeout phase is enforced for streaming chunk delivery and
+    // 4. Redirect policy is honored before returning the final streaming
+    //    response, while preserving the same high-level caller shape.
+    let redirect_client = Client::builder()
+        .prefer_http2(false)
+        .redirect_policy(RedirectPolicy::Limited(3))
+        .build()
+        .unwrap();
+    let (redirect_resp, redirect_rx) = redirect_client
+        .get(fixture.endpoint("/redirect-start"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(redirect_resp.status().as_u16(), 200);
+    assert_eq!(
+        redirect_resp.url().map(|u| u.path()),
+        Some("/redirect-final")
+    );
+    assert_eq!(
+        collect_body(redirect_rx).await.unwrap(),
+        b"redirected-final"
+    );
+
+    // 5. H2 preserves the same public builder semantics: default headers,
+    //    explicit auth, and non-empty request bodies reach the pooled H2 path.
+    let h2_headers_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let h2_body_seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let (mut builder, ca_cert) = generate_cert_bundle();
+        builder.set_alpn_select_callback(|_, client_protos| {
+            boring::ssl::select_next_proto(b"\x02h2", client_protos)
+                .ok_or(boring::ssl::AlpnError::NOACK)
+        });
+        let acceptor = builder.build();
+        let server = MockH2Server::new().await.unwrap();
+        let url = server.url_tls();
+        let headers_seen = h2_headers_seen.clone();
+        let body_seen = h2_body_seen.clone();
+        server.start_tls(acceptor, move |conn: MockH2Connection| {
+            let headers_seen = headers_seen.clone();
+            let body_seen = body_seen.clone();
+            async move {
+                conn.read_preface().await.unwrap();
+                let (_, frame_type, flags, _, _) = conn.read_frame().await.unwrap();
+                assert_eq!(frame_type, 0x04);
+                assert_eq!(flags & 0x01, 0);
+                conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                    .await
+                    .unwrap();
+                conn.send_settings_ack().await.unwrap();
+
+                let headers = timeout(Duration::from_secs(5), conn.read_decoded_headers())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                *headers_seen.lock().await = headers.headers.clone();
+
+                let mut body = Vec::new();
+                if headers.flags & 0x01 == 0 {
+                    loop {
+                        let (_, frame_type, flags, stream_id, payload) =
+                            conn.read_frame().await.unwrap();
+                        if frame_type == 0x00 && stream_id == headers.stream_id {
+                            body.extend_from_slice(&payload);
+                            if flags & 0x01 != 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                *body_seen.lock().await = body;
+
+                let mut encoder = Encoder::new();
+                let resp = encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
+                conn.send_headers(headers.stream_id, &resp, false, true)
+                    .await
+                    .unwrap();
+                conn.send_data(headers.stream_id, b"h2-semantics-ok", true)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = Client::builder()
+            .add_root_certificate(ca_cert)
+            .prefer_http2(true)
+            .default_header("X-Default-Semantic", "default-h2")
+            .build()
+            .unwrap();
+        let (h2_resp, h2_rx) = client
+            .post(format!("{}/upload", url))
+            .header("Authorization", "Bearer h2-streaming-token")
+            .body("h2-streaming-body")
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(h2_resp.status().as_u16(), 200);
+        assert_eq!(collect_body(h2_rx).await.unwrap(), b"h2-semantics-ok");
+    }
+
+    let h2_headers = h2_headers_seen.lock().await.clone();
+    assert!(
+        h2_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer h2-streaming-token"),
+        "H2 streaming must preserve explicit Authorization headers: {h2_headers:?}"
+    );
+    assert!(
+        h2_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-default-semantic") && value == "default-h2"
+        }),
+        "H2 streaming must preserve default headers: {h2_headers:?}"
+    );
+    assert_eq!(&*h2_body_seen.lock().await, b"h2-streaming-body");
+
+    // 6. H3 preserves the same public builder semantics for headers and
+    //    non-empty bodies when forced through the high-level HTTP/3 API.
+    let h3_headers_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let h3_body_seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let server = MockH3Server::new().await.unwrap();
+        let url = server.url();
+        let headers_seen = h3_headers_seen.clone();
+        let body_seen = h3_body_seen.clone();
+        server.start(move |conn| {
+            let headers_seen = headers_seen.clone();
+            let body_seen = body_seen.clone();
+            async move {
+                let mut stream_id = None;
+                let mut body = Vec::new();
+                loop {
+                    match conn.read_event().await {
+                        Some(MockEvent::Headers {
+                            stream_id: id,
+                            headers,
+                        }) => {
+                            stream_id = Some(id);
+                            *headers_seen.lock().await = headers;
+                        }
+                        Some(MockEvent::Data { data, .. }) => body.extend_from_slice(&data),
+                        Some(MockEvent::Finished { stream_id: id }) => {
+                            assert_eq!(stream_id, Some(id));
+                            *body_seen.lock().await = body;
+                            conn.send_response_headers(id, vec![(":status", "200")], false)
+                                .await;
+                            conn.send_response_data(id, b"h3-semantics-ok", true).await;
+                            return;
+                        }
+                        Some(_) => {}
+                        None => return,
+                    }
+                }
+            }
+        });
+
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .default_header("X-Default-Semantic", "default-h3")
+            .build()
+            .unwrap();
+        let (h3_resp, h3_rx) = client
+            .post(&url)
+            .version(HttpVersion::Http3Only)
+            .header("Authorization", "Bearer h3-streaming-token")
+            .body("h3-streaming-body")
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(h3_resp.status().as_u16(), 200);
+        assert_eq!(collect_body(h3_rx).await.unwrap(), b"h3-semantics-ok");
+    }
+
+    let h3_headers = h3_headers_seen.lock().await.clone();
+    assert!(
+        h3_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer h3-streaming-token"),
+        "H3 streaming must preserve explicit Authorization headers: {h3_headers:?}"
+    );
+    assert!(
+        h3_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-default-semantic") && value == "default-h3"
+        }),
+        "H3 streaming must preserve default headers: {h3_headers:?}"
+    );
+    assert_eq!(&*h3_body_seen.lock().await, b"h3-streaming-body");
+
+    // 7. Read-idle timeout phase is enforced for streaming chunk delivery and
     //    surfaces as the same crate-level Error variant the non-streaming path
     //    uses (Error::ReadIdleTimeout).
     let timeout_client = Client::builder()
@@ -441,6 +648,11 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .find(|l| l.path == "/upload")
         .map(|l| l.request_body.clone())
         .unwrap_or_default();
+    let redirect_paths: Vec<String> = logs
+        .iter()
+        .filter(|l| l.path.starts_with("/redirect-"))
+        .map(|l| l.path.clone())
+        .collect();
     assert_eq!(
         cookie_seen.as_deref(),
         Some("cross_proto_h1=h1_value"),
@@ -457,10 +669,26 @@ async fn public_streaming_preserves_high_level_request_semantics() {
     );
 
     let artifact = json!({
-        "cookie_replayed_on_streaming": cookie_seen,
-        "authorization_header_seen": auth_seen,
-        "upload_body_bytes": upload_body.len(),
-        "read_idle_timeout_error_variant": "Error::ReadIdleTimeout",
+        "h1": {
+            "cookie_replayed_on_streaming": cookie_seen,
+            "authorization_header_seen": auth_seen,
+            "upload_body_bytes": upload_body.len(),
+            "redirect_policy_followed_paths": redirect_paths,
+            "read_idle_timeout_error_variant": "Error::ReadIdleTimeout"
+        },
+        "h2": {
+            "authorization_header_seen": h2_headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value),
+            "default_header_seen": h2_headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("x-default-semantic")).map(|(_, value)| value),
+            "upload_body_bytes": h2_body_seen.lock().await.len()
+        },
+        "h3": {
+            "authorization_header_seen": h3_headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value),
+            "default_header_seen": h3_headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("x-default-semantic")).map(|(_, value)| value),
+            "upload_body_bytes": h3_body_seen.lock().await.len()
+        },
+        "protocol_limitations": {
+            "compressed_streaming": "explicitly unsupported; compressed streaming returns Error::Decompression in transport tests"
+        }
     });
     fs::write(
         "target/validation/cross/VAL-CROSS-006.json",
