@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-05-22
+
+### Added
+- **High-level streaming API for HTTP/1.1, pooled HTTP/2, and HTTP/3**:
+  `RequestBuilder::send_streaming()` returns an empty `Response` plus a
+  `tokio::sync::mpsc::Receiver<Result<Bytes>>` for incremental body
+  delivery. Behavior is transport-neutral: response metadata arrives
+  before body completion, chunks stream in order, and clean termination
+  is signalled by `recv() -> None`. Compressed encodings on streaming
+  responses now return an explicit `Error::Decompression` rather than
+  silently buffering.
+- **HTTP/1.1 streaming pool lifecycle**: keep-alive connections reuse
+  after a full drain, are discarded on malformed or aborted streams,
+  preserve per-connection cookie and timeout state, and now reject
+  unsupported compressed streaming modes consistently.
+- **Pooled HTTP/2 streaming with multiplexing, flow control, GOAWAY, and
+  RFC 8441 coexistence**: pooled HTTP/2 streaming respects flow control,
+  scopes RST_STREAM and GOAWAY to the affected stream(s), evicts stale
+  pool entries before reuse, and lets WebSocket-over-HTTP/2 tunnels
+  coexist with concurrent streaming requests on the same connection.
+- **HTTP/3 streaming + connection pooling**: H3 streaming surfaces
+  early headers, delivers DATA chunks incrementally, propagates resets
+  and GOAWAY as crate-level errors, supports non-empty request bodies,
+  preserves cookie/timeout semantics, and enforces flow control under
+  slow consumers without starving sibling streams. The H3 client now
+  pools QUIC connections by authority + fingerprint-affecting
+  configuration with explicit eviction of closed/draining connections.
+- **`ClientBuilder` runtime knobs wired through the transport layer**:
+  DNS resolver, TCP keepalive (interval/retries/base), HTTP/1 idle
+  pool sizing/timeout, and HTTP/3 max-idle-timeout each now affect
+  end-to-end behavior. Adds `Client::h3_client()` accessor for direct
+  access to the pooled HTTP/3 transport.
+- **Deterministic streaming benchmark gate**:
+  `cargo bench --bench streaming_vs_reqwest --all-features --
+  --require-thresholds` exits non-zero when any required H1/H2 row
+  fails the 5%-improvement TTFT/throughput gate, and the synthetic
+  H3 row enforces a separate Specter regression threshold against
+  the local UDP fixture (with a `--self-test-h3-threshold-failure`
+  switch for negative-path proof). Public/provider rows are excluded
+  from primary threshold math.
+- **Validation harnesses**: `tests/streaming_public_api.rs` covers
+  cross-protocol public-API parity; `scripts/run-public-endpoint-
+  compatibility.sh` records Cloudflare H2/H3, nghttp2 H2, and
+  fingerprint-validation smoke results as compatibility evidence;
+  `scripts/validate-redacted-artifacts.py` scans Specter, proxy, and
+  mission artifacts for unredacted secrets; vendored test fixtures
+  and runtime caches are skipped.
+
+### Changed
+- **TLS fingerprint pool keying**: H3 connection pool key now uses
+  `TlsFingerprint::pool_key_string()` (explicit field enumeration),
+  not `format!("{:?}", fp)`. Adding new fields can no longer silently
+  re-key existing pooled connections.
+- **H3 driver behavior on dropped streaming receivers**: the driver
+  now sends QUIC `STOP_SENDING` with `H3_REQUEST_CANCELLED` (0x010c)
+  and clears server-side state for the abandoned stream, rather than
+  silently letting the peer continue shipping bytes.
+- **H3 benchmark threshold field naming**: `max_median_ttft_ns` was
+  renamed `max_median_ttft_p50_ns` to match the `metrics.p50_ns`
+  input it actually compares against. The threshold values now live
+  in a single `default_specter_gate()` helper consumed by both the
+  per-row pass/fail check and the JSON `h3_gate.specter_thresholds`
+  section.
+
+### Fixed
+- **Inner-loop iteration**: `[profile.dev]`/`[profile.test]` switched
+  to `debug = "line-tables-only"` with `split-debuginfo = "unpacked"`
+  and zero-debug for transitive packages. `.cargo/config.toml`
+  enables `RUSTC_WRAPPER=sccache` and `-fuse-ld=ld64.lld` for
+  `aarch64-apple-darwin`. Both files are excluded from `cargo
+  publish` and have no effect on downstream consumers.
+
+### Compatibility
+- All public APIs remain source-compatible with 3.0.0; no breaking
+  changes. `send_streaming()` and `Client::h3_client()` are pure
+  additions. `TlsFingerprint::pool_key_string()` is additive.
+
 ## [2.1.3] - 2026-04-24
 
 ### Fixed

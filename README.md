@@ -10,7 +10,7 @@ Supported Chrome fingerprints: **142, 143, 144, 145, 146** (current stable). Fir
 
 ```toml
 [dependencies]
-specter = "2.3"
+specter = "3.1"
 ```
 
 ## Usage
