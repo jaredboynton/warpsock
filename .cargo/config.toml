@@ -5,21 +5,18 @@
 # - Local dev: source scripts/env.sh
 # - CI: Set BORING_BSSL_PATH and BORING_BSSL_INCLUDE_PATH in workflow
 
-[build]
-# Local-only: rustc-wrapper is excluded from the published crate
-# (`.cargo/` is in `Cargo.toml::exclude`), so this only affects local
-# inner-loop builds. Skips rustc work via sccache for cached crates.
-rustc-wrapper = "/opt/homebrew/bin/sccache"
+# Inner-loop iteration speedups (sccache, ld64.lld) are intentionally NOT wired
+# in this file because GitHub Actions / docs.rs / downstream consumers do not
+# all have those tools at the same paths. Developers who want them can export:
+#
+#   export RUSTC_WRAPPER=$(command -v sccache)
+#   export RUSTFLAGS="$RUSTFLAGS -C link-arg=-fuse-ld=$(command -v ld64.lld)"
+#
+# in their own shell or .envrc; both are picked up automatically by cargo.
 
 [env]
 # These are relative to the manifest directory (where Cargo.toml lives)
 # Unfortunately Cargo doesn't support relative paths in [env], so we use scripts instead
-
-# Local-only Mach-O linker swap. ld64.lld is materially faster than the
-# system linker on macOS for the many integration test binaries this crate
-# produces. `.cargo/` is excluded from `cargo publish`, so this never ships.
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 # Target-specific linker settings for cross-compilation
 [target.aarch64-unknown-linux-gnu]
