@@ -180,10 +180,34 @@ struct H3Gate {
 
 #[derive(Serialize)]
 struct H3RegressionThresholds {
-    max_median_ttft_ns: f64,
+    max_median_ttft_p50_ns: f64,
     min_median_bytes_per_sec: f64,
     min_median_chunks_per_sec: f64,
     min_connection_reuse_count: usize,
+}
+
+impl H3RegressionThresholds {
+    /// Single source of truth for the H3 regression gate thresholds.
+    /// Used both for evaluating per-row pass/fail and for emitting the
+    /// `h3_gate.specter_thresholds` JSON section so the two cannot drift.
+    fn default_specter_gate() -> Self {
+        Self {
+            max_median_ttft_p50_ns: 2_000_000.0,
+            min_median_bytes_per_sec: 30_000.0,
+            min_median_chunks_per_sec: 2_000.0,
+            min_connection_reuse_count: 1,
+        }
+    }
+
+    /// Evaluate a metrics row against the configured H3 regression gate.
+    /// The TTFT check runs against `metrics.p50_ns` to match the
+    /// `max_median_ttft_p50_ns` field name.
+    fn evaluate(&self, metrics: &Metrics) -> bool {
+        metrics.p50_ns <= self.max_median_ttft_p50_ns
+            && metrics.bytes_per_sec >= self.min_median_bytes_per_sec
+            && metrics.chunks_per_sec >= self.min_median_chunks_per_sec
+            && metrics.connection_reuse_count >= self.min_connection_reuse_count
+    }
 }
 
 #[derive(Serialize)]
@@ -990,18 +1014,9 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
                 metrics.pass = false;
             }
 
-            let h3_thresholds = H3RegressionThresholds {
-                max_median_ttft_ns: 2_000_000.0,
-                min_median_bytes_per_sec: 30_000.0,
-                min_median_chunks_per_sec: 2_000.0,
-                min_connection_reuse_count: 1,
-            };
-            let h3_gate_pass = protocol != "h3"
-                || client != "specter"
-                || (metrics.p50_ns <= h3_thresholds.max_median_ttft_ns
-                    && metrics.bytes_per_sec >= h3_thresholds.min_median_bytes_per_sec
-                    && metrics.chunks_per_sec >= h3_thresholds.min_median_chunks_per_sec
-                    && metrics.connection_reuse_count >= h3_thresholds.min_connection_reuse_count);
+            let h3_thresholds = H3RegressionThresholds::default_specter_gate();
+            let h3_gate_pass =
+                protocol != "h3" || client != "specter" || h3_thresholds.evaluate(&metrics);
             if protocol == "h3" && client == "specter" {
                 metrics.pass = h3_gate_pass;
                 h3_specter_metrics = Some(metrics.clone());
@@ -1090,12 +1105,7 @@ async fn build_artifact(preflight: PortCheck) -> io::Result<Artifact> {
         comparison_mode: "reqwest_h3_unavailable_specter_regression_gate",
         reqwest_comparison_available: false,
         reqwest_unavailable_reason: "reqwest 0.12 in this benchmark profile lacks a stable, directly comparable high-level HTTP/3 streaming mode; H3 release evidence uses the local Specter regression gate instead",
-        specter_thresholds: H3RegressionThresholds {
-            max_median_ttft_ns: 2_000_000.0,
-            min_median_bytes_per_sec: 30_000.0,
-            min_median_chunks_per_sec: 2_000.0,
-            min_connection_reuse_count: 1,
-        },
+        specter_thresholds: H3RegressionThresholds::default_specter_gate(),
         pass: h3_metrics.pass,
         status: if h3_metrics.pass { "pass" } else { "fail" },
         specter_metrics: h3_metrics,

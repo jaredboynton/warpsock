@@ -232,4 +232,36 @@ impl TlsFingerprint {
             enable_kyber: false,                     // Firefox requires manual flag for Kyber
         }
     }
+
+    /// Stable, explicit-field key suitable for use as a connection-pool discriminator.
+    ///
+    /// Unlike `format!("{self:?}")`, this representation enumerates each
+    /// fingerprint-affecting field individually so adding new struct fields
+    /// will not silently change the keying behavior of pooled connections.
+    pub fn pool_key_string(&self) -> String {
+        let cert_compression = match self.cert_compression {
+            CertCompression::Brotli => "brotli",
+            CertCompression::Zlib => "zlib",
+            CertCompression::None => "none",
+        };
+        format!(
+            "ciphers={}|sigalgs={}|curves={}|exts={}|order={}|grease={}|cc={}|kyber={}",
+            self.cipher_list.join(","),
+            self.sigalgs.join(","),
+            self.curves.join(","),
+            self.extensions
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.extension_order
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.grease,
+            cert_compression,
+            self.enable_kyber,
+        )
+    }
 }

@@ -96,34 +96,10 @@ impl H3Client {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
-        let is_idempotent = method == "GET"
-            || method == "HEAD"
-            || method == "OPTIONS"
-            || method == "PUT"
-            || method == "DELETE";
-        let mut tried_pooled = false;
+        let is_idempotent = is_idempotent_method(method);
         let key = self.pool_key(url)?;
+        let (mut handle, tried_pooled) = self.resolve_handle(url, &key).await?;
 
-        let mut handle = {
-            let pool = self.pool.read().await;
-            if let Some(h) = pool.get(&key).cloned() {
-                if !h.is_closed() && !h.is_draining() {
-                    tried_pooled = true;
-                    h
-                } else {
-                    drop(pool);
-                    let mut pool_write = self.pool.write().await;
-                    pool_write.remove(&key);
-                    drop(pool_write);
-                    self.pooled_handle(url).await?
-                }
-            } else {
-                drop(pool);
-                self.pooled_handle(url).await?
-            }
-        };
-
-        // Convert body
         let body_bytes = body.map(bytes::Bytes::from);
 
         let uri: http::Uri = url
@@ -148,10 +124,7 @@ impl H3Client {
                     "H3: Pooled connection failed: {}. Retrying on a fresh connection",
                     e
                 );
-                let mut pool = self.pool.write().await;
-                pool.remove(&key);
-                drop(pool);
-
+                self.evict_pool_entry(&key).await;
                 handle = self.pooled_handle(url).await?;
                 handle
                     .send_request(method_http, &uri, headers, body_bytes)
@@ -169,32 +142,9 @@ impl H3Client {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
-        let is_idempotent = method == "GET"
-            || method == "HEAD"
-            || method == "OPTIONS"
-            || method == "PUT"
-            || method == "DELETE";
-        let mut tried_pooled = false;
+        let is_idempotent = is_idempotent_method(method);
         let key = self.pool_key(url)?;
-
-        let mut handle = {
-            let pool = self.pool.read().await;
-            if let Some(h) = pool.get(&key).cloned() {
-                if !h.is_closed() && !h.is_draining() {
-                    tried_pooled = true;
-                    h
-                } else {
-                    drop(pool);
-                    let mut pool_write = self.pool.write().await;
-                    pool_write.remove(&key);
-                    drop(pool_write);
-                    self.pooled_handle(url).await?
-                }
-            } else {
-                drop(pool);
-                self.pooled_handle(url).await?
-            }
-        };
+        let (mut handle, tried_pooled) = self.resolve_handle(url, &key).await?;
 
         let uri: http::Uri = url
             .parse()
@@ -219,10 +169,7 @@ impl H3Client {
                     "H3: Pooled streaming connection failed: {}. Retrying on a fresh connection",
                     e
                 );
-                let mut pool = self.pool.write().await;
-                pool.remove(&key);
-                drop(pool);
-
+                self.evict_pool_entry(&key).await;
                 handle = self.pooled_handle(url).await?;
                 handle
                     .send_streaming_request(method_http, &uri, headers, body_bytes)
@@ -244,6 +191,30 @@ impl H3Client {
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
 
         handle.open_websocket_tunnel(uri, headers).await
+    }
+
+    /// Resolve an H3Handle for the given URL: reuse a healthy pooled handle if
+    /// one exists, otherwise establish a fresh connection. Returns the handle
+    /// together with a flag indicating whether the returned handle came from
+    /// the pool (and is therefore eligible for transparent idempotent retry).
+    async fn resolve_handle(&self, url: &str, key: &H3PoolKey) -> Result<(H3Handle, bool)> {
+        {
+            let pool = self.pool.read().await;
+            if let Some(handle) = pool.get(key).cloned() {
+                if !handle.is_closed() && !handle.is_draining() {
+                    return Ok((handle, true));
+                }
+            }
+        }
+
+        self.evict_pool_entry(key).await;
+        let handle = self.pooled_handle(url).await?;
+        Ok((handle, false))
+    }
+
+    async fn evict_pool_entry(&self, key: &H3PoolKey) {
+        let mut pool = self.pool.write().await;
+        pool.remove(key);
     }
 
     async fn pooled_handle(&self, url: &str) -> Result<H3Handle> {
@@ -284,7 +255,7 @@ impl H3Client {
             fingerprint: self
                 .tls_fingerprint
                 .as_ref()
-                .map(|fp| format!("{fp:?}"))
+                .map(|fp| fp.pool_key_string())
                 .unwrap_or_else(|| "default".to_string()),
         })
     }
@@ -367,7 +338,7 @@ impl H3Client {
         // Chrome uses 15663105 (15MB) for initial_max_data
         const CHROME_INITIAL_MAX_DATA: u64 = 15_663_105;
 
-        config.set_max_idle_timeout(30_000);
+        config.set_max_idle_timeout(self.max_idle_timeout.unwrap_or(30_000));
         config.set_max_recv_udp_payload_size(65535);
         config.set_max_send_udp_payload_size(1350);
         config.set_initial_max_data(CHROME_INITIAL_MAX_DATA);
@@ -396,4 +367,8 @@ fn parse_url_host(url: &str) -> Result<(String, u16, String)> {
     let port = u.port_or_known_default().unwrap_or(443);
     let path = u.path().to_string();
     Ok((host, port, path))
+}
+
+fn is_idempotent_method(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE")
 }

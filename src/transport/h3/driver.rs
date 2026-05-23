@@ -728,6 +728,7 @@ impl H3Driver {
         }
 
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            let mut receiver_dropped = false;
             loop {
                 match self.h3_conn.recv_body(&mut self.conn, stream_id, &mut buf) {
                     Ok(0) => break,
@@ -735,6 +736,7 @@ impl H3Driver {
                         if let Some(tx) = &stream.streaming_body_tx {
                             if tx.send(Ok(Bytes::copy_from_slice(&buf[..len]))).is_err() {
                                 stream.streaming_body_tx = None;
+                                receiver_dropped = true;
                                 break;
                             }
                         } else if stream.response_tx.is_some() {
@@ -744,6 +746,19 @@ impl H3Driver {
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(Error::Quic(format!("H3 recv body failed: {}", e))),
                 }
+            }
+
+            if receiver_dropped {
+                // Tell the peer to stop sending and drop server-side state for this
+                // stream so a dropped body receiver does not waste downstream bandwidth.
+                // H3_REQUEST_CANCELLED == 0x010c per RFC 9114 §8.1.
+                const H3_REQUEST_CANCELLED: u64 = 0x010c;
+                let _ = self.conn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    H3_REQUEST_CANCELLED,
+                );
+                self.streams.remove(&stream_id);
             }
         }
 
