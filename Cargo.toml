@@ -17,6 +17,7 @@ exclude = [
     ".cargo/",
     "examples/",
     "justfile",
+    "**/.DS_Store",
 ]
 
 [lib]

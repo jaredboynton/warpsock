@@ -84,6 +84,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes. `send_streaming()` and `Client::h3_client()` are pure
   additions. `TlsFingerprint::pool_key_string()` is additive.
 
+### Rollback / yank / fix-forward guidance
+- **Specter (crates.io)**: 3.1.0 is published as a strictly additive
+  minor over 3.0.0. If a regression is discovered after upload,
+  prefer fix-forward: cut 3.1.1 with the patch and publish over the
+  same line. `cargo yank --version 3.1.0 specters` is reserved for
+  cases where the artifact itself is unsafe to consume (e.g. an
+  accidentally bundled secret or a license error). Yanking does not
+  remove the version from the registry; downstream `Cargo.lock`
+  pins continue to resolve, but new lockfile-less builds will
+  refuse to select 3.1.0.
+- **Specter (Git tag and GitHub release)**: the tag `v3.1.0` and the
+  matching GitHub release point at the release commit. To revert,
+  delete or retarget the GitHub release, then `git push --delete
+  origin v3.1.0` only after the crates.io fate is decided. Never
+  reuse the same tag name for a different commit; cut a new patch
+  tag instead.
+- **Proxy (unified-model-proxy-v2)**: the proxy dependency bump to
+  `specters = "3.1"` is a one-commit change limited to
+  `Cargo.toml` and `Cargo.lock`. Roll back with `git revert` of
+  that single commit, then `cargo update -p specters --precise
+  3.0.0` followed by `cargo check --locked`. Live provider
+  validation logs are tied to the dependency version and survive
+  a rollback as historical evidence.
+
 ## [2.1.3] - 2026-04-24
 
 ### Fixed
