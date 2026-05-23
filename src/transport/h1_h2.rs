@@ -631,9 +631,13 @@ impl<'a> RequestBuilder<'a> {
         Response,
         tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
     )> {
+        let policy = self.client.redirect_policy.clone();
+        if matches!(policy, RedirectPolicy::None) {
+            return self.send_streaming_once().await;
+        }
+
         let client = self.client;
         let mut request = self.build()?;
-        let policy = client.redirect_policy.clone();
         let mut redirects = 0u32;
 
         loop {
@@ -650,7 +654,7 @@ impl<'a> RequestBuilder<'a> {
 
             let (response, rx) = builder.send_streaming_once().await?;
 
-            if matches!(policy, RedirectPolicy::None) || !response.is_redirect() {
+            if !response.is_redirect() {
                 return Ok((response, rx));
             }
 
@@ -680,19 +684,18 @@ impl<'a> RequestBuilder<'a> {
         tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
     )> {
         let client = self.client.clone();
-        let request = self.build()?;
+        let mut request = self.build()?;
         let mut timeouts = client.timeouts.clone();
         if let Some(total) = request.timeout {
             timeouts.total = Some(total);
         }
-        let mut headers = request.headers.clone();
 
         if let Some(jar) = &client.cookie_store {
-            if !headers.contains("cookie") {
+            if !request.headers.contains("cookie") {
                 if let Some(cookie_header) =
                     jar.read().await.build_cookie_header(request.url.as_str())
                 {
-                    headers.insert("Cookie", cookie_header);
+                    request.headers.insert("Cookie", cookie_header);
                 }
             }
         }
@@ -709,7 +712,7 @@ impl<'a> RequestBuilder<'a> {
             let fut = client.h3_client.send_streaming(
                 request.url.as_str(),
                 request.method.as_str(),
-                headers.to_vec(),
+                request.headers.to_vec(),
                 body,
             );
 
@@ -831,7 +834,7 @@ impl<'a> RequestBuilder<'a> {
             let send_fut = conn.send_request_streaming(
                 request.method.clone(),
                 &uri,
-                headers.to_vec(),
+                request.headers.to_vec(),
                 body_bytes,
                 on_reusable,
             );
@@ -876,7 +879,7 @@ impl<'a> RequestBuilder<'a> {
                 let send_fut = conn.send_streaming_request(
                     request.method.clone(),
                     &uri,
-                    headers.to_vec(),
+                    request.headers.to_vec(),
                     body_bytes,
                 );
                 let res = if let Some(ttfb_timeout) = timeouts.ttfb {
@@ -955,7 +958,7 @@ impl<'a> RequestBuilder<'a> {
                         let send_fut = pooled_conn.send_streaming_request(
                             request.method.clone(),
                             &uri,
-                            headers.to_vec(),
+                            request.headers.to_vec(),
                             body_bytes,
                         );
                         let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
@@ -1025,7 +1028,7 @@ impl<'a> RequestBuilder<'a> {
                 let send_fut = pooled_conn.send_streaming_request(
                     request.method.clone(),
                     &uri,
-                    headers.to_vec(),
+                    request.headers.to_vec(),
                     body_bytes,
                 );
                 let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {

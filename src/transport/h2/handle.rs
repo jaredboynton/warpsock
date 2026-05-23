@@ -94,7 +94,7 @@ impl H2Handle {
     ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
         // Allocate channels for headers and body
         let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
-        let (body_tx, body_rx) = mpsc::channel(128);
+        let (body_tx, body_rx) = mpsc::channel(32);
 
         // Send command to driver
         let command = DriverCommand::SendStreamingRequest {

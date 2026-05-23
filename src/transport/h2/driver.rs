@@ -298,6 +298,19 @@ where
     /// `Ok(false)` when the conditions changed before any frame was processed
     /// (so the caller falls through to the regular `select!`).
     async fn run_single_stream_streaming_fast_path(&mut self, stream_id: u32) -> Result<bool> {
+        // Hoist the body_tx Sender once so per-frame DATA delivery does not
+        // re-enter the streams HashMap. Each chunk would otherwise pay one
+        // HashMap lookup to read the sender plus one HashMap get_mut to push
+        // backpressured items; in the unbackpressured case the cached Sender
+        // alone is enough.
+        let body_tx = match self.streams.get(&stream_id) {
+            Some(stream) => match stream.streaming_body_tx.as_ref() {
+                Some(tx) => tx.clone(),
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+
         let mut processed_any = false;
 
         loop {
@@ -312,17 +325,9 @@ where
                 }
             }
 
-            if let Some(stream) = self.streams.get(&stream_id) {
-                if let Some(tx) = stream.streaming_body_tx.as_ref() {
-                    if tx.is_closed() {
-                        self.cancel_stream_for_dropped_receiver(stream_id).await;
-                        return Ok(true);
-                    }
-                } else {
-                    return Ok(processed_any);
-                }
-            } else {
-                return Ok(processed_any);
+            if body_tx.is_closed() {
+                self.cancel_stream_for_dropped_receiver(stream_id).await;
+                return Ok(true);
             }
 
             let (header, payload) = match self.connection.read_next_frame().await {
@@ -341,41 +346,27 @@ where
                     .process_inbound_data_frame(stream_id, header.flags, payload)
                     .await?;
 
-                let mut should_complete = false;
-                let mut backpressured = false;
-                if let Some(stream) = self.streams.get_mut(&stream_id) {
-                    let Some(tx) = stream.streaming_body_tx.as_ref() else {
-                        return Ok(true);
-                    };
-                    if !data.is_empty() {
-                        match tx.try_send(Ok(data)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(item)) => {
+                if !data.is_empty() {
+                    match body_tx.try_send(Ok(data)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(item)) => {
+                            if let Some(stream) = self.streams.get_mut(&stream_id) {
                                 stream.pending_streaming_body.push_back(item);
-                                backpressured = true;
+                                if end_stream {
+                                    stream.pending_streaming_end = true;
+                                }
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                self.cancel_stream_for_dropped_receiver(stream_id).await;
-                                return Ok(true);
-                            }
+                            return Ok(true);
                         }
-                    }
-
-                    if end_stream {
-                        if stream.pending_streaming_body.is_empty() {
-                            should_complete = true;
-                        } else {
-                            stream.pending_streaming_end = true;
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            self.cancel_stream_for_dropped_receiver(stream_id).await;
+                            return Ok(true);
                         }
                     }
                 }
 
-                if should_complete {
+                if end_stream {
                     self.complete_stream(stream_id);
-                    return Ok(true);
-                }
-
-                if backpressured {
                     return Ok(true);
                 }
             } else {
@@ -491,45 +482,22 @@ where
             response_tx,
         } = cmd
         {
-            // Construct request
-            let mut req_builder = http::Request::builder().method(method).uri(uri);
-
-            for (k, v) in headers {
-                req_builder = req_builder.header(k, v);
-            }
-
-            // Body
             let body_bytes = body.unwrap_or_default();
             let has_body = !body_bytes.is_empty();
-
-            let req = match req_builder.body(body_bytes.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    if response_tx
-                        .send(Err(Error::HttpProtocol(format!("Invalid request: {}", e))))
-                        .is_err()
-                    {
-                        tracing::debug!("Response channel closed while sending error");
-                    }
-                    return Ok(());
-                }
-            };
-
-            // Send HEADERS frame (non-blocking write)
-            // If body is present, end_stream=false (DATA frames will be sent separately)
             let end_stream = !has_body;
 
-            match self.connection.send_headers(&req, end_stream).await {
+            match self
+                .connection
+                .send_headers_raw(&method, &uri, &headers, end_stream)
+                .await
+            {
                 Ok(stream_id) => {
-                    // Register stream state
                     self.streams
                         .insert(stream_id, DriverStreamState::new(response_tx, body_bytes));
 
-                    // Trigger flush to try sending body immediately
                     self.flush_pending_data().await?;
                 }
                 Err(e) => {
-                    // Notify error immediately
                     if response_tx.send(Err(e)).is_err() {
                         tracing::debug!("Response channel closed while sending error");
                     }
@@ -549,25 +517,14 @@ where
             headers_tx,
         } = cmd
         {
-            let mut req_builder = http::Request::builder().method(method).uri(uri);
-
-            for (key, value) in headers {
-                req_builder = req_builder.header(key, value);
-            }
-
             let body_bytes = body.unwrap_or_default();
             let end_stream = body_bytes.is_empty();
-            let req = match req_builder.body(body_bytes.clone()) {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = headers_tx.send(Err(Error::HttpProtocol(format!(
-                        "Invalid request: {error}"
-                    ))));
-                    return Ok(());
-                }
-            };
 
-            match self.connection.send_headers(&req, end_stream).await {
+            match self
+                .connection
+                .send_headers_raw(&method, &uri, &headers, end_stream)
+                .await
+            {
                 Ok(stream_id) => {
                     self.streams.insert(
                         stream_id,
@@ -737,6 +694,9 @@ where
     }
 
     async fn flush_tunnel_data(&mut self) -> Result<()> {
+        if self.tunnels.is_empty() {
+            return Ok(());
+        }
         let stream_ids: Vec<u32> = self.tunnels.keys().copied().collect();
 
         for stream_id in stream_ids {
@@ -809,6 +769,9 @@ where
     }
 
     async fn flush_pending_streaming_bodies(&mut self) -> Result<()> {
+        if !self.has_pending_streaming_body() {
+            return Ok(());
+        }
         let stream_ids: Vec<u32> = self
             .streams
             .iter()
@@ -1010,12 +973,11 @@ where
 
                 if let Some(stream) = self.streams.get_mut(&stream_id) {
                     if status >= 200 {
-                        stream.status = Some(status);
-                        stream.headers = regular_headers;
-
                         if let Some(tx) = stream.streaming_headers_tx.take() {
-                            let _ =
-                                tx.send(Ok((stream.status.unwrap_or(0), stream.headers.clone())));
+                            let _ = tx.send(Ok((status, regular_headers)));
+                        } else {
+                            stream.status = Some(status);
+                            stream.headers = regular_headers;
                         }
                     } else if status > 0 {
                         // 1xx informational status

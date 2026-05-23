@@ -634,12 +634,29 @@ where
         request: &Request<Bytes>,
         end_stream: bool,
     ) -> Result<u32> {
+        let uri = request.uri();
+        let method = request.method();
+        let headers: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+            .collect();
+        self.send_headers_raw(method, uri, &headers, end_stream)
+            .await
+    }
+
+    /// Send request headers from raw method/uri/headers parts and register the
+    /// stream without round-tripping through `http::Request` / `HeaderMap`.
+    pub async fn send_headers_raw(
+        &mut self,
+        method: &Method,
+        uri: &Uri,
+        headers: &[(String, String)],
+        end_stream: bool,
+    ) -> Result<u32> {
         // Allocate stream ID
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2; // Client uses odd stream IDs
-
-        let uri = request.uri();
-        let method = request.method();
 
         // Extract URI components
         let scheme = uri.scheme_str().unwrap_or("https");
@@ -689,17 +706,10 @@ where
             },
         );
 
-        // Convert headers to Vec<(String, String)>
-        let headers: Vec<(String, String)> = request
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
-            .collect();
-
         // Encode headers with custom pseudo-header order
         let header_block =
             self.encoder
-                .encode_request(method.as_str(), scheme, authority, path, &headers);
+                .encode_request(method.as_str(), scheme, authority, path, headers);
 
         // RFC 9113 Section 6.2: HEADERS frame header block must not be empty
         if header_block.is_empty() {

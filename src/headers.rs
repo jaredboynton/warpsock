@@ -505,6 +505,10 @@ impl Headers {
     pub fn to_vec(&self) -> Vec<(String, String)> {
         self.headers.clone()
     }
+
+    pub fn into_inner(self) -> Vec<(String, String)> {
+        self.headers
+    }
 }
 
 impl From<Vec<(String, String)>> for Headers {
