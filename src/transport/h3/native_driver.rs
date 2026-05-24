@@ -1273,10 +1273,6 @@ impl NativeH3Driver {
         Ok(())
     }
 
-    // Stub placeholder for the sibling P0.1 RFC9002 recovery worker so the
-    // tree compiles while their full PTO/RTT signal aggregation lands here.
-    fn observe_recovery_signals(&mut self) {}
-
     async fn send_lost_application_stream_retransmits(&mut self) -> Result<()> {
         for packet in self
             .handshake

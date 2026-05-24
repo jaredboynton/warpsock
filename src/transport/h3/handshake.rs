@@ -17,6 +17,9 @@ use crate::transport::h3::quic::{
     LongHeaderType, OpenedShortHeaderPacket, QuicAckTracker, QuicCloseState, QuicCryptoAssembler,
     QuicFrame, QuicLossDetector, QuicPacketKeyMaterial, QuicPathValidator, TransportParameter,
 };
+use crate::transport::h3::recovery::{
+    PacketNumberSpace, RecoveryState, SentPacketInfo,
+};
 use crate::transport::h3::tls::{
     build_client_initial_packet_from_capture_with_size,
     build_client_initial_packet_from_capture_with_version_and_size, ClientInitialPacket,
@@ -720,14 +723,17 @@ pub struct NativeQuicHandshake {
     initial_ack_tracker: QuicAckTracker,
     handshake_ack_tracker: QuicAckTracker,
     application_ack_tracker: QuicAckTracker,
+    client_initial_loss_detector: QuicLossDetector,
     client_handshake_loss_detector: QuicLossDetector,
     client_application_loss_detector: QuicLossDetector,
     client_application_flow_control: QuicApplicationFlowControl,
     client_application_receive_flow_control: QuicReceiveFlowControl,
+    client_initial_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
     client_handshake_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
     client_application_sent_streams: BTreeMap<u64, SentApplicationStreamPacket>,
     client_path_validator: QuicPathValidator,
     server_transport_parameters_validated: bool,
+    recovery: RecoveryState,
     next_client_initial_packet_number: u64,
     next_server_initial_packet_number: u64,
     next_server_handshake_packet_number: u64,

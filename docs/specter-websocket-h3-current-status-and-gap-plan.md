@@ -132,7 +132,6 @@ Specter status:
 
 1. **RFC9002 recovery/PTO completion:** send-time tracking, ACK-driven RTT/PTO estimator updates, and client Handshake CRYPTO PTO retransmission exist, but full PTO backoff, packet-space recovery timers, Initial/server CRYPTO PTO coverage, and production loss recovery remain open.
 2. **RFC9220 statistical proof:** Specter local tunnel echo, close/FIN, slow-consumer mixed rows, and low-level `quiche`/`tokio-quiche` raw tunnel echo comparator rows are persisted at n=30; statistically meaningful p99 (n>=100), third-party close/mixed comparator coverage, and a dedicated tunnel superiority gate remain missing.
-3. **RFC9220 tunnel gate/comparator depth:** byte-bounded outbound backpressure and local/low-level echo rows exist, but p99-scale tunnel samples, third-party close/mixed comparator rows, and a dedicated tunnel superiority gate remain open.
 
 ### P1
 
