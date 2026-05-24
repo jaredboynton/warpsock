@@ -12,7 +12,7 @@ Repo: `/Users/jaredboynton/__devlocal/specter`
 - Native QUIC frame codec now round-trips RFC9000 ACK_ECN frames (`0x03`), validates ACK_ECN counters, records CE growth, applies ACK_ECN ranges like ordinary ACK ranges, and feeds CE growth into congestion response.
 - Native QUIC now has send-time tracking, ACK-driven RTT/PTO estimator updates, client Initial/Handshake plus server Initial/Handshake CRYPTO PTO retransmission, client application-space driver PTO timer/retransmit, mock-server and same-fixture server application loss-detection wake/retransmit, server application ACK-driven recovery state, event-level peer close draining, bounded client/server `CONNECTION_CLOSE` drain replay/suppression, Retry/VN client-handshake handling, and client PATH_CHALLENGE/PATH_RESPONSE token lifecycle coverage.
 - Native H3 now exposes a reusable `H3Handle` path for low-overhead repeated requests and a same-URL hot handle cache for the higher-level `H3Client` path.
-- Native H3 TLS now advertises certificate compression from the TLS fingerprint, controls deterministic-vs-browser-permuted extension behavior, emits raw ordered QUIC transport parameters with dynamic connection-ID placeholders when configured, and wires session-ticket capture/replay through `NativeH3SessionCache`, H3Client cache injection/access, H3 connection establishment, and driver-side ticket drain; safe end-to-end 0-RTT request replay policy remains open.
+- Native H3 TLS now advertises certificate compression from the TLS fingerprint, controls deterministic-vs-browser-permuted extension behavior, emits raw ordered QUIC transport parameters with dynamic connection-ID placeholders when configured, wires session-ticket capture/replay through `NativeH3SessionCache`, H3Client cache injection/access, H3 connection establishment, and driver-side ticket drain, and proves ordinary resumption suppresses 0-RTT CRYPTO unless policy opts in; safe end-to-end 0-RTT request replay policy remains open.
 - Native H3 scheduling now has in-connection request-body/tunnel DATA rotation, RTT/loss/BDP-aware adaptive send-window growth, and H3Client slow-path dispatch wired through the pool-level origin-fair dispatcher.
 - The local benchmark fixture now starts a fresh native H3 server fixture per client in the full matrix, avoiding cross-client fixture state/noise.
 - Release-grade measured proof is now `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30-plus-rfc9220-comparators.json`. It passes `--require-superiority` for required H3 HTTP rows, includes n=30 RFC9220 echo, close/FIN, mixed slow-consumer, and low-level `quiche`/`tokio-quiche` echo comparator rows, and emits no `fixture_events`.
@@ -136,7 +136,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Added transport-only `quinn_transport` and optional `s2n_quic_transport` same-fixture comparator adapters that open a raw QUIC bidirectional stream, echo payload bytes, and record measured TTFT/throughput outside the H3 superiority gate.
 - Added fingerprint-level raw ordered QUIC transport parameters; when supplied, native H3 encodes that list exactly in caller order, bypasses typed/default/GREASE parameter emission, and preserves raw order in the H3 pool key.
 - Wired native QUIC TLS certificate-compression configuration from `TlsFingerprint.cert_compression`, so H3 ClientHello capture can advertise `compress_certificate` for Brotli/Zlib fingerprints.
-- Wired native H3 TLS extension-order behavior into BoringSSL permutation control, added session-ticket capture/install helpers, `NativeH3SessionCache`, H3Client cache injection/access, connection-level session replay with stale-ticket eviction fallback, driver-side ticket drain into the shared cache, and 0-RTT early-data context setup; safe 0-RTT request replay policy remains pending.
+- Wired native H3 TLS extension-order behavior into BoringSSL permutation control, added session-ticket capture/install helpers, `NativeH3SessionCache`, H3Client cache injection/access, connection-level session replay with stale-ticket eviction fallback, driver-side ticket drain into the shared cache, 0-RTT early-data context setup, TLS-level early-data accept/reject status, and non-0RTT replay gating that strips early-data capability from replayed sessions; safe 0-RTT request replay policy remains pending.
 - Added client/server CONNECTION_CLOSE drain replay: local idle/client-shutdown closes and fixture/mock server closes retain the protected close packet, replay it to peer packets during a bounded drain window, and suppress non-close sends after peer close drains.
 - Added a pool-level `OriginFairQueue` rotation primitive for per-origin fairness and wired H3Client slow-path fresh-connect admission through it.
 - Added adaptive native H3 DATA send-window growth/decay driven by RTT samples, loss, and a bounded BDP proxy.
@@ -153,7 +153,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `quinn_transport` and optional `s2n_quic_transport` have measured transport-only comparator adapters; they remain non-H3 rows and are not required for the H3 superiority gate.
 - RFC9220/WebSocket-over-H3 has Specter-native same-fixture echo, close/FIN, slow-consumer mixed rows, and low-level `quiche`/`tokio-quiche` raw tunnel comparator rows at n=30; remaining proof work is p99-scale samples and any dedicated tunnel superiority gate/claim.
 - TLS certificate compression, deterministic-vs-browser-permuted extension behavior, raw ordered QUIC transport parameters with dynamic connection-ID placeholders, session-ticket helpers, `NativeH3SessionCache`, H3Client cache wiring, connection-level session replay, driver-side ticket drain, and 0-RTT early-data context setup are wired for native H3; remaining fingerprint work is explicit extension-list ordering, 0-RTT replay-policy integration, and capture presets.
-- TLS resumption is now plumbed from H3Client through `SSL_SESSION` replay and ticket storage; the remaining 0-RTT gap is anti-replay request policy, transport send integration, and acceptance/rejection observability, not ambiguity or missing cache wiring.
+- TLS resumption is now plumbed from H3Client through `SSL_SESSION` replay and ticket storage; ordinary session replay now strips early-data capability unless request policy opts in, and TLS-level 0-RTT accept/reject status plus reason codes are observable. The remaining 0-RTT gap is anti-replay request policy, transport send integration, and connection/H3Client-level propagation of acceptance/rejection, not ambiguity or missing cache wiring.
 - H3 scheduling now has in-connection fair send turns for streaming request bodies and RFC9220 tunnel DATA, sibling-tunnel and mixed tunnel/response receive-class fairness, RTT/loss/BDP-aware adaptive send budgets, and H3Client origin-fair slow-path dispatch.
 - Outbound RFC9220 tunnel backpressure is byte-bounded at the send API and driver queue boundary; public sends block on byte permits and permit release tracks emitted DATA chunks.
 - Native H3 receive-window updates are now user-consumption-gated for streaming responses and RFC9220 tunnels: public body/tunnel byte release includes encoded H3 DATA frame type/length overhead and feeds `record_client_stream_consumed` per stream before flushing absolute MAX_DATA/MAX_STREAM_DATA.
@@ -166,7 +166,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Native QUIC still needs broader recovery soak/backoff validation, ECN socket marking/reporting plus ACK_ECN generation, PMTU/path probing policy, and path migration/validation beyond the client token lifecycle.
 - Browser-capture ACK parity remains open for per-browser/version ACK behavior and the tuned `ack_eliciting_threshold = 128` benchmark profile.
 - RFC9220/WebSocket-over-H3 still lacks p99-scale samples, third-party close/FIN and slow-consumer comparator rows, and a dedicated tunnel superiority gate/claim, even though low-level `quiche` and `tokio-quiche` raw tunnel echo comparator adapters now have n=30 rows.
-- TLS/H3 fingerprint gaps remain: explicit extension-list ordering beyond BoringSSL permutation policy, 0-RTT request send/replay policy, 0-RTT acceptance/rejection observability, and capture-derived raw transport-parameter presets.
+- TLS/H3 fingerprint gaps remain: explicit extension-list ordering beyond BoringSSL permutation policy, 0-RTT request send/replay policy with connection/H3Client-level acceptance/rejection propagation, and capture-derived raw transport-parameter presets.
 
 ## Validation run
 
@@ -196,6 +196,8 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-current-target-2 cargo test --test h3_native_handshake -- --nocapture`
 - `cargo test --test h3_fingerprint_config -- --nocapture`
 - `cargo test --test h3_native_tls -- --nocapture`
+- `cargo test --test h3_native_tls_resumption -- --nocapture`
+- `cargo test --test h3_native_tls native_tls_zero_rtt_offer_requires_replayable_session_ticket -- --nocapture`
 - `cargo test -p specters --lib pool::multiplexer::tests::origin_fair_queue_rotates_ready_origins_before_same_origin_reuse -- --nocapture`
 - `cargo test --test h3_streaming_pool -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --test h3_receive_flow_scheduling -- --nocapture`
@@ -208,6 +210,8 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-current-target cargo test --test h3_fingerprint_config h3_client_exposes_shared_native_h3_session_cache_for_resumption -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-close-drain-target cargo test --test h3_receive_flow_scheduling close -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-raw-tp-target cargo test --test h3_transport_parameter_raw_order -- --nocapture`
+- `cargo test --test h3_native_tls_resumption -- --nocapture`
+- `cargo test --test h3_native_tls native_tls_zero_rtt_offer_requires_replayable_session_ticket -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib streaming_response_body_reports_backpressure_when_shared_and_pending_slots_are_full -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib streaming_response_backpressure_does_not_pause_when_a_sibling_has_capacity -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-current-a cargo test --test h3_receive_flow_scheduling native_h3_driver_flushes_receive_credit_from_consumed_body_bytes -- --nocapture`
