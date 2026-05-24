@@ -1760,6 +1760,53 @@ fn native_h3_handshake_rejects_server_original_dcid_transport_parameter_mismatch
 }
 
 #[test]
+fn native_h3_handshake_requires_retry_source_transport_parameter_after_retry() {
+    let fingerprint = Http3Fingerprint::chrome();
+    let original_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let retry_source_cid = ConnectionId::from_static(b"retry-scid");
+    let server_source_cid = ConnectionId::from_static(b"server-scid");
+    let mut client = NativeQuicHandshake::client_with_verify_peer(
+        "localhost",
+        &fingerprint,
+        original_destination_cid.clone(),
+        client_source_cid.clone(),
+        false,
+    )
+    .unwrap();
+    let retry = retry_packet(
+        &original_destination_cid,
+        &client_source_cid,
+        &retry_source_cid,
+        b"retry-token",
+    );
+    client.process_server_datagram(&retry).unwrap();
+    let retry_initial = client.take_pending_client_initial().unwrap();
+    let (cert_pem, key_pem) = helpers::tls::cached_cert_and_key_pem();
+    let mut server = NativeQuicServerHandshake::new_with_transport_parameter_connection_ids(
+        &fingerprint,
+        &cert_pem,
+        &key_pem,
+        retry_source_cid,
+        client_source_cid,
+        server_source_cid.clone(),
+        original_destination_cid,
+        server_source_cid,
+        None,
+    )
+    .unwrap();
+    let server_flight = server
+        .process_client_initial(retry_initial.packet.as_ref())
+        .unwrap();
+
+    let err = client
+        .process_server_datagram(&server_flight.datagram)
+        .expect_err("server transport parameters must prove the Retry source CID");
+
+    assert!(err.to_string().contains("retry_source_connection_id"));
+}
+
+#[test]
 fn native_h3_handshake_exposes_single_client_initial_packet() {
     let handshake = NativeQuicHandshake::client(
         "example.com",

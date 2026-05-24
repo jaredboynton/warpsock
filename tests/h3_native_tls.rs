@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use specter::fingerprint::tls::NativeH3TlsFeatureStatus;
+use specter::fingerprint::tls::{NativeH3TlsFeatureStatus, TlsExtensionOrderBehavior};
 use specter::fingerprint::{
     CertCompression, Http3Fingerprint, RawQuicTransportParameter, TlsFingerprint,
 };
@@ -140,6 +140,80 @@ fn native_tls_clienthello_advertises_tls_fingerprint_cert_compression() {
         extensions.contains(&27),
         "Brotli cert compression should advertise compress_certificate extension 27 in {extensions:?}"
     );
+}
+
+#[test]
+fn native_tls_can_reject_invalid_replayed_session_ticket_before_clienthello() {
+    let err = match NativeQuicTlsSession::client_with_replayed_session(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        Some(&TlsFingerprint::chrome()),
+        false,
+        b"not-a-der-session-ticket",
+    ) {
+        Ok(_) => panic!("invalid replayed TLS session tickets must fail before ClientHello capture"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("session ticket"),
+        "unexpected replay error: {err}"
+    );
+}
+
+#[test]
+fn native_tls_zero_rtt_offer_requires_replayable_session_ticket() {
+    let err = match NativeQuicTlsSession::client_with_zero_rtt_offer(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        Some(&TlsFingerprint::chrome()),
+        false,
+        None,
+        b"GET / HTTP/3\r\n\r\n",
+    ) {
+        Ok(_) => panic!("0-RTT must be gated on a replayable TLS session ticket"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("0-RTT") && err.to_string().contains("session ticket"),
+        "unexpected 0-RTT gating error: {err}"
+    );
+}
+
+#[test]
+fn native_tls_deterministic_extension_order_policy_disables_permutation() {
+    let mut tls_fingerprint = TlsFingerprint::chrome();
+    tls_fingerprint.grease = false;
+    tls_fingerprint.cert_compression = CertCompression::None;
+    tls_fingerprint.extension_order_behavior = TlsExtensionOrderBehavior::Deterministic;
+
+    assert_eq!(
+        tls_fingerprint.native_h3_extension_order_behavior(),
+        TlsExtensionOrderBehavior::Deterministic
+    );
+
+    let mut first = NativeQuicTlsSession::client_with_tls_fingerprint(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        Some(&tls_fingerprint),
+        false,
+    )
+    .unwrap();
+    let mut second = NativeQuicTlsSession::client_with_tls_fingerprint(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        Some(&tls_fingerprint),
+        false,
+    )
+    .unwrap();
+
+    let first_extensions =
+        clienthello_extension_ids(&first.take_crypto(QuicEncryptionLevel::Initial));
+    let second_extensions =
+        clienthello_extension_ids(&second.take_crypto(QuicEncryptionLevel::Initial));
+
+    assert_eq!(first_extensions, second_extensions);
 }
 
 #[test]
