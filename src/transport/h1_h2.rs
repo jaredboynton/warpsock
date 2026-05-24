@@ -741,25 +741,32 @@ impl<'a> RequestBuilder<'a> {
         let version = request.version.unwrap_or(client.default_version);
 
         if matches!(version, HttpVersion::Http3 | HttpVersion::Http3Only) {
-            if request.body.is_streaming() {
-                return Err(Error::HttpProtocol(
-                    "HTTP/3 streaming request bodies are not implemented yet".into(),
-                ));
+            if let Some(content_length) = request.body.content_length() {
+                if content_length > 0 && !request.headers.contains("content-length") {
+                    request
+                        .headers
+                        .insert("Content-Length", content_length.to_string());
+                }
             }
-            let body = if request.body.is_empty() {
-                None
+            let body = if request.body.is_streaming() {
+                std::mem::take(&mut request.body)
             } else {
-                Some(request.body.clone().into_bytes()?.to_vec())
+                request.body.clone()
+            };
+            let body_timeouts = crate::transport::h3::H3BodyTimeouts {
+                read_idle: timeouts.read_idle,
+                total: timeouts.total,
             };
 
-            let fut = client.h3_client.send_streaming(
+            let fut = client.h3_client.send_streaming_with_timeouts(
                 request.url.as_str(),
                 request.method.as_str(),
                 request.headers.to_vec(),
                 body,
+                body_timeouts,
             );
 
-            let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+            let response = if let Some(ttfb_timeout) = timeouts.ttfb {
                 tokio_timeout(ttfb_timeout, fut)
                     .await
                     .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
@@ -793,8 +800,7 @@ impl<'a> RequestBuilder<'a> {
                 }
             }
 
-            let body = wrap_streaming_receiver(rx, &timeouts);
-            return Ok(attach_streaming_body(response, body));
+            return Ok(response);
         }
 
         // Parse URI
@@ -1086,68 +1092,6 @@ fn reject_compressed_streaming(response: &Response) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn attach_streaming_body(response: Response, body: Body) -> Response {
-    let url = response.url().cloned();
-    let mut response = Response::with_body(
-        response.status_code(),
-        response.headers().clone(),
-        body,
-        response.http_version().to_string(),
-    );
-    if let Some(url) = url {
-        response = response.with_url(url);
-    }
-    response
-}
-
-fn wrap_streaming_receiver(
-    rx: tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
-    timeouts: &Timeouts,
-) -> Body {
-    if timeouts.read_idle.is_none() && timeouts.total.is_none() {
-        return Body::from_channel(rx);
-    }
-
-    let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(32);
-    let read_idle_timeout = timeouts.read_idle;
-    let total_timeout = timeouts.total;
-    let start_time = tokio::time::Instant::now();
-    let mut mut_rx = rx;
-
-    tokio::spawn(async move {
-        loop {
-            let item = if let Some(rt) = read_idle_timeout {
-                match tokio::time::timeout(rt, mut_rx.recv()).await {
-                    Ok(Some(val)) => val,
-                    Ok(None) => break,
-                    Err(_) => {
-                        let _ = wrapped_tx.send(Err(Error::ReadIdleTimeout(rt))).await;
-                        break;
-                    }
-                }
-            } else {
-                match mut_rx.recv().await {
-                    Some(val) => val,
-                    None => break,
-                }
-            };
-
-            if let Some(tt) = total_timeout {
-                if start_time.elapsed() >= tt {
-                    let _ = wrapped_tx.send(Err(Error::TotalTimeout(tt))).await;
-                    break;
-                }
-            }
-
-            if wrapped_tx.send(item).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    Body::from_channel(wrapped_rx)
 }
 
 async fn drain_streaming_body(body: &mut Body) -> Result<()> {

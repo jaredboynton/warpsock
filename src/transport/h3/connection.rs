@@ -121,6 +121,7 @@ impl H3Connection {
         // Spawn Driver
         let (tx, rx) = mpsc::channel(32);
         let is_draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_progress_notify = Arc::new(tokio::sync::Notify::new());
         let driver = H3Driver::new(
             tx.clone(),
             rx,
@@ -129,6 +130,7 @@ impl H3Connection {
             socket.clone(),
             peer_addr,
             is_draining.clone(),
+            body_progress_notify.clone(),
             max_idle_timeout,
         );
 
@@ -138,7 +140,11 @@ impl H3Connection {
             }
         });
 
-        Ok(H3Handle::new(tx, is_draining))
+        Ok(H3Handle::new_with_notify(
+            tx,
+            is_draining,
+            body_progress_notify,
+        ))
     }
 }
 

@@ -3,7 +3,7 @@
 //! affect runtime behavior end-to-end via `Client::builder()`.
 
 use specter::transport::dns::{Resolve, ResolveFuture};
-use specter::Client;
+use specter::{Client, RequestBody};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -259,19 +259,39 @@ async fn client_builder_h3_max_idle_timeout_forces_reconnect() {
 
     let h3 = client.h3_client().clone();
 
-    let (response1, mut body_rx1) = h3.send_streaming(&url, "GET", vec![], None).await.unwrap();
+    let mut response1 = h3
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
     assert_eq!(response1.status(), 200);
     assert_eq!(
-        body_rx1.recv().await.unwrap().unwrap(),
+        response1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let (response2, mut body_rx2) = h3.send_streaming(&url, "GET", vec![], None).await.unwrap();
+    let mut response2 = h3
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
     assert_eq!(response2.status(), 200);
     assert_eq!(
-        body_rx2.recv().await.unwrap().unwrap(),
+        response2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
 

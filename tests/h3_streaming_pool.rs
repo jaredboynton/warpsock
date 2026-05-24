@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use specter::transport::h3::H3Client;
+use specter::RequestBody;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -82,28 +83,42 @@ async fn h3_pool_reuses_live_same_key_connection() {
     let client = H3Client::new().danger_accept_invalid_certs(true);
 
     // First streaming request
-    let (response1, mut body_rx1) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response1 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(response1.status(), 200);
     assert_eq!(
-        body_rx1.recv().await.unwrap().unwrap(),
+        response1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
-    assert!(body_rx1.recv().await.is_none());
+    assert!(response1.body_mut().frame().await.is_none());
 
     // Second streaming request
-    let (response2, mut body_rx2) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response2 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(response2.status(), 200);
     assert_eq!(
-        body_rx2.recv().await.unwrap().unwrap(),
+        response2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
-    assert!(body_rx2.recv().await.is_none());
+    assert!(response2.body_mut().frame().await.is_none());
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(connection_count.load(Ordering::SeqCst), 1);
@@ -147,23 +162,37 @@ async fn h3_pool_separates_authority_and_fingerprint_keys() {
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
 
-    let (resp1, mut body_rx1) = client
-        .send_streaming(&url1, "GET", vec![], None)
+    let mut resp1 = client
+        .send_streaming(&url1, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(resp1.status(), 200);
     assert_eq!(
-        body_rx1.recv().await.unwrap().unwrap(),
+        resp1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"ok1")
     );
 
-    let (resp2, mut body_rx2) = client
-        .send_streaming(&url2, "GET", vec![], None)
+    let mut resp2 = client
+        .send_streaming(&url2, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(resp2.status(), 200);
     assert_eq!(
-        body_rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"ok2")
     );
 
@@ -210,15 +239,16 @@ async fn h3_pool_concurrent_streams_are_isolated() {
         let client = client.clone();
         let req_url = format!("{url}/stream/{idx}");
         tasks.push(tokio::spawn(async move {
-            let (response, mut body_rx) = client
-                .send_streaming(&req_url, "GET", vec![], None)
+            let mut response = client
+                .send_streaming(&req_url, "GET", vec![], RequestBody::Empty)
                 .await
                 .unwrap();
             assert_eq!(response.status(), 200);
 
             let mut chunks = Vec::new();
-            while let Some(chunk) = body_rx.recv().await {
-                chunks.push(String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+            while let Some(chunk) = response.body_mut().frame().await {
+                chunks
+                    .push(String::from_utf8(chunk.unwrap().into_data().unwrap().to_vec()).unwrap());
             }
             (idx, chunks)
         }));
@@ -263,26 +293,40 @@ async fn h3_pool_reconnects_after_idle_timeout() {
         .danger_accept_invalid_certs(true)
         .with_max_idle_timeout(100); // 100 milliseconds idle timeout
 
-    let (response1, mut body_rx1) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response1 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(response1.status(), 200);
     assert_eq!(
-        body_rx1.recv().await.unwrap().unwrap(),
+        response1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
 
     // Wait for the idle timeout to kick in on client/server
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let (response2, mut body_rx2) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response2 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(response2.status(), 200);
     assert_eq!(
-        body_rx2.recv().await.unwrap().unwrap(),
+        response2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"chunk")
     );
 
@@ -336,26 +380,40 @@ async fn h3_pool_evicts_closed_or_draining_connections() {
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
 
-    let (resp1, mut body_rx1) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut resp1 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(resp1.status(), 200);
     assert_eq!(
-        body_rx1.recv().await.unwrap().unwrap(),
+        resp1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"first")
     );
 
     // Give background driver a tiny moment to process GOAWAY
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (resp2, mut body_rx2) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut resp2 = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(resp2.status(), 200);
     assert_eq!(
-        body_rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         bytes::Bytes::from_static(b"second")
     );
 

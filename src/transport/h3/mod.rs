@@ -1,10 +1,12 @@
 //! HTTP/3 Transport Module
 
+mod body;
 mod connection;
 mod driver;
 mod handle;
 mod tunnel;
 
+pub(crate) use body::{H3Body, H3BodyTimeouts};
 pub use connection::H3Connection;
 pub use driver::DriverCommand;
 pub use handle::H3Handle;
@@ -18,12 +20,12 @@ pub use tunnel::{H3Tunnel, H3TunnelEvent, H3TunnelOutbound};
 
 use crate::error::{Error, Result};
 use crate::fingerprint::tls::TlsFingerprint;
+use crate::request::RequestBody;
 use crate::response::Response;
 use crate::transport::dns::DnsConfig;
-use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct H3PoolKey {
@@ -140,8 +142,21 @@ impl H3Client {
         url: &str,
         method: &str,
         headers: Vec<(String, String)>,
-        body: Option<Vec<u8>>,
-    ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
+        body: RequestBody,
+    ) -> Result<Response> {
+        self.send_streaming_with_timeouts(url, method, headers, body, H3BodyTimeouts::default())
+            .await
+    }
+
+    /// Send a request and stream the response body incrementally with body read timeouts.
+    pub(crate) async fn send_streaming_with_timeouts(
+        &self,
+        url: &str,
+        method: &str,
+        headers: Vec<(String, String)>,
+        body: RequestBody,
+        body_timeouts: H3BodyTimeouts,
+    ) -> Result<Response> {
         let is_idempotent = is_idempotent_method(method);
         let key = self.pool_key(url)?;
         let (mut handle, tried_pooled) = self.resolve_handle(url, &key).await?;
@@ -152,19 +167,23 @@ impl H3Client {
         let method_http: http::Method = method
             .parse()
             .map_err(|_| Error::HttpProtocol("Invalid Method".into()))?;
-        let body_bytes = body.map(Bytes::from);
-
+        let retry_body = if body.is_streaming() {
+            None
+        } else {
+            Some(body.clone())
+        };
         let res = handle
             .send_streaming_request(
                 method_http.clone(),
                 &uri,
                 headers.clone(),
-                body_bytes.clone(),
+                body,
+                body_timeouts,
             )
             .await;
 
         match res {
-            Err(e) if tried_pooled && is_idempotent => {
+            Err(e) if tried_pooled && is_idempotent && retry_body.is_some() => {
                 tracing::debug!(
                     "H3: Pooled streaming connection failed: {}. Retrying on a fresh connection",
                     e
@@ -172,7 +191,13 @@ impl H3Client {
                 self.evict_pool_entry(&key).await;
                 handle = self.pooled_handle(url).await?;
                 handle
-                    .send_streaming_request(method_http, &uri, headers, body_bytes)
+                    .send_streaming_request(
+                        method_http,
+                        &uri,
+                        headers,
+                        retry_body.expect("checked retry body"),
+                        body_timeouts,
+                    )
                     .await
             }
             other => other,

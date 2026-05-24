@@ -1,37 +1,12 @@
 #![allow(dead_code)]
 
 use quiche::h3::NameValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-
-// Self-signed certificate for testing
-#[allow(dead_code)]
-const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIICWjCCAcKgAwIBAgIBAzANBgkqhkiG9w0BAQsFADAoMSYwJAYDVQQDDB1xdWlj
-aGUgc2VsZi1zaWduZWQgY2VydGlmaWNhdGUwHhcNMjAwMTAxMDAwMDAwWhcNMzAw
-MTAxMDAwMDAwWjAoMSYwJAYDVQQDDB1xdWljaGUgc2VsZi1zaWduZWQgY2VydGlm
-aWNhdGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC9C6aAm2j7TCLr
-E/2N+t2tZFxByJg+gN+XfP6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X
-6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q
-/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z
-7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X
-6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q
-/0CAwEAATANBgkqhkiG9w0BAQsFAAOCAQEAq7KkS8qjgJz7Q/X6Z7Q/X6Z7Q/X6Z
-7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X
-6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q
-/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z
-7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X
-6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q/X6Z7Q
-/0==
------END CERTIFICATE-----";
-// Note: This is a dummy cert. In a real scenario we'd use a properly generated one.
-// For the sake of this mock, we will generate a fresh one at runtime using a helper
-// or just trust that quiche's validation can be disabled or configured to accept this.
-// Actually, simpler: write temp files.
 
 /// A mock HTTP/3 server for testing.
 #[allow(dead_code)]
@@ -52,27 +27,14 @@ impl MockH3Server {
 
         // precise frame control requires handling the connection manually
 
-        // Write cert/key to temp files
+        // Reuse the process-wide cached ECDSA P-256 cert (rcgen default) instead of
+        // forking openssl per server. quiche loads cert+key from PEM files, so write
+        // the cached PEM bytes once per server (paths must be unique per UDP port).
+        let (cert_pem, key_pem) = super::tls::cached_cert_and_key_pem();
         let cert_path = std::env::temp_dir().join(format!("mock_h3_{}.crt", port));
         let key_path = std::env::temp_dir().join(format!("mock_h3_{}.key", port));
-
-        let _ = std::process::Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                key_path.to_str().unwrap(),
-                "-out",
-                cert_path.to_str().unwrap(),
-                "-days",
-                "365",
-                "-nodes",
-                "-subj",
-                "/CN=localhost",
-            ])
-            .output()?;
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
 
         Ok(Self {
             socket,
@@ -286,6 +248,8 @@ impl MockH3Server {
                     connections_clone.lock().await.insert(server_scid, tx_clone);
 
                     let mut h3_conn: Option<quiche::h3::Connection> = None;
+                    let mut pending_response_data: VecDeque<(u64, Vec<u8>, usize, bool)> =
+                        VecDeque::new();
 
                     let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
                     let (evt_tx, evt_rx) = mpsc::channel(100);
@@ -407,11 +371,7 @@ impl MockH3Server {
                                         }
                                     }
                                     Some(MockCommand::SendResponseData { stream_id, bytes, fin }) => {
-                                        if let Some(h3) = h3_conn.as_mut() {
-                                            if let Err(e) = h3.send_body(&mut conn, stream_id, &bytes, fin) {
-                                                tracing::debug!("mock h3 send_body error: {}", e);
-                                            }
-                                        }
+                                        pending_response_data.push_back((stream_id, bytes, 0, fin));
                                     }
                                     Some(MockCommand::SendGoAway { id }) => {
                                         if let Some(h3) = h3_conn.as_mut() {
@@ -425,9 +385,64 @@ impl MockH3Server {
                                             error_code,
                                         );
                                     }
-                                    None => {
-                                        let _ = conn.close(true, 0x00, b"done");
-                                    },
+                                    None => {},
+                                }
+                            }
+                        }
+
+                        if let Some(h3) = h3_conn.as_mut() {
+                            while let Some((stream_id, bytes, offset, fin)) =
+                                pending_response_data.front_mut()
+                            {
+                                if bytes.is_empty() {
+                                    match h3.send_body(&mut conn, *stream_id, bytes, *fin) {
+                                        Ok(_) => {
+                                            pending_response_data.pop_front();
+                                        }
+                                        Err(quiche::h3::Error::Done)
+                                        | Err(quiche::h3::Error::StreamBlocked) => break,
+                                        Err(e) => {
+                                            tracing::debug!("mock h3 send_body error: {}", e);
+                                            pending_response_data.pop_front();
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let remaining_len = bytes.len().saturating_sub(*offset);
+                                let capacity = conn.stream_capacity(*stream_id).unwrap_or(0);
+                                let fin_for_call = *fin && capacity > remaining_len + 8;
+                                match h3.send_body(
+                                    &mut conn,
+                                    *stream_id,
+                                    &bytes[*offset..],
+                                    fin_for_call,
+                                ) {
+                                    Ok(sent) if sent > 0 => {
+                                        *offset += sent;
+                                        if *offset >= bytes.len() {
+                                            let needs_fin = *fin && !fin_for_call;
+                                            let finished_stream_id = *stream_id;
+                                            pending_response_data.pop_front();
+                                            if needs_fin {
+                                                pending_response_data.push_front((
+                                                    finished_stream_id,
+                                                    Vec::new(),
+                                                    0,
+                                                    true,
+                                                ));
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Ok(_)
+                                    | Err(quiche::h3::Error::Done)
+                                    | Err(quiche::h3::Error::StreamBlocked) => break,
+                                    Err(e) => {
+                                        tracing::debug!("mock h3 send_body error: {}", e);
+                                        pending_response_data.pop_front();
+                                    }
                                 }
                             }
                         }

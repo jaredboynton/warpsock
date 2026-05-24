@@ -1,11 +1,170 @@
 use bytes::Bytes;
 use specter::transport::h3::H3Client;
-use specter::{Client, Error, HttpVersion};
+use specter::{Client, Error, HttpVersion, RequestBody};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 mod helpers;
 use helpers::mock_h3_server::{MockEvent, MockH3Server};
+
+#[tokio::test]
+async fn h3_response_body_is_poll_based() {
+    fn assert_http_body<T: http_body::Body<Data = Bytes, Error = Error>>(_: &T) {}
+
+    let server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+
+    server.start(|conn| async move {
+        let stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+
+        conn.send_response_headers(stream_id, vec![(":status", "200")], false)
+            .await;
+        conn.send_response_data(stream_id, b"poll", false).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        conn.send_response_data(stream_id, b"-body", true).await;
+    });
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+    let mut response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
+    assert_http_body(response.body());
+    assert!(response.body().is_streaming());
+
+    let first = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, Bytes::from_static(b"poll"));
+    let second = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(second, Bytes::from_static(b"-body"));
+    assert!(response.body_mut().frame().await.is_none());
+
+    let h3_mod = std::fs::read_to_string("src/transport/h3/mod.rs").unwrap();
+    let h3_handle = std::fs::read_to_string("src/transport/h3/handle.rs").unwrap();
+    let h3_driver = std::fs::read_to_string("src/transport/h3/driver.rs").unwrap();
+    assert!(
+        !h3_mod.contains("mpsc::Receiver<Result<Bytes>>")
+            && !h3_handle.contains("mpsc::Receiver<Result<Bytes>>")
+            && !h3_driver.contains("streaming_body_tx")
+    );
+}
+
+#[tokio::test]
+async fn h3_response_body_delivers_error_after_buffered_data() {
+    let server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+
+    server.start(|conn| async move {
+        let stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+
+        conn.send_response_headers(stream_id, vec![(":status", "200")], false)
+            .await;
+        conn.send_response_data(stream_id, b"before-reset", false)
+            .await;
+        conn.reset_stream(stream_id, 0x010c).await;
+    });
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+    let mut response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let first = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, Bytes::from_static(b"before-reset"));
+
+    let second = tokio::time::timeout(Duration::from_secs(1), response.body_mut().frame())
+        .await
+        .expect("reset after buffered DATA must not hang")
+        .unwrap();
+    assert!(matches!(second, Err(Error::Quic(_))));
+}
+
+#[tokio::test]
+async fn h3_dropped_response_body_cancels_stream() {
+    let server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+
+    server.start(|conn| async move {
+        let first_stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+
+        conn.send_response_headers(first_stream_id, vec![(":status", "200")], false)
+            .await;
+
+        let second_stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+        conn.send_response_headers(second_stream_id, vec![(":status", "200")], false)
+            .await;
+        conn.send_response_data(second_stream_id, b"after-drop", true)
+            .await;
+    });
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+    let response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
+    drop(response);
+
+    let mut followup = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
+    let body = followup
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(body, Bytes::from_static(b"after-drop"));
+}
 
 #[tokio::test]
 async fn h3_streaming_returns_headers_before_body_completion() {
@@ -30,22 +189,36 @@ async fn h3_streaming_returns_headers_before_body_completion() {
     });
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
-    let (response, mut body_rx) = tokio::time::timeout(
+    let mut response = tokio::time::timeout(
         Duration::from_secs(3),
-        client.send_streaming(&url, "GET", vec![], None),
+        client.send_streaming(&url, "GET", vec![], RequestBody::Empty),
     )
     .await
     .expect("headers should arrive before body finishes")
     .unwrap();
 
     assert_eq!(response.status(), 200);
-    assert!(response.body().is_empty());
+    assert!(response.body().is_streaming());
 
-    let first = body_rx.recv().await.unwrap().unwrap();
+    let first = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(first, Bytes::from_static(b"one"));
-    let second = body_rx.recv().await.unwrap().unwrap();
+    let second = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(second, Bytes::from_static(b"two"));
-    assert!(body_rx.recv().await.is_none());
+    assert!(response.body_mut().frame().await.is_none());
 }
 
 #[tokio::test]
@@ -72,23 +245,82 @@ async fn h3_streaming_delivers_incremental_ordered_data() {
     });
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
-    let (_response, mut body_rx) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
 
-    let first = tokio::time::timeout(Duration::from_millis(150), body_rx.recv())
+    let first = tokio::time::timeout(Duration::from_millis(150), response.body_mut().frame())
         .await
         .expect("first DATA must arrive before FIN")
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(first, Bytes::from_static(b"chunk-a"));
 
-    let second = body_rx.recv().await.unwrap().unwrap();
-    let third = body_rx.recv().await.unwrap().unwrap();
+    let second = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let third = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(second, Bytes::from_static(b"chunk-b"));
     assert_eq!(third, Bytes::from_static(b"chunk-c"));
-    assert!(body_rx.recv().await.is_none());
+    assert!(response.body_mut().frame().await.is_none());
+}
+
+#[tokio::test]
+async fn h3_streaming_handles_benchmark_sized_chunks() {
+    let server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+
+    server.start(|conn| async move {
+        let stream_id = loop {
+            match conn.read_event().await {
+                Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+
+        conn.send_response_headers(stream_id, vec![(":status", "200")], false)
+            .await;
+        for idx in 0..5 {
+            let marker = b'a' + idx;
+            let chunk = vec![marker; 16 * 1024];
+            conn.send_response_data(stream_id, &chunk, idx == 4).await;
+        }
+    });
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+    let mut response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
+        .await
+        .unwrap();
+
+    let mut body = Vec::new();
+    while let Some(frame) = response.body_mut().frame().await {
+        body.extend_from_slice(&frame.unwrap().into_data().unwrap());
+    }
+
+    assert_eq!(body.len(), 5 * 16 * 1024);
+    for idx in 0..5 {
+        let marker = b'a' + idx as u8;
+        let start = idx * 16 * 1024;
+        let end = start + 16 * 1024;
+        assert!(body[start..end].iter().all(|byte| *byte == marker));
+    }
 }
 
 #[tokio::test]
@@ -114,26 +346,40 @@ async fn h3_streaming_fin_clean_eof_and_reuse() {
     });
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
-    let (_response, mut first_rx) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut first_response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(
-        first_rx.recv().await.unwrap().unwrap(),
+        first_response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from_static(b"first")
     );
-    assert!(first_rx.recv().await.is_none());
-    assert!(first_rx.recv().await.is_none());
+    assert!(first_response.body_mut().frame().await.is_none());
+    assert!(first_response.body_mut().frame().await.is_none());
 
-    let (_response, mut second_rx) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut second_response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
     assert_eq!(
-        second_rx.recv().await.unwrap().unwrap(),
+        second_response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from_static(b"second")
     );
-    assert!(second_rx.recv().await.is_none());
+    assert!(second_response.body_mut().frame().await.is_none());
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(connection_count.load(Ordering::SeqCst), 1);
@@ -159,12 +405,12 @@ async fn h3_streaming_reset_and_error_propagation() {
     });
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
-    let (_response, mut body_rx) = client
-        .send_streaming(&url, "GET", vec![], None)
+    let mut response = client
+        .send_streaming(&url, "GET", vec![], RequestBody::Empty)
         .await
         .unwrap();
 
-    let err = tokio::time::timeout(Duration::from_secs(2), body_rx.recv())
+    let err = tokio::time::timeout(Duration::from_secs(2), response.body_mut().frame())
         .await
         .expect("reset must be reported promptly")
         .expect("reset must produce a body item")
@@ -245,7 +491,12 @@ async fn h3_streaming_does_not_duplicate_partial_non_idempotent_requests() {
 
     let client = H3Client::new().danger_accept_invalid_certs(true);
     let res = client
-        .send_streaming(&url, "POST", vec![], Some(b"some body".to_vec()))
+        .send_streaming(
+            &url,
+            "POST",
+            vec![],
+            RequestBody::Bytes(Bytes::from_static(b"some body")),
+        )
         .await;
 
     // It should fail and NOT retry (which means connection count should be 1, and we should get an error)

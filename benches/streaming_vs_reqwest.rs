@@ -1,7 +1,7 @@
 use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use quiche::h3::NameValue;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io;
@@ -846,6 +846,9 @@ async fn start_h3_server(
                         quiche::accept(&scid_clone, Some(&odcid), local_addr, peer, &mut config)
                             .unwrap();
                     let mut h3_conn: Option<quiche::h3::Connection> = None;
+                    let mut pending_response_data: VecDeque<(u64, Vec<u8>, usize, bool)> =
+                        VecDeque::new();
+                    let (response_tx, mut response_rx) = mpsc::channel::<(u64, Vec<u8>, bool)>(100);
                     let mut out = [0u8; 65535];
                     let mut interval = tokio::time::interval(Duration::from_millis(10));
 
@@ -895,20 +898,25 @@ async fn start_h3_server(
                                                                     let chunk_size = BENCH_CHUNK_SIZE;
                                                                     let chunk_count = BENCH_CHUNK_COUNT;
                                                                     let delay_ms = BENCH_CHUNK_DELAY_MS;
-                                                                    let chunk_data = vec![b's'; chunk_size];
-                                                                    let chunk_send_anchor = Instant::now();
+                                                                    let response_tx = response_tx.clone();
+                                                                    tokio::spawn(async move {
+                                                                        let chunk_data = vec![b's'; chunk_size];
+                                                                        let chunk_send_anchor = Instant::now();
 
-                                                                    for i in 0..chunk_count {
-                                                                        if i > 0 {
-                                                                            let target = chunk_send_anchor
-                                                                                + Duration::from_millis(
-                                                                                    delay_ms.saturating_mul(i as u64),
-                                                                                );
-                                                                            pace_chunk_until(target).await;
+                                                                        for i in 0..chunk_count {
+                                                                            if i > 0 {
+                                                                                let target = chunk_send_anchor
+                                                                                    + Duration::from_millis(
+                                                                                        delay_ms.saturating_mul(i as u64),
+                                                                                    );
+                                                                                pace_chunk_until(target).await;
+                                                                            }
+                                                                            let end_stream = i == chunk_count - 1;
+                                                                            if response_tx.send((stream_id, chunk_data.clone(), end_stream)).await.is_err() {
+                                                                                break;
+                                                                            }
                                                                         }
-                                                                        let end_stream = i == chunk_count - 1;
-                                                                        let _ = h3.send_body(&mut conn, stream_id, &chunk_data, end_stream);
-                                                                    }
+                                                                    });
                                                                 }
                                                             }
                                                             Err(quiche::h3::Error::Done) => break,
@@ -925,6 +933,64 @@ async fn start_h3_server(
                             }
                             _ = interval.tick() => {
                                 conn.on_timeout();
+                            }
+                            Some((stream_id, bytes, fin)) = response_rx.recv() => {
+                                pending_response_data.push_back((stream_id, bytes, 0, fin));
+                            }
+                        }
+
+                        if let Some(h3) = h3_conn.as_mut() {
+                            while let Some((stream_id, bytes, offset, fin)) =
+                                pending_response_data.front_mut()
+                            {
+                                if bytes.is_empty() {
+                                    match h3.send_body(&mut conn, *stream_id, bytes, *fin) {
+                                        Ok(_) => {
+                                            pending_response_data.pop_front();
+                                        }
+                                        Err(quiche::h3::Error::Done)
+                                        | Err(quiche::h3::Error::StreamBlocked) => break,
+                                        Err(_) => {
+                                            pending_response_data.pop_front();
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let remaining_len = bytes.len().saturating_sub(*offset);
+                                let capacity = conn.stream_capacity(*stream_id).unwrap_or(0);
+                                let fin_for_call = *fin && capacity > remaining_len + 8;
+                                match h3.send_body(
+                                    &mut conn,
+                                    *stream_id,
+                                    &bytes[*offset..],
+                                    fin_for_call,
+                                ) {
+                                    Ok(sent) if sent > 0 => {
+                                        *offset += sent;
+                                        if *offset >= bytes.len() {
+                                            let needs_fin = *fin && !fin_for_call;
+                                            let finished_stream_id = *stream_id;
+                                            pending_response_data.pop_front();
+                                            if needs_fin {
+                                                pending_response_data.push_front((
+                                                    finished_stream_id,
+                                                    Vec::new(),
+                                                    0,
+                                                    true,
+                                                ));
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Ok(_)
+                                    | Err(quiche::h3::Error::Done)
+                                    | Err(quiche::h3::Error::StreamBlocked) => break,
+                                    Err(_) => {
+                                        pending_response_data.pop_front();
+                                    }
+                                }
                             }
                         }
 

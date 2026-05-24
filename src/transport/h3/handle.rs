@@ -4,12 +4,16 @@
 //! Multiple handles can share the same driver, enabling true multiplexing.
 
 use bytes::Bytes;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
-use crate::response::Response;
+use crate::request::RequestBody;
+use crate::response::{Body, Response};
+use crate::transport::h3::body::{H3Body, H3BodyShared, H3BodyTimeouts};
 use crate::transport::h3::driver::DriverCommand;
 use crate::transport::h3::H3Tunnel;
 
@@ -19,6 +23,7 @@ pub struct H3Handle {
     /// Channel for sending commands to the driver
     command_tx: mpsc::Sender<DriverCommand>,
     is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    body_progress_notify: Arc<Notify>,
 }
 
 impl H3Handle {
@@ -27,9 +32,20 @@ impl H3Handle {
         command_tx: mpsc::Sender<DriverCommand>,
         is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
+        Self::new_with_notify(command_tx, is_draining, Arc::new(Notify::new()))
+    }
+
+    /// Create a new handle with a command channel and shared body progress
+    /// notifier wired to the driver.
+    pub(crate) fn new_with_notify(
+        command_tx: mpsc::Sender<DriverCommand>,
+        is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        body_progress_notify: Arc<Notify>,
+    ) -> Self {
         Self {
             command_tx,
             is_draining,
+            body_progress_notify,
         }
     }
 
@@ -92,19 +108,11 @@ impl H3Handle {
         method: http::Method,
         uri: &http::Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
-    ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
+        body: RequestBody,
+        body_timeouts: H3BodyTimeouts,
+    ) -> Result<Response> {
         let (headers_tx, headers_rx) = oneshot::channel();
-        let (body_tx, body_rx) = mpsc::channel(32);
-        let (driver_body_tx, mut driver_body_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            while let Some(item) = driver_body_rx.recv().await {
-                if body_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let body_shared = H3BodyShared::new(self.body_progress_notify.clone());
 
         self.command_tx
             .send(DriverCommand::SendStreamingRequest {
@@ -113,7 +121,7 @@ impl H3Handle {
                 headers,
                 body,
                 headers_tx,
-                body_tx: driver_body_tx,
+                body_shared: body_shared.clone(),
             })
             .await
             .map_err(|_| Error::HttpProtocol("H3 Driver channel closed".into()))?;
@@ -122,14 +130,11 @@ impl H3Handle {
             .await
             .map_err(|_| Error::HttpProtocol("H3 streaming headers channel closed".into()))??;
 
-        Ok((
-            Response::new(
-                status,
-                Headers::from(headers),
-                Bytes::new(),
-                "HTTP/3".to_string(),
-            ),
-            body_rx,
+        Ok(Response::with_body(
+            status,
+            Headers::from(headers),
+            Body::from_h3(H3Body::new(body_shared, body_timeouts)),
+            "HTTP/3".to_string(),
         ))
     }
 

@@ -7,13 +7,17 @@ use quiche::h3::NameValue;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::{Poll, Wake, Waker};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use crate::error::{Error, Result};
+use crate::request::{RequestBody, RequestBodyStream};
+use crate::transport::h3::body::{H3BodyPush, H3BodyShared};
 use crate::transport::h3::{H3Tunnel, H3TunnelEvent, H3TunnelOutbound};
 
 pub type StreamingHeadersResult = Result<(u16, Vec<(String, String)>)>;
@@ -35,9 +39,9 @@ pub enum DriverCommand {
         method: http::Method,
         uri: http::Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
+        body: RequestBody,
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        body_tx: mpsc::UnboundedSender<Result<Bytes>>,
+        body_shared: Arc<H3BodyShared>,
     },
     /// Open an RFC 9220 WebSocket-over-HTTP/3 tunnel.
     OpenWebSocketTunnel {
@@ -59,39 +63,89 @@ pub struct StreamResponse {
     pub body: Bytes,
 }
 
+struct NotifyWake(Arc<Notify>);
+
+impl Wake for NotifyWake {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify_one();
+    }
+}
+
+struct DriverStreamingRequestBody {
+    stream: RequestBodyStream,
+    content_length: Option<u64>,
+    current_chunk: Option<Bytes>,
+    current_offset: usize,
+    sent: u64,
+    finished: bool,
+    end_stream_sent: bool,
+}
+
+impl DriverStreamingRequestBody {
+    fn new(stream: RequestBodyStream, content_length: Option<u64>) -> Self {
+        Self {
+            stream,
+            content_length,
+            current_chunk: None,
+            current_offset: 0,
+            sent: 0,
+            finished: false,
+            end_stream_sent: false,
+        }
+    }
+}
+
 /// Per-stream state tracked by driver.
 struct DriverStreamState {
     response_tx: Option<oneshot::Sender<Result<StreamResponse>>>,
     streaming_headers_tx: Option<oneshot::Sender<StreamingHeadersResult>>,
-    streaming_body_tx: Option<mpsc::UnboundedSender<Result<Bytes>>>,
+    streaming_body: Option<Arc<H3BodyShared>>,
     status: Option<u16>,
     headers: Vec<(String, String)>,
     body: BytesMut,
+    pending_body: Bytes,
+    body_offset: usize,
+    request_stream: Option<DriverStreamingRequestBody>,
+    streaming_body_pending_recv: bool,
 }
 
 impl DriverStreamState {
-    fn new(response_tx: oneshot::Sender<Result<StreamResponse>>) -> Self {
+    fn new(response_tx: oneshot::Sender<Result<StreamResponse>>, pending_body: Bytes) -> Self {
         Self {
             response_tx: Some(response_tx),
             streaming_headers_tx: None,
-            streaming_body_tx: None,
+            streaming_body: None,
             status: None,
             headers: Vec::new(),
             body: BytesMut::new(),
+            pending_body,
+            body_offset: 0,
+            request_stream: None,
+            streaming_body_pending_recv: false,
         }
     }
 
     fn streaming(
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        body_tx: mpsc::UnboundedSender<Result<Bytes>>,
+        body_shared: Arc<H3BodyShared>,
+        pending_body: Bytes,
+        request_stream: Option<DriverStreamingRequestBody>,
     ) -> Self {
         Self {
             response_tx: None,
             streaming_headers_tx: Some(headers_tx),
-            streaming_body_tx: Some(body_tx),
+            streaming_body: Some(body_shared),
             status: None,
             headers: Vec::new(),
             body: BytesMut::new(),
+            pending_body,
+            body_offset: 0,
+            request_stream,
+            streaming_body_pending_recv: false,
         }
     }
 }
@@ -140,6 +194,7 @@ pub struct H3Driver {
     pending_commands: VecDeque<DriverCommand>,
     goaway_id: Option<u64>,
     is_draining: Arc<std::sync::atomic::AtomicBool>,
+    body_progress_notify: Arc<Notify>,
     max_idle_timeout: std::time::Duration,
     last_activity: std::time::Instant,
 }
@@ -154,6 +209,7 @@ impl H3Driver {
         socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
         is_draining: Arc<std::sync::atomic::AtomicBool>,
+        body_progress_notify: Arc<Notify>,
         max_idle_timeout_ms: u64,
     ) -> Self {
         Self {
@@ -168,6 +224,7 @@ impl H3Driver {
             pending_commands: VecDeque::new(),
             goaway_id: None,
             is_draining,
+            body_progress_notify,
             max_idle_timeout: std::time::Duration::from_millis(max_idle_timeout_ms),
             last_activity: std::time::Instant::now(),
         }
@@ -183,8 +240,8 @@ impl H3Driver {
                     let _ = tx.send(Err(Error::Quic(format!("Driver error: {}", e))));
                 } else if let Some(tx) = stream.streaming_headers_tx.take() {
                     let _ = tx.send(Err(Error::Quic(format!("Driver error: {}", e))));
-                } else if let Some(tx) = stream.streaming_body_tx.take() {
-                    let _ = tx.send(Err(Error::Quic(format!("Driver error: {}", e))));
+                } else if let Some(body) = stream.streaming_body.take() {
+                    let _ = body.fail(Error::Quic(format!("Driver error: {}", e)));
                 }
             }
             for (_, mut tunnel) in self.tunnels.drain() {
@@ -212,6 +269,8 @@ impl H3Driver {
         loop {
             self.process_h3_events().await?;
             self.process_pending_commands().await?;
+            self.flush_streaming_body_recvs().await?;
+            self.flush_request_bodies().await?;
             self.flush_tunnel_data().await?;
 
             loop {
@@ -291,6 +350,12 @@ impl H3Driver {
                 _ = sleep(timeout_duration) => {
                     self.conn.on_timeout();
                 }
+
+                _ = self.body_progress_notify.notified() => {
+                    self.cancel_closed_streaming_bodies();
+                    self.flush_streaming_body_recvs().await?;
+                    self.flush_request_bodies().await?;
+                }
             }
 
             if self.conn.is_closed() {
@@ -365,37 +430,13 @@ impl H3Driver {
                 }
             };
 
-            let fin = body.is_none();
+            let pending_body = body.unwrap_or_default();
+            let fin = pending_body.is_empty();
             match self.h3_conn.send_request(&mut self.conn, &h3_headers, fin) {
                 Ok(stream_id) => {
-                    let mut state = DriverStreamState::new(response_tx);
-
-                    if let Some(data) = body {
-                        match self
-                            .h3_conn
-                            .send_body(&mut self.conn, stream_id, &data, true)
-                        {
-                            Ok(sent) if sent == data.len() => {}
-                            Ok(sent) => {
-                                if let Some(tx) = state.response_tx.take() {
-                                    let _ = tx.send(Err(Error::Quic(format!(
-                                        "Partial H3 request body write: sent {sent} of {} bytes",
-                                        data.len()
-                                    ))));
-                                }
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                if let Some(tx) = state.response_tx.take() {
-                                    let _ = tx
-                                        .send(Err(Error::Quic(format!("Send body failed: {}", e))));
-                                }
-                                return Ok(());
-                            }
-                        }
-                    }
-
+                    let state = DriverStreamState::new(response_tx, pending_body);
                     self.streams.insert(stream_id, state);
+                    self.flush_request_bodies().await?;
                 }
                 Err(e) => {
                     let _ =
@@ -414,7 +455,7 @@ impl H3Driver {
             headers,
             body,
             headers_tx,
-            body_tx,
+            body_shared,
         } = cmd
         {
             if self.goaway_id.is_some() {
@@ -432,39 +473,48 @@ impl H3Driver {
                 }
             };
 
-            let fin = body.is_none();
+            let (pending_body, request_stream, fin) = match body {
+                RequestBody::Empty => (Bytes::new(), None, true),
+                RequestBody::Bytes(bytes) => {
+                    let fin = bytes.is_empty();
+                    (bytes, None, fin)
+                }
+                RequestBody::Text(text) => {
+                    let bytes = Bytes::from(text.into_bytes());
+                    let fin = bytes.is_empty();
+                    (bytes, None, fin)
+                }
+                RequestBody::Json(bytes) => {
+                    let bytes = Bytes::from(bytes);
+                    let fin = bytes.is_empty();
+                    (bytes, None, fin)
+                }
+                RequestBody::Form(text) => {
+                    let bytes = Bytes::from(text.into_bytes());
+                    let fin = bytes.is_empty();
+                    (bytes, None, fin)
+                }
+                RequestBody::Stream {
+                    stream,
+                    content_length,
+                } => (
+                    Bytes::new(),
+                    Some(DriverStreamingRequestBody::new(stream, content_length)),
+                    false,
+                ),
+            };
             match self.h3_conn.send_request(&mut self.conn, &h3_headers, fin) {
                 Ok(stream_id) => {
-                    let mut state = DriverStreamState::streaming(headers_tx, body_tx);
-
-                    if let Some(data) = body {
-                        match self
-                            .h3_conn
-                            .send_body(&mut self.conn, stream_id, &data, true)
-                        {
-                            Ok(sent) if sent == data.len() => {}
-                            Ok(sent) => {
-                                if let Some(tx) = state.streaming_headers_tx.take() {
-                                    let _ = tx.send(Err(Error::Quic(format!(
-                                        "Partial H3 streaming request body write: sent {sent} of {} bytes",
-                                        data.len()
-                                    ))));
-                                }
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                if let Some(tx) = state.streaming_headers_tx.take() {
-                                    let _ = tx.send(Err(Error::Quic(format!(
-                                        "Send streaming body failed: {}",
-                                        e
-                                    ))));
-                                }
-                                return Ok(());
-                            }
-                        }
-                    }
-
-                    self.streams.insert(stream_id, state);
+                    self.streams.insert(
+                        stream_id,
+                        DriverStreamState::streaming(
+                            headers_tx,
+                            body_shared,
+                            pending_body,
+                            request_stream,
+                        ),
+                    );
+                    self.flush_request_bodies().await?;
                 }
                 Err(e) => {
                     let _ = headers_tx.send(Err(Error::Quic(format!(
@@ -693,12 +743,307 @@ impl H3Driver {
                 }
             }
 
+            let mut cancel_after_headers_drop = false;
             if let (Some(status), Some(tx)) = (stream.status, stream.streaming_headers_tx.take()) {
-                let _ = tx.send(Ok((status, stream.headers.clone())));
+                if tx.send(Ok((status, stream.headers.clone()))).is_err() {
+                    cancel_after_headers_drop = true;
+                }
+            }
+            if cancel_after_headers_drop {
+                self.reset_cancel_stream(stream_id);
+                self.streams.remove(&stream_id);
+                return Ok(());
             }
         }
 
         Ok(())
+    }
+
+    async fn flush_request_bodies(&mut self) -> Result<()> {
+        let stream_ids: Vec<u64> = self.streams.keys().copied().collect();
+        for stream_id in stream_ids {
+            self.flush_request_body(stream_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_request_body(&mut self, stream_id: u64) -> Result<()> {
+        loop {
+            let (has_pending_body, offset) = self
+                .streams
+                .get(&stream_id)
+                .map(|stream| {
+                    (
+                        stream.body_offset < stream.pending_body.len(),
+                        stream.body_offset,
+                    )
+                })
+                .unwrap_or((false, 0));
+
+            if has_pending_body {
+                let pending_body = self
+                    .streams
+                    .get(&stream_id)
+                    .expect("stream exists")
+                    .pending_body
+                    .clone();
+                let remaining = &pending_body[offset..];
+                match self
+                    .h3_conn
+                    .send_body(&mut self.conn, stream_id, remaining, true)
+                {
+                    Ok(sent) if sent > 0 => {
+                        if let Some(stream) = self.streams.get_mut(&stream_id) {
+                            stream.body_offset += sent;
+                        }
+                        if sent < remaining.len() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Ok(_)
+                    | Err(quiche::h3::Error::Done)
+                    | Err(quiche::h3::Error::StreamBlocked) => {
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.fail_stream(stream_id, format!("H3 request body send failed: {e}"));
+                        return Ok(());
+                    }
+                }
+            }
+
+            self.flush_streaming_request_body(stream_id).await?;
+            return Ok(());
+        }
+    }
+
+    async fn flush_streaming_request_body(&mut self, stream_id: u64) -> Result<()> {
+        loop {
+            let has_stream = self
+                .streams
+                .get(&stream_id)
+                .and_then(|stream| stream.request_stream.as_ref())
+                .is_some();
+            if !has_stream {
+                return Ok(());
+            }
+
+            let has_current = self
+                .streams
+                .get(&stream_id)
+                .and_then(|stream| stream.request_stream.as_ref())
+                .and_then(|body| body.current_chunk.as_ref())
+                .is_some();
+
+            if !has_current {
+                let capacity = match self.conn.stream_capacity(stream_id) {
+                    Ok(capacity) => capacity,
+                    Err(quiche::Error::InvalidStreamState(_)) => return Ok(()),
+                    Err(quiche::Error::StreamStopped(_)) => {
+                        self.fail_stream(stream_id, "H3 request body stream stopped".into());
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Error::Quic(format!("H3 stream capacity failed: {e}"))),
+                };
+                if capacity == 0 {
+                    let _ = self.conn.stream_writable(stream_id, 1);
+                    return Ok(());
+                }
+
+                let poll_result = {
+                    let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                    let body = stream
+                        .request_stream
+                        .as_mut()
+                        .expect("request stream exists");
+                    if body.finished {
+                        Poll::Ready(None)
+                    } else {
+                        let waker =
+                            Waker::from(Arc::new(NotifyWake(self.body_progress_notify.clone())));
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        body.stream.as_mut().poll_next(&mut cx)
+                    }
+                };
+
+                match poll_result {
+                    Poll::Pending => return Ok(()),
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                        let body = stream
+                            .request_stream
+                            .as_mut()
+                            .expect("request stream exists");
+                        body.current_chunk = Some(chunk);
+                        body.current_offset = 0;
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        self.fail_stream(stream_id, format!("request body stream error: {error}"));
+                        return Ok(());
+                    }
+                    Poll::Ready(None) => {
+                        let (valid_len, sent, expected, already_sent_end) = {
+                            let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                            let body = stream
+                                .request_stream
+                                .as_mut()
+                                .expect("request stream exists");
+                            body.finished = true;
+                            (
+                                body.content_length
+                                    .map(|expected| expected == body.sent)
+                                    .unwrap_or(true),
+                                body.sent,
+                                body.content_length,
+                                body.end_stream_sent,
+                            )
+                        };
+                        if !valid_len {
+                            self.fail_stream(
+                                stream_id,
+                                format!(
+                                    "sized streaming request body length mismatch: sent {} bytes, Content-Length is {}",
+                                    sent,
+                                    expected.unwrap_or_default()
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        if already_sent_end {
+                            return Ok(());
+                        }
+                        match self.h3_conn.send_body(&mut self.conn, stream_id, &[], true) {
+                            Ok(_) => {
+                                if let Some(stream) = self.streams.get_mut(&stream_id) {
+                                    if let Some(body) = stream.request_stream.as_mut() {
+                                        body.end_stream_sent = true;
+                                    }
+                                    stream.request_stream = None;
+                                }
+                                return Ok(());
+                            }
+                            Err(quiche::h3::Error::Done)
+                            | Err(quiche::h3::Error::StreamBlocked) => return Ok(()),
+                            Err(e) => {
+                                self.fail_stream(
+                                    stream_id,
+                                    format!("H3 request body FIN send failed: {e}"),
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (chunk, offset) = {
+                let stream = self.streams.get(&stream_id).expect("stream exists");
+                let body = stream
+                    .request_stream
+                    .as_ref()
+                    .expect("request stream exists");
+                (
+                    body.current_chunk.as_ref().expect("current chunk").clone(),
+                    body.current_offset,
+                )
+            };
+            let remaining = &chunk[offset..];
+            match self
+                .h3_conn
+                .send_body(&mut self.conn, stream_id, remaining, false)
+            {
+                Ok(sent) if sent > 0 => {
+                    let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                    let body = stream
+                        .request_stream
+                        .as_mut()
+                        .expect("request stream exists");
+                    body.current_offset += sent;
+                    body.sent += sent as u64;
+                    if body.current_offset >= chunk.len() {
+                        body.current_chunk = None;
+                        body.current_offset = 0;
+                    }
+                    return Ok(());
+                }
+                Ok(_) | Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.fail_stream(stream_id, format!("H3 streaming body send failed: {e}"));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn flush_streaming_body_recvs(&mut self) -> Result<()> {
+        let stream_ids: Vec<u64> = self
+            .streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                if stream.streaming_body_pending_recv {
+                    Some(*stream_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for stream_id in stream_ids {
+            self.handle_data_event(stream_id).await?;
+        }
+
+        Ok(())
+    }
+
+    fn reset_cancel_stream(&mut self, stream_id: u64) {
+        // H3_REQUEST_CANCELLED == 0x010c per RFC 9114 §8.1.
+        const H3_REQUEST_CANCELLED: u64 = 0x010c;
+        let _ = self
+            .conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, H3_REQUEST_CANCELLED);
+        let _ = self
+            .conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Write, H3_REQUEST_CANCELLED);
+    }
+
+    fn cancel_closed_streaming_bodies(&mut self) {
+        let stream_ids: Vec<u64> = self
+            .streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                stream
+                    .streaming_body
+                    .as_ref()
+                    .filter(|body| body.is_closed())
+                    .map(|_| *stream_id)
+            })
+            .collect();
+
+        for stream_id in stream_ids {
+            self.reset_cancel_stream(stream_id);
+            self.streams.remove(&stream_id);
+        }
+    }
+
+    fn fail_stream(&mut self, stream_id: u64, message: String) {
+        self.reset_cancel_stream(stream_id);
+        if let Some(mut stream) = self.streams.remove(&stream_id) {
+            if let Some(tx) = stream.response_tx.take() {
+                let _ = tx.send(Err(Error::HttpProtocol(message.clone())));
+            }
+            if let Some(tx) = stream.streaming_headers_tx.take() {
+                let _ = tx.send(Err(Error::HttpProtocol(message.clone())));
+            }
+            if let Some(body) = stream.streaming_body.take() {
+                let _ = body.fail(Error::HttpProtocol(message));
+            }
+        }
     }
 
     async fn handle_data_event(&mut self, stream_id: u64) -> Result<()> {
@@ -729,15 +1074,33 @@ impl H3Driver {
 
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             let mut receiver_dropped = false;
+            let mut slot_full = false;
             loop {
+                if let Some(body) = &stream.streaming_body {
+                    if body.is_closed() {
+                        receiver_dropped = true;
+                        break;
+                    }
+                    if !body.is_slot_available() {
+                        slot_full = true;
+                        break;
+                    }
+                }
+
                 match self.h3_conn.recv_body(&mut self.conn, stream_id, &mut buf) {
                     Ok(0) => break,
                     Ok(len) => {
-                        if let Some(tx) = &stream.streaming_body_tx {
-                            if tx.send(Ok(Bytes::copy_from_slice(&buf[..len]))).is_err() {
-                                stream.streaming_body_tx = None;
-                                receiver_dropped = true;
-                                break;
+                        if let Some(body) = &stream.streaming_body {
+                            match body.push(Ok(Bytes::copy_from_slice(&buf[..len]))) {
+                                H3BodyPush::Accepted => {}
+                                H3BodyPush::Full => {
+                                    slot_full = true;
+                                    break;
+                                }
+                                H3BodyPush::Closed => {
+                                    receiver_dropped = true;
+                                    break;
+                                }
                             }
                         } else if stream.response_tx.is_some() {
                             stream.body.extend_from_slice(&buf[..len]);
@@ -751,14 +1114,10 @@ impl H3Driver {
             if receiver_dropped {
                 // Tell the peer to stop sending and drop server-side state for this
                 // stream so a dropped body receiver does not waste downstream bandwidth.
-                // H3_REQUEST_CANCELLED == 0x010c per RFC 9114 §8.1.
-                const H3_REQUEST_CANCELLED: u64 = 0x010c;
-                let _ = self.conn.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Read,
-                    H3_REQUEST_CANCELLED,
-                );
+                self.reset_cancel_stream(stream_id);
                 self.streams.remove(&stream_id);
+            } else if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.streaming_body_pending_recv = slot_full;
             }
         }
 
@@ -800,6 +1159,11 @@ impl H3Driver {
                     ))),
                 };
                 let _ = tx.send(response);
+                if let Some(body) = stream.streaming_body.take() {
+                    body.finish();
+                }
+            } else if let Some(body) = stream.streaming_body.take() {
+                body.finish();
             }
         }
 
@@ -824,8 +1188,8 @@ impl H3Driver {
                 let _ = tx.send(Err(Error::Quic(format!("Stream reset: {}", error_code))));
             } else if let Some(tx) = stream.streaming_headers_tx.take() {
                 let _ = tx.send(Err(Error::Quic(format!("Stream reset: {}", error_code))));
-            } else if let Some(tx) = stream.streaming_body_tx.take() {
-                let _ = tx.send(Err(Error::Quic(format!("Stream reset: {}", error_code))));
+            } else if let Some(body) = stream.streaming_body.take() {
+                let _ = body.fail(Error::Quic(format!("Stream reset: {}", error_code)));
             }
         }
 
@@ -867,10 +1231,10 @@ impl H3Driver {
                         let _ = tx.send(Err(Error::HttpProtocol(format!(
                             "HTTP/3 GOAWAY received id={id}"
                         ))));
-                    } else if let Some(tx) = stream.streaming_body_tx.take() {
-                        let _ = tx.send(Err(Error::HttpProtocol(format!(
+                    } else if let Some(body) = stream.streaming_body.take() {
+                        let _ = body.fail(Error::HttpProtocol(format!(
                             "HTTP/3 GOAWAY received id={id}"
-                        ))));
+                        )));
                     }
                 }
             }
@@ -885,8 +1249,8 @@ impl H3Driver {
                 let _ = tx.send(Err(Error::HttpProtocol(err.to_string())));
             } else if let Some(tx) = stream.streaming_headers_tx.take() {
                 let _ = tx.send(Err(Error::HttpProtocol(err.to_string())));
-            } else if let Some(tx) = stream.streaming_body_tx.take() {
-                let _ = tx.send(Err(Error::HttpProtocol(err.to_string())));
+            } else if let Some(body) = stream.streaming_body.take() {
+                let _ = body.fail(Error::HttpProtocol(err.to_string()));
             }
         }
 
