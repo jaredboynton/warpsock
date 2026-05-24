@@ -3706,6 +3706,31 @@ mod tests {
     }
 
     #[test]
+    fn local_native_fixture_suppresses_post_application_short_header_packet_noise() {
+        let error = anyhow::anyhow!("QUIC packet open failed: unknown BoringSSL error");
+        let classification = super::classify_local_native_h3_packet_error_with_datagram(
+            &error,
+            true,
+            "len=1200 short_prefix=[ab, cd]",
+        );
+
+        assert_eq!(classification.level, "debug");
+        assert_eq!(classification.kind, "packet_noise");
+        assert_eq!(
+            classification.classification,
+            "post_application_short_header_packet_open_noise"
+        );
+        assert_eq!(
+            classification.category,
+            "ignored_short_header_packet_open_after_application_ready"
+        );
+        assert!(!classification.fatal);
+        assert!(!super::should_log_local_native_h3_fixture_event(
+            &classification
+        ));
+    }
+
+    #[test]
     fn artifact_emits_fixture_events_for_packet_error_audit() {
         let specter_row = super::BenchmarkRow {
             competitor_id: "specter_native".into(),
