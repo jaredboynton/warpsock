@@ -59,12 +59,18 @@ pub enum H3Backend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct H3TransportConfig {
     pub streaming_body_buffer_slots: usize,
+    /// Maximum bytes that may be queued from `H3Tunnel::send_bytes` through the
+    /// driver before the caller is forced to wait. Acquired permits are
+    /// capped at this value per send so callers above the budget wait for the
+    /// previous in-flight bytes to drain rather than splitting the chunk.
+    pub tunnel_outbound_byte_budget: usize,
 }
 
 impl Default for H3TransportConfig {
     fn default() -> Self {
         Self {
             streaming_body_buffer_slots: DEFAULT_H3_BODY_SLOT_CAPACITY,
+            tunnel_outbound_byte_budget: DEFAULT_H3_TUNNEL_OUTBOUND_BYTE_BUDGET,
         }
     }
 }
@@ -72,6 +78,9 @@ impl Default for H3TransportConfig {
 impl H3TransportConfig {
     pub(crate) fn normalized(mut self) -> Self {
         self.streaming_body_buffer_slots = self.streaming_body_buffer_slots.max(1);
+        self.tunnel_outbound_byte_budget = self
+            .tunnel_outbound_byte_budget
+            .max(MIN_H3_TUNNEL_OUTBOUND_BYTE_BUDGET);
         self
     }
 }

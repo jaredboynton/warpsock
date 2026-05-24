@@ -1567,6 +1567,37 @@ impl NativeQuicHandshake {
         self.pending_client_initial.take()
     }
 
+    pub fn supported_versions(&self) -> &[u32] {
+        &self.supported_versions
+    }
+
+    pub fn set_supported_versions(&mut self, versions: Vec<u32>) -> Result<()> {
+        if versions.is_empty() {
+            return Err(Error::Quic(
+                "native H3 supported QUIC versions list cannot be empty".into(),
+            ));
+        }
+        if !versions.contains(&self.client_initial_version) {
+            return Err(Error::Quic(
+                "native H3 supported QUIC versions must include the issued initial version".into(),
+            ));
+        }
+        self.supported_versions = versions;
+        Ok(())
+    }
+
+    pub fn client_initial_version(&self) -> u32 {
+        self.client_initial_version
+    }
+
+    pub fn retry_received(&self) -> bool {
+        self.retry_received
+    }
+
+    pub fn version_negotiation_received(&self) -> bool {
+        self.vn_received
+    }
+
     pub fn install_tls_secrets(&mut self, secrets: &[QuicTlsSecret]) -> Result<()> {
         for secret in secrets {
             if secret.direction == QuicSecretDirection::Read
