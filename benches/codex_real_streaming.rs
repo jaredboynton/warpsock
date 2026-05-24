@@ -20,7 +20,7 @@ const INTER_REQUEST_DELAY: Duration = Duration::from_secs(2);
 // Primary claim passes if at least 80% of samples meet pass conditions.
 // Threshold scales with sample_count: ceil(0.8 * N), min 2.
 fn primary_claim_threshold(sample_count: usize) -> usize {
-    let scaled = (sample_count * 4 + 4) / 5; // ceil(0.8 * N)
+    let scaled = (sample_count * 4).div_ceil(5); // ceil(0.8 * N)
     scaled.max(2)
 }
 const DEFAULT_SAMPLES: usize = 10;
@@ -508,7 +508,7 @@ async fn run_specter_sample(
         .header("Origin", "https://chatgpt.com")
         .header("Referer", "https://chatgpt.com/")
         .header("Content-Type", "application/json")
-        .header("Authorization", &format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {token}"))
         .body(body);
     if let Some(aid) = account_id {
         req = req.header("ChatGPT-Account-Id", aid);
@@ -851,7 +851,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
-    if sample_count.is_multiple_of(2) == false {
+    if !sample_count.is_multiple_of(2) {
         eprintln!(
             "--samples must be even (paired interleaving); got {sample_count}"
         );

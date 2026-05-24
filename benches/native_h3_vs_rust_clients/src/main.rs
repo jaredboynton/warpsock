@@ -1076,13 +1076,9 @@ async fn measure_specter_native(
     warmups: usize,
     samples: usize,
 ) -> anyhow::Result<BenchmarkRow> {
-    let client = specter::Client::builder()
+    let client = specter::H3Client::new()
         .danger_accept_invalid_certs(true)
-        .h3_backend(specter::H3Backend::Native)
-        .prefer_http2(false)
-        .h3_upgrade(false)
-        .total_timeout(ADAPTER_TIMEOUT)
-        .build()?;
+        .with_max_idle_timeout(ADAPTER_TIMEOUT.as_millis() as u64);
 
     for _ in 0..warmups {
         let _ = measure_specter_native_once(&client, url).await?;
@@ -1101,14 +1097,12 @@ async fn measure_specter_native(
 }
 
 async fn measure_specter_native_once(
-    client: &specter::Client,
+    client: &specter::H3Client,
     url: &str,
 ) -> anyhow::Result<AdapterSample> {
     let start = Instant::now();
     let mut response = client
-        .get(url)
-        .version(specter::HttpVersion::Http3Only)
-        .send_streaming()
+        .send_streaming(url, "GET", Vec::new(), specter::RequestBody::empty())
         .await?;
     if !(200..300).contains(&response.status_code()) {
         anyhow::bail!(
@@ -1329,6 +1323,7 @@ async fn measure_h3_quinn_once(url: &str) -> anyhow::Result<AdapterSample> {
     endpoint.set_default_client_config(h3_quinn_client_config()?);
     let server_name = url.host_str().unwrap_or("localhost");
     let connection = endpoint.connect(peer_addr, server_name)?.await?;
+    let close_connection = connection.clone();
     let (mut driver, mut send_request) =
         h3::client::new(h3_quinn::Connection::new(connection)).await?;
     let driver = tokio::spawn(async move { poll_fn(|cx| driver.poll_close(cx)).await });
@@ -1346,8 +1341,9 @@ async fn measure_h3_quinn_once(url: &str) -> anyhow::Result<AdapterSample> {
         bytes = bytes.saturating_add(chunk.remaining() as u64);
     }
     drop(send_request);
+    close_connection.close(0u32.into(), b"benchmark complete");
     driver.abort();
-    endpoint.wait_idle().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
 
     Ok(AdapterSample::new(
         first_byte_ns.unwrap_or_else(|| start.elapsed().as_nanos() as f64),
