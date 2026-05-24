@@ -19,7 +19,14 @@ use serde_json::Value;
 use specter::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 
 const QUICHE_MAX_DATAGRAM_SIZE: usize = 1350;
-const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_ADAPTER_TIMEOUT_SECS: u64 = 30;
+fn adapter_timeout() -> Duration {
+    let secs = std::env::var("SPECTER_BENCH_ADAPTER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ADAPTER_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 const LOCAL_FIXTURE_CHUNK_SIZE: usize = 16 * 1024;
 const LOCAL_FIXTURE_CHUNK_COUNT: usize = 5;
 const LOCAL_FIXTURE_CHUNK_DELAY_MS: u64 = 1;
@@ -1992,7 +1999,7 @@ async fn measure_specter_native(
     let client = specter::H3Client::new()
         .danger_accept_invalid_certs(true)
         .with_http3_fingerprint(fingerprint)
-        .with_max_idle_timeout(ADAPTER_TIMEOUT.as_millis() as u64);
+        .with_max_idle_timeout(adapter_timeout().as_millis() as u64);
     let handle = client.handle(url).await?;
     let uri: http::Uri = url.parse()?;
 
@@ -2077,7 +2084,7 @@ fn specter_rfc9220_client() -> anyhow::Result<specter::Client> {
         .h3_fingerprint(fingerprint)
         .prefer_http2(false)
         .h3_upgrade(false)
-        .total_timeout(ADAPTER_TIMEOUT)
+        .total_timeout(adapter_timeout())
         .build()?)
 }
 
@@ -2132,13 +2139,13 @@ async fn measure_specter_native_rfc9220_tunnel_once(
 ) -> anyhow::Result<AdapterSample> {
     let payload = Bytes::from(vec![b'w'; LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE]);
     let start = Instant::now();
-    let mut tunnel = tokio::time::timeout(ADAPTER_TIMEOUT, client.websocket_h3(url).open())
+    let mut tunnel = tokio::time::timeout(adapter_timeout(), client.websocket_h3(url).open())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 tunnel open timed out"))??;
 
     tunnel.send_bytes(payload.clone(), false).await?;
 
-    let echoed = tokio::time::timeout(ADAPTER_TIMEOUT, tunnel.recv_bytes())
+    let echoed = tokio::time::timeout(adapter_timeout(), tunnel.recv_bytes())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 tunnel echo timed out"))?
         .ok_or_else(|| anyhow::anyhow!("specter_native RFC 9220 tunnel closed before echo"))??;
@@ -2160,13 +2167,13 @@ async fn measure_specter_native_rfc9220_tunnel_close_once(
 ) -> anyhow::Result<AdapterSample> {
     let payload = Bytes::from(vec![b'c'; LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE]);
     let start = Instant::now();
-    let mut tunnel = tokio::time::timeout(ADAPTER_TIMEOUT, client.websocket_h3(url).open())
+    let mut tunnel = tokio::time::timeout(adapter_timeout(), client.websocket_h3(url).open())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 tunnel close open timed out"))??;
 
     tunnel.send_bytes(payload.clone(), true).await?;
 
-    let echoed = tokio::time::timeout(ADAPTER_TIMEOUT, tunnel.recv_bytes())
+    let echoed = tokio::time::timeout(adapter_timeout(), tunnel.recv_bytes())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 tunnel close echo timed out"))?
         .ok_or_else(|| anyhow::anyhow!("specter_native RFC 9220 tunnel close before echo"))??;
@@ -2178,7 +2185,7 @@ async fn measure_specter_native_rfc9220_tunnel_close_once(
         );
     }
 
-    let end = tokio::time::timeout(ADAPTER_TIMEOUT, tunnel.recv_bytes())
+    let end = tokio::time::timeout(adapter_timeout(), tunnel.recv_bytes())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 tunnel server FIN timed out"))?;
     if let Some(extra) = end {
@@ -2202,7 +2209,7 @@ async fn measure_specter_native_rfc9220_tunnel_mixed_once(
     let expected_tunnel_bytes =
         LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE * LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
     let start = Instant::now();
-    let mut tunnel = tokio::time::timeout(ADAPTER_TIMEOUT, client.websocket_h3(tunnel_url).open())
+    let mut tunnel = tokio::time::timeout(adapter_timeout(), client.websocket_h3(tunnel_url).open())
         .await
         .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 mixed tunnel open timed out"))??;
 
@@ -2228,7 +2235,7 @@ async fn measure_specter_native_rfc9220_tunnel_mixed_once(
             LOCAL_FIXTURE_TUNNEL_SLOW_READ_DELAY_MS,
         ))
         .await;
-        let chunk = tokio::time::timeout(ADAPTER_TIMEOUT, tunnel.recv_bytes())
+        let chunk = tokio::time::timeout(adapter_timeout(), tunnel.recv_bytes())
             .await
             .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 mixed tunnel drain timed out"))?
             .ok_or_else(|| {
@@ -2244,7 +2251,7 @@ async fn measure_specter_native_rfc9220_tunnel_mixed_once(
         );
     }
 
-    let _ = tokio::time::timeout(ADAPTER_TIMEOUT, tunnel.recv_bytes()).await;
+    let _ = tokio::time::timeout(adapter_timeout(), tunnel.recv_bytes()).await;
     Ok(AdapterSample::new(
         stream_first_byte_ns,
         start.elapsed().as_nanos() as f64,
@@ -2355,7 +2362,7 @@ fn measure_quiche_direct_rfc9220_tunnel_once(url: &str) -> anyhow::Result<Adapte
     let mut stream_id = None;
     let mut echoed = Vec::new();
     let start = Instant::now();
-    let deadline = start + ADAPTER_TIMEOUT;
+    let deadline = start + adapter_timeout();
     let request_headers = quiche_rfc9220_tunnel_headers(&url)?;
     let payload = rfc9220_tunnel_payload(b'q');
     let mut recv_buf = [0u8; 65535];
@@ -2465,7 +2472,7 @@ fn measure_quiche_direct_rfc9220_tunnel_once(url: &str) -> anyhow::Result<Adapte
 
     anyhow::bail!(
         "quiche RFC 9220 tunnel timed out after {:?}; h3_ready={} req_sent={} stream_id={:?} echoed_bytes={}",
-        ADAPTER_TIMEOUT,
+        adapter_timeout(),
         h3_conn.is_some(),
         req_sent,
         stream_id,
@@ -2511,7 +2518,7 @@ async fn measure_tokio_quiche_rfc9220_tunnel_once(url: &str) -> anyhow::Result<A
     socket.connect(peer_addr).await?;
 
     let start = Instant::now();
-    let deadline = start + ADAPTER_TIMEOUT;
+    let deadline = start + adapter_timeout();
     let (_, mut controller) = tokio_quiche::quic::connect(socket, host)
         .await
         .map_err(|error| anyhow::anyhow!("tokio_quiche RFC 9220 connect failed: {error}"))?;
@@ -2544,7 +2551,7 @@ async fn measure_tokio_quiche_rfc9220_tunnel_once(url: &str) -> anyhow::Result<A
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             anyhow::bail!(
                 "tokio_quiche RFC 9220 timed out after {:?}",
-                ADAPTER_TIMEOUT
+                adapter_timeout()
             );
         };
         let event = tokio::time::timeout(remaining, controller.event_receiver_mut().recv())
@@ -2552,7 +2559,7 @@ async fn measure_tokio_quiche_rfc9220_tunnel_once(url: &str) -> anyhow::Result<A
             .map_err(|_| {
                 anyhow::anyhow!(
                     "tokio_quiche RFC 9220 timed out after {:?}",
-                    ADAPTER_TIMEOUT
+                    adapter_timeout()
                 )
             })?
             .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 event stream closed"))?;
@@ -2599,7 +2606,7 @@ async fn read_tokio_quiche_rfc9220_tunnel_echo(
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             anyhow::bail!(
                 "tokio_quiche RFC 9220 body timed out after {:?}",
-                ADAPTER_TIMEOUT
+                adapter_timeout()
             );
         };
         let frame = tokio::time::timeout(remaining, recv.recv())
@@ -2607,7 +2614,7 @@ async fn read_tokio_quiche_rfc9220_tunnel_echo(
             .map_err(|_| {
                 anyhow::anyhow!(
                     "tokio_quiche RFC 9220 body timed out after {:?}",
-                    ADAPTER_TIMEOUT
+                    adapter_timeout()
                 )
             })?
             .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 body stream closed"))?;
@@ -2735,14 +2742,14 @@ async fn measure_quinn_transport_once(
 ) -> anyhow::Result<AdapterSample> {
     let payload = Bytes::from(vec![b'q'; LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE]);
     let start = Instant::now();
-    let (mut send, mut recv) = tokio::time::timeout(ADAPTER_TIMEOUT, connection.open_bi())
+    let (mut send, mut recv) = tokio::time::timeout(adapter_timeout(), connection.open_bi())
         .await
         .map_err(|_| anyhow::anyhow!("quinn_transport open_bi timed out"))??;
 
     send.write_all(payload.as_ref()).await?;
     send.finish()?;
     let echoed = tokio::time::timeout(
-        ADAPTER_TIMEOUT,
+        adapter_timeout(),
         recv.read_to_end(LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE * 8),
     )
     .await
@@ -2815,7 +2822,7 @@ async fn measure_s2n_quic_transport_once(
 ) -> anyhow::Result<AdapterSample> {
     let payload = Bytes::from(vec![b's'; LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE]);
     let start = Instant::now();
-    let mut stream = tokio::time::timeout(ADAPTER_TIMEOUT, connection.open_bidirectional_stream())
+    let mut stream = tokio::time::timeout(adapter_timeout(), connection.open_bidirectional_stream())
         .await
         .map_err(|_| anyhow::anyhow!("s2n_quic_transport open_bidirectional_stream timed out"))??;
 
@@ -2824,7 +2831,7 @@ async fn measure_s2n_quic_transport_once(
 
     let mut echoed = Vec::with_capacity(payload.len());
     loop {
-        let chunk = tokio::time::timeout(ADAPTER_TIMEOUT, stream.receive())
+        let chunk = tokio::time::timeout(adapter_timeout(), stream.receive())
             .await
             .map_err(|_| anyhow::anyhow!("s2n_quic_transport echo timed out"))??;
         let Some(chunk) = chunk else {
@@ -2998,7 +3005,7 @@ async fn measure_tokio_quiche_once(url: &str) -> anyhow::Result<AdapterSample> {
     socket.connect(peer_addr).await?;
 
     let start = Instant::now();
-    let deadline = start + ADAPTER_TIMEOUT;
+    let deadline = start + adapter_timeout();
     let (_, mut controller) = tokio_quiche::quic::connect(socket, host)
         .await
         .map_err(|error| anyhow::anyhow!("tokio_quiche connect failed: {error}"))?;
@@ -3013,11 +3020,11 @@ async fn measure_tokio_quiche_once(url: &str) -> anyhow::Result<AdapterSample> {
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            anyhow::bail!("tokio_quiche timed out after {:?}", ADAPTER_TIMEOUT);
+            anyhow::bail!("tokio_quiche timed out after {:?}", adapter_timeout());
         };
         let event = tokio::time::timeout(remaining, controller.event_receiver_mut().recv())
             .await
-            .map_err(|_| anyhow::anyhow!("tokio_quiche timed out after {:?}", ADAPTER_TIMEOUT))?
+            .map_err(|_| anyhow::anyhow!("tokio_quiche timed out after {:?}", adapter_timeout()))?
             .ok_or_else(|| anyhow::anyhow!("tokio_quiche event stream closed"))?;
 
         match event {
@@ -3063,12 +3070,12 @@ async fn read_tokio_quiche_response_body(
     let mut recv = headers.recv;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            anyhow::bail!("tokio_quiche body timed out after {:?}", ADAPTER_TIMEOUT);
+            anyhow::bail!("tokio_quiche body timed out after {:?}", adapter_timeout());
         };
         let frame = tokio::time::timeout(remaining, recv.recv())
             .await
             .map_err(|_| {
-                anyhow::anyhow!("tokio_quiche body timed out after {:?}", ADAPTER_TIMEOUT)
+                anyhow::anyhow!("tokio_quiche body timed out after {:?}", adapter_timeout())
             })?
             .ok_or_else(|| anyhow::anyhow!("tokio_quiche body stream closed"))?;
         match frame {
@@ -3334,7 +3341,7 @@ fn measure_quiche_direct_once(url: &str) -> anyhow::Result<AdapterSample> {
     let mut first_byte_ns = None;
     let mut bytes = 0u64;
     let start = Instant::now();
-    let deadline = start + ADAPTER_TIMEOUT;
+    let deadline = start + adapter_timeout();
     let request_headers = quiche_request_headers(&url)?;
     let mut recv_buf = [0u8; 65535];
     let mut out = [0u8; QUICHE_MAX_DATAGRAM_SIZE];
@@ -3424,7 +3431,7 @@ fn measure_quiche_direct_once(url: &str) -> anyhow::Result<AdapterSample> {
         }
     }
 
-    anyhow::bail!("quiche_direct timed out after {:?}", ADAPTER_TIMEOUT)
+    anyhow::bail!("quiche_direct timed out after {:?}", adapter_timeout())
 }
 
 fn quiche_request_headers(url: &url::Url) -> anyhow::Result<Vec<quiche::h3::Header>> {
