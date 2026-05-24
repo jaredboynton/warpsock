@@ -193,11 +193,14 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib transport::h3::native_driver::tests -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --test h3_receive_flow_scheduling native_h3_driver_treats_pending_delayed_ack_as_pending_work -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib h3_body -- --nocapture`
+- `CARGO_TARGET_DIR=/tmp/specter-h3-continue cargo test --lib h3_body_reports_released_recv_bytes_when_consumer_takes_data -- --nocapture`
+- `CARGO_TARGET_DIR=/tmp/specter-h3-continue-b cargo test --lib recv_event_releases_encoded_data_frame_credit -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --test h3_native_handshake native_h3_client_emits_max_data_after_receive_connection_window_threshold -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-current-target cargo test --test h3_fingerprint_config h3_client_exposes_shared_native_h3_session_cache_for_resumption -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib streaming_response_body_reports_backpressure_when_shared_and_pending_slots_are_full -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib streaming_response_backpressure_does_not_pause_when_a_sibling_has_capacity -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-current-a cargo test --test h3_receive_flow_scheduling native_h3_driver_flushes_receive_credit_from_consumed_body_bytes -- --nocapture`
+- `CARGO_TARGET_DIR=/tmp/specter-h3-continue cargo test --test h3_native_recovery -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib reset_on_full_tunnel_inbound_is_queued_until_public_reader_frees_capacity -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --test h3_native_quic native_quic_ack_tracker_uses_max_ack_delay_timer_below_packet_threshold -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --test h3_quic_packet_parsing -- --nocapture`
