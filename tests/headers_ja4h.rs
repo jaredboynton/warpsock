@@ -2,7 +2,7 @@
 //!
 //! Validates OrderedHeaders preserves order and JA4H fingerprint calculation.
 
-use specter::headers::{chrome_142_headers, firefox_133_headers, OrderedHeaders};
+use specter::headers::{chrome_142_headers, firefox_133_headers, firefox_151_headers, OrderedHeaders};
 
 #[test]
 fn test_ordered_headers_preserves_order() {
@@ -33,6 +33,30 @@ fn test_ja4h_fingerprint_deterministic() {
 
     // Same headers should produce same JA4H
     assert_eq!(ordered1.ja4h_fingerprint(), ordered2.ja4h_fingerprint());
+}
+
+#[test]
+fn test_firefox_user_agent_value_changes_do_not_change_current_ja4h() {
+    let firefox_133 = OrderedHeaders::new(firefox_133_headers());
+    let firefox_151 = OrderedHeaders::new(firefox_151_headers());
+
+    assert_ne!(
+        firefox_133
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "User-Agent")
+            .map(|(_, value)| value),
+        firefox_151
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "User-Agent")
+            .map(|(_, value)| value)
+    );
+    assert_eq!(
+        firefox_133.ja4h_fingerprint(),
+        firefox_151.ja4h_fingerprint(),
+        "Current JA4H implementation is header-name/order based, not User-Agent-value sensitive"
+    );
 }
 
 #[test]

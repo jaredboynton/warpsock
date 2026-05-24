@@ -37,7 +37,7 @@ const EXPECTED_AKAMAI_SETTINGS: &str = "1:65536;2:0;3:1000;4:6291456;5:16384;6:2
 const EXPECTED_WINDOW_UPDATE: &str = "15663105";
 const EXPECTED_PSEUDO_ORDER: &str = "m,s,a,p";
 
-/// Expected Firefox 133 HTTP/2 Akamai format
+/// Expected shared Firefox HTTP/2 Akamai format
 const EXPECTED_FIREFOX_AKAMAI_SETTINGS: &str = "1:65536;4:131072;5:16384";
 const EXPECTED_FIREFOX_WINDOW_UPDATE: &str = "12517377";
 const EXPECTED_FIREFOX_PSEUDO_ORDER: &str = "m,p,a,s";
@@ -429,7 +429,7 @@ async fn test_h3_fingerprint() -> Result<()> {
 
 /// Test Firefox TLS fingerprint using BoringConnector
 async fn test_firefox_tls_fingerprint() -> Result<()> {
-    let fp = TlsFingerprint::firefox_133();
+    let fp = TlsFingerprint::firefox();
 
     info!("      Configured Firefox TLS Fingerprint:");
     info!("      - Cipher suites: {} configured", fp.cipher_list.len());
@@ -501,7 +501,7 @@ async fn test_firefox_h2_fingerprint() -> Result<()> {
     );
 
     // Expected Firefox values
-    info!("      Expected Firefox 133 values:");
+    info!("      Expected shared Firefox values:");
     info!(
         "      - HEADER_TABLE_SIZE: 65536 {}",
         check(settings.header_table_size == 65536)
@@ -535,7 +535,7 @@ async fn test_firefox_h2_fingerprint() -> Result<()> {
     );
 
     // Test actual HTTP/2 connection
-    let fp = TlsFingerprint::firefox_133();
+    let fp = TlsFingerprint::firefox();
     let connector = BoringConnector::with_fingerprint(fp);
     let uri: Uri = "https://tls.peet.ws/api/all".parse().unwrap();
 
@@ -560,7 +560,7 @@ async fn test_firefox_h2_fingerprint() -> Result<()> {
                     let headers = vec![
                         (
                             "user-agent".to_string(),
-                            FingerprintProfile::Firefox133.user_agent().to_string(),
+                            FingerprintProfile::Firefox151.user_agent().to_string(),
                         ),
                         ("accept".to_string(), "application/json".to_string()),
                     ];
@@ -653,7 +653,7 @@ fn validate_firefox_akamai_fingerprint(akamai: &str) {
             "      - SETTINGS: {} {}",
             settings_str,
             if settings_match {
-                "[PASS] Matches Firefox 133 core settings"
+                "[PASS] Matches shared Firefox core settings"
             } else {
                 "[INFO] Core settings present, may include additional settings"
             }
@@ -678,7 +678,7 @@ fn validate_firefox_akamai_fingerprint(akamai: &str) {
             "      - Pseudo-header order: {} {}",
             parts[3],
             if pseudo_match {
-                "[PASS] Matches Firefox 133 order"
+                "[PASS] Matches shared Firefox order"
             } else {
                 "[INFO] Order differs from reference"
             }
@@ -994,7 +994,7 @@ fn print_fingerprint_summary() {
     info!("      - WINDOW_UPDATE:   {}", EXPECTED_WINDOW_UPDATE);
     info!("      - Pseudo order:    {}", EXPECTED_PSEUDO_ORDER);
     info!("");
-    info!("      Expected HTTP/2 Akamai format (Firefox 133):");
+    info!("      Expected HTTP/2 Akamai format (shared Firefox):");
     info!(
         "      - SETTINGS:        {} (only 3 settings)",
         EXPECTED_FIREFOX_AKAMAI_SETTINGS
