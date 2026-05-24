@@ -11,11 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::{Buf, Bytes};
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls;
-use quinn::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 
 const QUICHE_MAX_DATAGRAM_SIZE: usize = 1350;
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,6 +25,8 @@ const LOCAL_FIXTURE_CHUNK_COUNT: usize = 5;
 const LOCAL_FIXTURE_CHUNK_DELAY_MS: u64 = 1;
 const LOCAL_FIXTURE_H3_STREAM_SEGMENT_SIZE: usize = 1_200;
 const LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE: usize = 1_024;
+const LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE: usize = 1_024;
+const QUINN_TRANSPORT_ALPN: &[u8] = b"specter-transport-bench";
 
 #[derive(Debug, Serialize)]
 struct Artifact {
@@ -282,6 +285,10 @@ fn specter_native_rfc9220_tunnel_row_from_samples(samples: &[AdapterSample]) -> 
     )
 }
 
+fn quinn_transport_row_from_samples(samples: &[AdapterSample]) -> BenchmarkRow {
+    adapter_row_from_samples("quinn_transport", "quinn_transport_adapter", samples)
+}
+
 #[cfg(test)]
 fn tokio_quiche_row_from_samples(samples: &[AdapterSample]) -> BenchmarkRow {
     adapter_row_from_samples("tokio_quiche", "tokio_quiche_adapter", samples)
@@ -311,6 +318,7 @@ fn local_native_fixture_measurement_plan() -> Vec<&'static str> {
             "h3_quinn",
         ];
         plan.push("reqwest_h3");
+        plan.push("quinn_transport");
         plan.push("specter_native_rfc9220_tunnel");
         plan
     }
@@ -321,6 +329,7 @@ fn local_native_fixture_measurement_plan() -> Vec<&'static str> {
             "quiche_direct",
             "tokio_quiche",
             "h3_quinn",
+            "quinn_transport",
             "specter_native_rfc9220_tunnel",
         ]
     }
@@ -579,6 +588,16 @@ async fn main() -> anyhow::Result<()> {
             .await?,
         );
     }
+    if let Some(url) = option_value(&args, "--measure-quinn-transport-url") {
+        measured_competitor_rows.push(
+            measure_quinn_transport(
+                &url,
+                option_usize(&args, "--warmups", 3)?,
+                option_usize(&args, "--samples", 30)?,
+            )
+            .await?,
+        );
+    }
     if let Some(url) = option_value(&args, "--measure-reqwest-h3-url") {
         measured_competitor_rows.push(
             measure_reqwest_h3(
@@ -664,6 +683,10 @@ async fn measure_local_native_fixture(
             "quiche_direct" => measure_quiche_direct(url, warmups, samples),
             "tokio_quiche" => measure_tokio_quiche(url, warmups, samples).await,
             "h3_quinn" => measure_h3_quinn(url, warmups, samples).await,
+            "quinn_transport" => {
+                let fixture = LocalQuinnTransportFixture::start().await?;
+                measure_quinn_transport(fixture.url(), warmups, samples).await
+            }
             #[cfg(feature = "reqwest-h3")]
             "reqwest_h3" => measure_reqwest_h3(url, warmups, samples).await,
             "specter_native_rfc9220_tunnel" => {
@@ -730,6 +753,60 @@ impl Drop for LocalNativeH3Fixture {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+struct LocalQuinnTransportFixture {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LocalQuinnTransportFixture {
+    async fn start() -> anyhow::Result<Self> {
+        let server_config = quinn_transport_server_config()?;
+        let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse()?)?;
+        let port = endpoint.local_addr()?.port();
+        let task = tokio::spawn(run_local_quinn_transport_fixture(endpoint));
+        Ok(Self {
+            url: format!("quic://localhost:{port}/transport"),
+            task,
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Drop for LocalQuinnTransportFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn run_local_quinn_transport_fixture(endpoint: quinn::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(async move {
+            let Ok(connection) = incoming.await else {
+                return;
+            };
+            while let Ok(stream) = connection.accept_bi().await {
+                tokio::spawn(async move {
+                    let _ = echo_quinn_transport_stream(stream).await;
+                });
+            }
+        });
+    }
+}
+
+async fn echo_quinn_transport_stream(
+    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+) -> anyhow::Result<()> {
+    let bytes = recv
+        .read_to_end(LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE * 8)
+        .await?;
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    Ok(())
 }
 
 fn generate_local_fixture_cert_pem() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
@@ -1408,6 +1485,181 @@ async fn measure_specter_native_rfc9220_tunnel_once(
 
     let total_ns = start.elapsed().as_nanos() as f64;
     Ok(AdapterSample::new(total_ns, total_ns, echoed.len() as u64))
+}
+
+async fn measure_quinn_transport(
+    url: &str,
+    warmups: usize,
+    samples: usize,
+) -> anyhow::Result<BenchmarkRow> {
+    let url = url::Url::parse(url)?;
+    let peer_addr = url
+        .socket_addrs(|| Some(443))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("URL resolved to no socket addresses"))?;
+    let bind_addr = if peer_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let mut endpoint = quinn::Endpoint::client(bind_addr.parse()?)?;
+    endpoint.set_default_client_config(quinn_transport_client_config()?);
+    let server_name = url.host_str().unwrap_or("localhost");
+    let connection = endpoint.connect(peer_addr, server_name)?.await?;
+
+    for _ in 0..warmups {
+        let _ = measure_quinn_transport_once(&connection).await?;
+    }
+
+    let mut measured = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        measured.push(measure_quinn_transport_once(&connection).await?);
+    }
+
+    connection.close(0u32.into(), b"benchmark complete");
+    let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+
+    Ok(quinn_transport_row_from_samples(&measured))
+}
+
+async fn measure_quinn_transport_once(connection: &quinn::Connection) -> anyhow::Result<AdapterSample> {
+    let payload = Bytes::from(vec![b'q'; LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE]);
+    let start = Instant::now();
+    let (mut send, mut recv) = tokio::time::timeout(ADAPTER_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| anyhow::anyhow!("quinn_transport open_bi timed out"))??;
+
+    send.write_all(payload.as_ref()).await?;
+    send.finish()?;
+    let echoed = tokio::time::timeout(
+        ADAPTER_TIMEOUT,
+        recv.read_to_end(LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE * 8),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("quinn_transport echo timed out"))??;
+    if echoed.as_slice() != payload.as_ref() {
+        anyhow::bail!(
+            "quinn_transport echo mismatch: expected {} bytes, got {} bytes",
+            payload.len(),
+            echoed.len()
+        );
+    }
+
+    let total_ns = start.elapsed().as_nanos() as f64;
+    Ok(AdapterSample::new(total_ns, total_ns, echoed.len() as u64))
+}
+
+fn quinn_transport_client_config() -> anyhow::Result<quinn::ClientConfig> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .retain(|suite| suite.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![QUINN_TRANSPORT_ALPN.to_vec()];
+    Ok(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto)?,
+    )))
+}
+
+fn quinn_transport_server_config() -> anyhow::Result<quinn::ServerConfig> {
+    let (cert_der, key_der) = generate_local_fixture_cert_der()?;
+    let cert_der = CertificateDer::from(cert_der);
+    let key = PrivatePkcs8KeyDer::from(key_der);
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .retain(|suite| suite.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key.into())?;
+    crypto.alpn_protocols = vec![QUINN_TRANSPORT_ALPN.to_vec()];
+
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
+    let transport_config = Arc::get_mut(&mut server_config.transport)
+        .ok_or_else(|| anyhow::anyhow!("quinn transport config unexpectedly shared"))?;
+    transport_config.max_concurrent_uni_streams(0_u8.into());
+    Ok(server_config)
+}
+
+fn generate_local_fixture_cert_der() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let cert_path = std::env::temp_dir().join(format!("specter_native_h3_{stamp}.der"));
+    let key_pem_path = std::env::temp_dir().join(format!("specter_native_h3_{stamp}.key.pem"));
+    let key_der_path = std::env::temp_dir().join(format!("specter_native_h3_{stamp}.key.der"));
+    let output = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_pem_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid temp key path"))?,
+            "-out",
+            cert_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid temp cert path"))?,
+            "-outform",
+            "DER",
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "-addext",
+            "basicConstraints=CA:FALSE",
+        ])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "openssl fixture DER cert generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("openssl")
+        .args([
+            "pkcs8",
+            "-topk8",
+            "-nocrypt",
+            "-inform",
+            "PEM",
+            "-outform",
+            "DER",
+            "-in",
+            key_pem_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid temp key path"))?,
+            "-out",
+            key_der_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid temp DER key path"))?,
+        ])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "openssl fixture DER key conversion failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let cert_der = fs::read(&cert_path)?;
+    let key_der = fs::read(&key_der_path)?;
+    let _ = fs::remove_file(cert_path);
+    let _ = fs::remove_file(key_pem_path);
+    let _ = fs::remove_file(key_der_path);
+    Ok((cert_der, key_der))
 }
 
 async fn measure_tokio_quiche(
