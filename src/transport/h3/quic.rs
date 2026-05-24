@@ -623,6 +623,24 @@ impl QuicLossDetector {
         self
     }
 
+    pub fn with_peer_ack_delay_exponent(mut self, exponent: u64) -> Self {
+        self.peer_ack_delay_exponent = exponent;
+        self
+    }
+
+    pub fn with_max_ack_delay(mut self, max_ack_delay: Duration) -> Self {
+        self.max_ack_delay = max_ack_delay;
+        self
+    }
+
+    pub fn set_peer_ack_delay_exponent(&mut self, exponent: u64) {
+        self.peer_ack_delay_exponent = exponent;
+    }
+
+    pub fn set_max_ack_delay(&mut self, max_ack_delay: Duration) {
+        self.max_ack_delay = max_ack_delay;
+    }
+
     pub fn on_packet_sent(&mut self, packet_number: u64) {
         self.on_packet_sent_at(packet_number, Instant::now());
     }
@@ -631,6 +649,10 @@ impl QuicLossDetector {
         if packet_number <= MAX_PACKET_NUMBER {
             self.sent.insert(packet_number);
             self.sent_at.insert(packet_number, sent_at);
+            self.largest_sent = Some(match self.largest_sent {
+                Some(current) => current.max(packet_number),
+                None => packet_number,
+            });
         }
     }
 
@@ -639,6 +661,93 @@ impl QuicLossDetector {
             self.acked.insert(packet_number);
             self.sent_at.remove(&packet_number);
         }
+    }
+
+    /// RFC9002 § 5.1/5.3 RTT estimator update. Returns the latest sample if
+    /// one was taken so callers can persist or expose it.
+    pub fn observe_rtt_sample(
+        &mut self,
+        sent_at: Instant,
+        ack_received_at: Instant,
+        ack_delay: Duration,
+    ) -> Option<Duration> {
+        let raw_latest = ack_received_at.checked_duration_since(sent_at)?;
+        if raw_latest.is_zero() {
+            return None;
+        }
+        self.latest_rtt = Some(raw_latest);
+        let prior_min = self.min_rtt.unwrap_or(raw_latest);
+        let min_rtt = prior_min.min(raw_latest);
+        self.min_rtt = Some(min_rtt);
+
+        // RFC9002 § 5.3: only subtract ack_delay when the resulting adjusted
+        // sample is still no smaller than min_rtt; otherwise keep the raw
+        // latest_rtt to avoid biasing low.
+        let adjusted = if raw_latest >= min_rtt + ack_delay {
+            raw_latest - ack_delay
+        } else {
+            raw_latest
+        };
+
+        match (self.smoothed_rtt, self.latest_rtt) {
+            (None, _) => {
+                self.smoothed_rtt = Some(adjusted);
+                self.rttvar = adjusted / 2;
+            }
+            (Some(prev_smoothed), _) => {
+                let rttvar_sample = duration_abs_diff(prev_smoothed, adjusted);
+                // RFC9002 § 5.3: rttvar = 3/4 * rttvar + 1/4 * |smoothed_rtt - adjusted_rtt|
+                self.rttvar = (self.rttvar * 3 + rttvar_sample) / 4;
+                // RFC9002 § 5.3: smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt
+                self.smoothed_rtt = Some((prev_smoothed * 7 + adjusted) / 8);
+            }
+        }
+        Some(raw_latest)
+    }
+
+    pub fn latest_rtt(&self) -> Option<Duration> {
+        self.latest_rtt
+    }
+
+    pub fn smoothed_rtt(&self) -> Option<Duration> {
+        self.smoothed_rtt
+    }
+
+    pub fn rttvar(&self) -> Duration {
+        self.rttvar
+    }
+
+    pub fn min_rtt(&self) -> Option<Duration> {
+        self.min_rtt
+    }
+
+    pub fn max_ack_delay(&self) -> Duration {
+        self.max_ack_delay
+    }
+
+    /// RFC9002 § 6.2.1 probe timeout duration:
+    /// `PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay`.
+    /// When no RTT samples have been taken the initial smoothed_rtt of
+    /// `kInitialRtt = 333ms` and `rttvar = kInitialRtt / 2` are used.
+    pub fn current_pto(&self) -> Duration {
+        let smoothed = self.smoothed_rtt.unwrap_or(INITIAL_RTT);
+        let rttvar = if self.smoothed_rtt.is_some() {
+            self.rttvar
+        } else {
+            INITIAL_RTT / 2
+        };
+        let variance_term = (rttvar.saturating_mul(4)).max(TIMER_GRANULARITY);
+        smoothed
+            .saturating_add(variance_term)
+            .saturating_add(self.max_ack_delay)
+    }
+
+    /// RFC9000 § 10.2 closing/draining period: 3 * current_PTO. Callers that
+    /// need a floor (e.g. before any RTT samples are taken) get the initial
+    /// PTO-derived value automatically because `current_pto` falls back to
+    /// `INITIAL_RTT` plus `max_ack_delay`.
+    pub fn close_window(&self) -> Duration {
+        self.current_pto().saturating_mul(3)
     }
 
     pub fn on_ack_frame(&mut self, frame: &QuicFrame) -> Result<Vec<u64>> {
