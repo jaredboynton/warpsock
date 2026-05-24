@@ -65,9 +65,11 @@ These rows are outside the H3 HTTP superiority gate and are tracked as tunnel-wo
 | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` | `specter_native_rfc9220_tunnel` | 30 | 187,000 | 243,166 | 5,474,717 |
 | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` | `specter_native_rfc9220_tunnel_close` | 30 | 217,833 | 518,958 | 4,212,137 |
 | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` | `specter_native_rfc9220_tunnel_mixed` | 30 | 5,169,209 | 9,016,000 | 1,042,871 |
+| `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` | `quiche_direct_rfc9220_tunnel` | 30 | 2,938,209 | 3,017,709 | 349,111 |
+| `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` | `tokio_quiche_rfc9220_tunnel` | 30 | 3,336,375 | 3,936,083 | 298,854 |
 | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-rfc9220-websocket-h3-agent3.json` | aggregate echo/close/mixed | 5 | see artifact | see artifact | see artifact |
 
-The comparator capability rows are now explicit: `quiche_direct_rfc9220_tunnel` and `tokio_quiche_rfc9220_tunnel` remain `pending_adapter`; `h3_quinn_rfc9220_tunnel`, `reqwest_h3_rfc9220_tunnel`, `tokio_tungstenite_rfc9220`, and `reqwest_rfc9220` are `unsupported_by_client` capability-audit rows, not throughput comparators.
+The low-level `quiche_direct_rfc9220_tunnel` and `tokio_quiche_rfc9220_tunnel` adapters now have measured n=30 rows. `h3_quinn_rfc9220_tunnel`, `reqwest_h3_rfc9220_tunnel`, `tokio_tungstenite_rfc9220`, and `reqwest_rfc9220` remain unsupported capability-audit rows, not throughput comparators.
 
 ## Historical passing proof artifact
 
@@ -126,7 +128,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Fixed native server QUIC transport parameters for required connection-ID fields and fixed server/client CID handling for 1-RTT packet routing.
 - Added a same-fixture `specter_native_rfc9220_tunnel` benchmark row that opens RFC9220/WebSocket-over-H3 against the native fixture, echoes H3 DATA, and records TTFT/throughput separately from the H3 streaming superiority gate.
 - Added same-fixture `specter_native_rfc9220_tunnel_close` and `specter_native_rfc9220_tunnel_mixed` rows for client DATA+FIN/server FIN timing and a slow-consumer tunnel plus concurrent H3 streaming response workload.
-- Added explicit RFC9220 comparator capability rows so feasible low-level `quiche`/`tokio-quiche` tunnel adapters are tracked as pending while `h3-quinn`, `reqwest_h3`, and H1 WebSocket clients are marked unsupported for RFC9220 tunnel throughput comparison.
+- Added measured low-level `quiche` and `tokio-quiche` RFC9220 tunnel comparator adapters while keeping `h3-quinn`, `reqwest_h3`, and H1 WebSocket clients marked unsupported for RFC9220 tunnel throughput comparison.
 - Added transport-only `quinn_transport` and optional `s2n_quic_transport` same-fixture comparator adapters that open a raw QUIC bidirectional stream, echo payload bytes, and record measured TTFT/throughput outside the H3 superiority gate.
 - Added fingerprint-level raw ordered QUIC transport parameters; when supplied, native H3 encodes that list exactly in caller order, bypasses typed/default/GREASE parameter emission, and preserves raw order in the H3 pool key.
 - Wired native QUIC TLS certificate-compression configuration from `TlsFingerprint.cert_compression`, so H3 ClientHello capture can advertise `compress_certificate` for Brotli/Zlib fingerprints.
@@ -142,7 +144,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Client/server same-fixture ACK decimation now has a `max_ack_delay_ms` timer path; remaining ACK work is browser-capture parity for tuned thresholds.
 - The latest full same-fixture proof emits no fixture packet-error events, and fixture events now serialize stable `category`/`fatal` fields; keep this as a regression guard, not an active cleanup gap.
 - `quinn_transport` and optional `s2n_quic_transport` have measured transport-only comparator adapters; they remain non-H3 rows and are not required for the H3 superiority gate.
-- RFC9220/WebSocket-over-H3 has Specter-native same-fixture echo, close/FIN, and slow-consumer mixed rows at n=30; remaining proof work is third-party RFC9220 adapters, p99-scale samples, and any tunnel superiority claim.
+- RFC9220/WebSocket-over-H3 has Specter-native same-fixture echo, close/FIN, slow-consumer mixed rows, and low-level `quiche`/`tokio-quiche` raw tunnel comparator rows at n=30; remaining proof work is p99-scale samples and any dedicated tunnel superiority gate/claim.
 - TLS certificate compression and raw ordered QUIC transport parameters are wired for native H3; remaining fingerprint work is extension ordering, resumption, 0-RTT, capture presets, and dynamic placeholders.
 - TLS resumption and 0-RTT are now exposed through capability-status helpers as unsupported in native H3; the remaining gap is implementation, not ambiguity.
 - H3 scheduling now has in-connection fair send turns for streaming request bodies and RFC9220 tunnel DATA, sibling-tunnel and mixed tunnel/response receive-class fairness, and a pool-level origin-rotation primitive.
@@ -152,7 +154,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 
 - Native QUIC still needs full packet-space RFC9002 PTO/timer-driven recovery with RTT/backoff, Initial/server CRYPTO PTO retransmission, RFC-grade close-drain timing beyond the bounded client replay window, key update handling, Version Negotiation/Retry handshake integration beyond packet primitives, ECN socket marking plus CE-driven congestion response, and path migration/validation beyond the client token lifecycle.
 - Browser-capture ACK parity remains open for per-browser/version ACK behavior and the tuned `ack_eliciting_threshold = 128` benchmark profile.
-- RFC9220/WebSocket-over-H3 still lacks low-level `quiche` and `tokio-quiche` tunnel comparator adapters, p99-scale samples, and any third-party tunnel superiority claim.
+- RFC9220/WebSocket-over-H3 still lacks p99-scale samples and a dedicated tunnel superiority gate/claim, even though low-level `quiche` and `tokio-quiche` raw tunnel comparator adapters now have n=30 rows.
 - TLS/H3 fingerprint gaps remain: extension ordering/permutation evidence and control, `SSL_SESSION` ticket capture/replay, 0-RTT send with replay policy, capture-derived raw transport-parameter presets, and dynamic connection-ID placeholder handling inside raw ordered transport-parameter lists.
 - H3 scheduling still needs H3Client dispatch wired to `OriginFairQueue` and fully adaptive send-window growth; receive-window credit for active streaming responses is now gated by public body-consumed bytes, while absolute MAX_DATA/MAX_STREAM_DATA values still come from the existing receive-threshold logic and byte-precise encoded H3 frame credit remains open.
 - Outbound RFC9220 tunnel backpressure remains item-count bounded rather than byte bounded.
@@ -212,7 +214,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features s2n-quic-transport -- --measure-local-native-fixture --measure-local-native-fixture-client s2n_quic_transport --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-s2n-quic-transport-local.json`
 - `RUSTFLAGS='--cfg reqwest_unstable' CARGO_TARGET_DIR=/tmp/specter-h3-test-target timeout 180 cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features reqwest-h3 -- --measure-local-native-fixture --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-smoke.json --require-superiority`
 - `RUSTFLAGS='--cfg reqwest_unstable' CARGO_TARGET_DIR=/tmp/specter-h3-test-target timeout 180 cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features reqwest-h3,s2n-quic-transport -- --measure-local-native-fixture --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-with-s2n-smoke.json --require-superiority`
-- Per-client n=30 release-grade artifacts merged into `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` via the import-precedence path; produced by running `--measure-local-native-fixture-client <name> --warmups 5 --samples 30` for `specter_native`, `specter_native_rfc9220_tunnel`, `specter_native_rfc9220_tunnel_close`, `specter_native_rfc9220_tunnel_mixed`, `quiche_direct`, `tokio_quiche`, `h3_quinn`, `reqwest_h3`, `quinn_transport` and then `--require-superiority` on the merge.
+- Per-client n=30 release-grade artifacts merged into `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json` via the import-precedence path; produced by running `--measure-local-native-fixture-client <name> --warmups 5 --samples 30` for `specter_native`, `specter_native_rfc9220_tunnel`, `specter_native_rfc9220_tunnel_close`, `specter_native_rfc9220_tunnel_mixed`, `quiche_direct_rfc9220_tunnel`, `tokio_quiche_rfc9220_tunnel`, `quiche_direct`, `tokio_quiche`, `h3_quinn`, `reqwest_h3`, `quinn_transport` and then `--require-superiority` on the merge.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml local_native_fixture_plan_includes_feature_enabled_clients -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --lib transport::h3::native_driver::tests -- --nocapture`
 - `cargo tree --no-default-features -e normal | rg '\bquiche\b'` returns no matches.
