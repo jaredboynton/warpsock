@@ -16,7 +16,7 @@ use tokio::time::{Instant, Sleep};
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
-use crate::request::RequestBody;
+use crate::request::{RequestBody, RequestBodyStream};
 use crate::response::Response;
 use crate::transport::connector::MaybeHttpsStream;
 
@@ -155,6 +155,12 @@ impl H1Body {
         self.read_idle_sleep = None;
     }
 
+    #[inline]
+    fn timeouts_enabled(&self) -> bool {
+        self.total_sleep.is_some() || self.read_idle_timeout.is_some()
+    }
+
+    #[inline]
     fn poll_timeouts(&mut self, cx: &mut Context<'_>) -> Option<Error> {
         if let Some(total) = self.total_sleep.as_mut() {
             if total.as_mut().poll(cx).is_ready() {
@@ -179,10 +185,12 @@ impl H1Body {
     /// Read from the socket directly into the spare capacity of `self.read_buf`,
     /// returning the number of bytes appended. Reuses the existing capacity when
     /// available so consecutive reads on a fresh chunk avoid reallocation.
+    #[inline]
     fn poll_read_into_internal_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
         self.poll_read_into_internal_buffer_limited(cx, STREAM_READ_BUF_SIZE)
     }
 
+    #[inline]
     fn poll_read_into_internal_buffer_limited(
         &mut self,
         cx: &mut Context<'_>,
@@ -237,10 +245,12 @@ impl H1Body {
 
     /// Read more bytes into the internal `read_buf`. Returns the number of bytes
     /// newly appended; zero indicates EOF.
+    #[inline]
     fn poll_read_more(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
         self.poll_read_into_internal_buffer(cx)
     }
 
+    #[inline]
     fn poll_fixed_body(
         &mut self,
         cx: &mut Context<'_>,
@@ -297,6 +307,7 @@ impl H1Body {
         }
     }
 
+    #[inline]
     fn poll_close_delimited(
         &mut self,
         cx: &mut Context<'_>,
@@ -339,6 +350,7 @@ impl H1Body {
     /// when both buffers share no allocation; this is the only place where a
     /// memcpy is unavoidable because chunked framing needs contiguous bytes
     /// across multiple reads.
+    #[inline]
     fn drain_read_buf_into(&mut self, buffer: &mut BytesMut) {
         if !self.read_buf.is_empty() {
             buffer.unsplit(self.read_buf.split());
@@ -369,6 +381,7 @@ impl H1Body {
         }
     }
 
+    #[inline]
     fn poll_chunked_body(
         &mut self,
         cx: &mut Context<'_>,
@@ -455,8 +468,10 @@ impl HttpBody for H1Body {
             return Poll::Ready(None);
         }
 
-        if let Some(err) = this.poll_timeouts(cx) {
-            return this.fail(err);
+        if this.timeouts_enabled() {
+            if let Some(err) = this.poll_timeouts(cx) {
+                return this.fail(err);
+            }
         }
 
         match std::mem::replace(&mut this.mode, H1BodyMode::Empty) {
@@ -570,12 +585,23 @@ impl H1Connection {
     ) -> Result<Response> {
         let body_kind = h1_request_body_kind(&body);
         let request_bytes = self.build_request(&method, uri, &headers, body_kind)?;
-        self.stream
-            .write_all(&request_bytes)
-            .await
-            .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
 
-        self.write_request_body(body).await?;
+        match body {
+            RequestBody::Stream {
+                stream,
+                content_length: Some(expected_len),
+            } => {
+                self.write_sized_request_stream_with_head(request_bytes, stream, expected_len)
+                    .await?;
+            }
+            body => {
+                self.stream
+                    .write_all(&request_bytes)
+                    .await
+                    .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
+                self.write_request_body(body).await?;
+            }
+        }
 
         self.stream
             .flush()
@@ -808,6 +834,67 @@ impl H1Connection {
                 }
             }
         }
+    }
+
+    async fn write_sized_request_stream_with_head(
+        &mut self,
+        mut request_bytes: Vec<u8>,
+        mut stream: RequestBodyStream,
+        expected_len: u64,
+    ) -> Result<()> {
+        let mut sent = 0u64;
+
+        loop {
+            let first_poll = {
+                let waker = std::task::Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                stream.as_mut().poll_next(&mut cx)
+            };
+
+            match first_poll {
+                Poll::Ready(Some(chunk)) => {
+                    let chunk = chunk?;
+                    sent += chunk.len() as u64;
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    request_bytes.extend_from_slice(&chunk);
+                    self.stream.write_all(&request_bytes).await.map_err(|e| {
+                        Error::HttpProtocol(format!(
+                            "Failed to write sized streaming request head/body: {}",
+                            e
+                        ))
+                    })?;
+                    break;
+                }
+                Poll::Ready(None) | Poll::Pending => {
+                    self.stream.write_all(&request_bytes).await.map_err(|e| {
+                        Error::HttpProtocol(format!("Failed to write request: {}", e))
+                    })?;
+                    break;
+                }
+            }
+        }
+
+        while let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            let chunk = chunk?;
+            sent += chunk.len() as u64;
+            self.stream.write_all(&chunk).await.map_err(|e| {
+                Error::HttpProtocol(format!(
+                    "Failed to write sized streaming request body: {}",
+                    e
+                ))
+            })?;
+        }
+
+        if sent != expected_len {
+            return Err(Error::HttpProtocol(format!(
+                "sized streaming request body length mismatch: sent {} bytes, Content-Length is {}",
+                sent, expected_len
+            )));
+        }
+
+        Ok(())
     }
 
     async fn write_sized_request_bytes(

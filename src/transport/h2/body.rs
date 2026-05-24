@@ -1,13 +1,14 @@
 //! Poll-based HTTP/2 response body delivery.
 
+use atomic_waker::AtomicWaker;
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use std::collections::VecDeque;
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{sleep, Sleep};
@@ -26,45 +27,83 @@ pub(crate) enum H2BodyPush {
     Closed,
 }
 
+pub(crate) enum H2BodyDataPush {
+    Accepted { queued_len: usize },
+    Full(Bytes),
+    Closed,
+}
+
 /// Bounded in-flight DATA item capacity per H2 stream body.
 ///
 /// H2 stream-level flow control still bounds total in-flight bytes; this cap
 /// is a safety bound on the number of distinct chunks queued between the
 /// driver and the consumer, which removes the per-chunk lock-step round-trip
 /// the original single-slot design imposed.
-const H2_BODY_SLOT_CAPACITY: usize = 32;
+const H2_BODY_SLOT_CAPACITY: usize = 3;
 const MIN_RELEASE_NOTIFY_BYTES: usize = 8 * 1024;
 const MAX_RELEASE_NOTIFY_BYTES: usize = 512 * 1024;
 
 struct H2BodyState {
-    slots: VecDeque<std::result::Result<Bytes, Error>>,
-    cap: usize,
+    slots: [Option<std::result::Result<Bytes, Error>>; H2_BODY_SLOT_CAPACITY],
+    head: usize,
+    len: usize,
     terminal_error: Option<Error>,
     ended: bool,
     closed: bool,
-    consumer_waker: Option<Waker>,
 }
 
 impl Default for H2BodyState {
     fn default() -> Self {
         Self {
-            slots: VecDeque::with_capacity(H2_BODY_SLOT_CAPACITY),
-            cap: H2_BODY_SLOT_CAPACITY,
+            slots: std::array::from_fn(|_| None),
+            head: 0,
+            len: 0,
             terminal_error: None,
             ended: false,
             closed: false,
-            consumer_waker: None,
         }
+    }
+}
+
+impl H2BodyState {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.len == H2_BODY_SLOT_CAPACITY
+    }
+
+    #[inline]
+    fn push_back(&mut self, item: std::result::Result<Bytes, Error>) {
+        debug_assert!(!self.is_full());
+        let tail = (self.head + self.len) % H2_BODY_SLOT_CAPACITY;
+        self.slots[tail] = Some(item);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<std::result::Result<Bytes, Error>> {
+        if self.is_empty() {
+            return None;
+        }
+        let item = self.slots[self.head].take();
+        self.head = (self.head + 1) % H2_BODY_SLOT_CAPACITY;
+        self.len -= 1;
+        item
     }
 }
 
 /// Shared DATA slots between the H2 driver and the public `Body` poller.
 ///
-/// Driver-owned wakeable state with a bounded `VecDeque` of in-flight chunks
-/// plus a consumer `Waker` and a `Notify` to wake the driver when the
+/// Driver-owned wakeable state with a bounded ring of in-flight chunks plus
+/// a consumer `Waker` and a `Notify` to wake the driver when the
 /// consumer drains a chunk and the slot becomes refillable.
 pub struct H2BodyShared {
     state: Mutex<H2BodyState>,
+    consumer_waker: AtomicWaker,
     closed: AtomicBool,
     released_recv_bytes: AtomicUsize,
     release_notify_bytes: usize,
@@ -77,6 +116,7 @@ impl H2BodyShared {
             .clamp(MIN_RELEASE_NOTIFY_BYTES, MAX_RELEASE_NOTIFY_BYTES);
         Arc::new(Self {
             state: Mutex::new(H2BodyState::default()),
+            consumer_waker: AtomicWaker::new(),
             closed: AtomicBool::new(false),
             released_recv_bytes: AtomicUsize::new(0),
             release_notify_bytes,
@@ -85,55 +125,70 @@ impl H2BodyShared {
     }
 
     pub(crate) fn push(&self, item: std::result::Result<Bytes, Error>) -> H2BodyPush {
-        if self.closed.load(Ordering::Acquire) {
-            return H2BodyPush::Closed;
-        }
-        let mut state = self.state.lock().expect("h2 body state poisoned");
-        if state.closed {
-            return H2BodyPush::Closed;
-        }
-        if state.slots.len() >= state.cap {
-            return H2BodyPush::Full(item);
-        }
-        let should_wake = state.slots.is_empty();
-        state.slots.push_back(item);
-        if should_wake {
-            if let Some(waker) = state.consumer_waker.as_ref() {
-                waker.wake_by_ref();
+        self.push_result(item, false)
+    }
+
+    pub(crate) fn push_data(&self, data: Bytes, end_stream: bool) -> H2BodyDataPush {
+        let (wake_consumer, queued_len) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return H2BodyDataPush::Closed;
             }
+            if state.is_full() {
+                return H2BodyDataPush::Full(data);
+            }
+            let wake_consumer = state.is_empty() || end_stream;
+            state.push_back(Ok(data));
+            if end_stream {
+                state.ended = true;
+            }
+            (wake_consumer, state.len)
+        };
+        if wake_consumer {
+            self.consumer_waker.wake();
+        }
+        H2BodyDataPush::Accepted { queued_len }
+    }
+
+    fn push_result(&self, item: std::result::Result<Bytes, Error>, end_stream: bool) -> H2BodyPush {
+        let wake_consumer = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return H2BodyPush::Closed;
+            }
+            if state.is_full() {
+                return H2BodyPush::Full(item);
+            }
+            let wake_consumer = state.is_empty() || end_stream;
+            state.push_back(item);
+            if end_stream {
+                state.ended = true;
+            }
+            wake_consumer
+        };
+        if wake_consumer {
+            self.consumer_waker.wake();
         }
         H2BodyPush::Accepted
     }
 
+    fn push_error(&self, error: Error) -> H2BodyPush {
+        self.push(Err(error))
+    }
+
     pub(crate) fn finish(&self) {
-        let mut state = self.state.lock().expect("h2 body state poisoned");
-        state.ended = true;
-        if state.slots.is_empty() {
-            if let Some(waker) = state.consumer_waker.as_ref() {
-                waker.wake_by_ref();
-            }
+        let wake_consumer = {
+            let mut state = self.state.lock();
+            state.ended = true;
+            state.is_empty()
+        };
+        if wake_consumer {
+            self.consumer_waker.wake();
         }
     }
 
     pub(crate) fn fail(&self, error: Error) -> H2BodyPush {
-        if self.closed.load(Ordering::Acquire) {
-            return H2BodyPush::Closed;
-        }
-        let mut state = self.state.lock().expect("h2 body state poisoned");
-        if state.closed {
-            return H2BodyPush::Closed;
-        }
-        if state.slots.len() >= state.cap {
-            return H2BodyPush::Full(Err(error));
-        }
-        let should_wake = state.slots.is_empty();
-        state.slots.push_back(Err(error));
-        if should_wake {
-            if let Some(waker) = state.consumer_waker.as_ref() {
-                waker.wake_by_ref();
-            }
-        }
-        H2BodyPush::Accepted
+        self.push_error(error)
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -141,28 +196,29 @@ impl H2BodyShared {
     }
 
     pub(crate) fn is_slot_available(&self) -> bool {
-        let state = self.state.lock().expect("h2 body state poisoned");
-        !state.closed && state.slots.len() < state.cap
+        let state = self.state.lock();
+        !state.closed && !state.is_full()
     }
 
     pub(crate) fn take_released_recv_bytes(&self) -> usize {
-        self.released_recv_bytes.swap(0, Ordering::AcqRel)
-    }
-
-    pub(crate) fn has_released_recv_bytes(&self) -> bool {
-        self.released_recv_bytes.load(Ordering::Acquire) > 0
+        self.released_recv_bytes.swap(0, Ordering::Relaxed)
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().expect("h2 body state poisoned");
-        if !state.closed {
-            state.closed = true;
-            self.closed.store(true, Ordering::Release);
-            if let Some(waker) = state.consumer_waker.take() {
-                waker.wake();
+        let wake_consumer = {
+            let mut state = self.state.lock();
+            if !state.closed {
+                state.closed = true;
+                self.closed.store(true, Ordering::Release);
+                true
+            } else {
+                false
             }
-            self.driver_notify.notify_one();
+        };
+        if wake_consumer {
+            self.consumer_waker.wake();
         }
+        self.driver_notify.notify_one();
     }
 }
 
@@ -174,6 +230,7 @@ pub(crate) struct H2Body {
     total_timeout: Option<Duration>,
     total_sleep: Option<Pin<Box<Sleep>>>,
     terminal: bool,
+    pending_release_bytes: usize,
 }
 
 impl H2Body {
@@ -185,6 +242,7 @@ impl H2Body {
             total_timeout: timeouts.total,
             total_sleep: timeouts.total.map(|duration| Box::pin(sleep(duration))),
             terminal: false,
+            pending_release_bytes: 0,
         }
     }
 
@@ -192,9 +250,29 @@ impl H2Body {
         self.terminal
     }
 
+    #[inline]
     fn reset_read_idle(&mut self) {
         if let Some(duration) = self.read_idle_timeout {
             self.read_idle_sleep = Some(Box::pin(sleep(duration)));
+        }
+    }
+
+    #[inline]
+    fn timeouts_enabled(&self) -> bool {
+        self.total_sleep.is_some() || self.read_idle_timeout.is_some()
+    }
+
+    #[inline]
+    fn release_recv_bytes(&mut self, released: usize, notify_slot_available: bool) {
+        self.pending_release_bytes = self.pending_release_bytes.saturating_add(released);
+        if notify_slot_available || self.pending_release_bytes >= self.shared.release_notify_bytes {
+            let released = std::mem::take(&mut self.pending_release_bytes);
+            if released > 0 {
+                self.shared
+                    .released_recv_bytes
+                    .fetch_add(released, Ordering::Relaxed);
+            }
+            self.shared.driver_notify.notify_one();
         }
     }
 
@@ -238,12 +316,13 @@ impl HttpBody for H2Body {
             Pending,
         }
 
-        let state_poll = {
-            let mut state = self.shared.state.lock().expect("h2 body state poisoned");
-            if let Some(item) = state.slots.pop_front() {
+        let poll_state = |shared: &H2BodyShared| {
+            let mut state = shared.state.lock();
+            let was_full = state.is_full();
+            if let Some(item) = state.pop_front() {
                 StatePoll::Item {
                     item,
-                    notify_slot_available: state.slots.len() + 1 >= state.cap,
+                    notify_slot_available: was_full,
                 }
             } else if let Some(error) = state.terminal_error.take() {
                 state.closed = true;
@@ -252,16 +331,15 @@ impl HttpBody for H2Body {
                 state.closed = true;
                 StatePoll::End
             } else {
-                let replace_waker = state
-                    .consumer_waker
-                    .as_ref()
-                    .is_none_or(|waker| !waker.will_wake(cx.waker()));
-                if replace_waker {
-                    state.consumer_waker = Some(cx.waker().clone());
-                }
                 StatePoll::Pending
             }
         };
+
+        let mut state_poll = poll_state(&self.shared);
+        if matches!(state_poll, StatePoll::Pending) {
+            self.shared.consumer_waker.register(cx.waker());
+            state_poll = poll_state(&self.shared);
+        }
 
         match state_poll {
             StatePoll::Error(error) => {
@@ -279,15 +357,7 @@ impl HttpBody for H2Body {
             } => match item {
                 Ok(bytes) => {
                     let released = bytes.len();
-                    let previous_released = self
-                        .shared
-                        .released_recv_bytes
-                        .fetch_add(released, Ordering::AcqRel);
-                    if notify_slot_available
-                        || previous_released + released >= self.shared.release_notify_bytes
-                    {
-                        self.shared.driver_notify.notify_one();
-                    }
+                    self.release_recv_bytes(released, notify_slot_available);
                     self.reset_read_idle();
                     if bytes.is_empty() {
                         return self.poll_frame(cx);
@@ -302,19 +372,21 @@ impl HttpBody for H2Body {
             },
         }
 
-        if let Some(total_sleep) = self.total_sleep.as_mut() {
-            if total_sleep.as_mut().poll(cx).is_ready() {
-                let duration = self.total_timeout.expect("total sleep without duration");
-                return self.close_with_error(Error::TotalTimeout(duration));
+        if self.timeouts_enabled() {
+            if let Some(total_sleep) = self.total_sleep.as_mut() {
+                if total_sleep.as_mut().poll(cx).is_ready() {
+                    let duration = self.total_timeout.expect("total sleep without duration");
+                    return self.close_with_error(Error::TotalTimeout(duration));
+                }
             }
-        }
 
-        if let Some(read_idle_sleep) = self.read_idle_sleep.as_mut() {
-            if read_idle_sleep.as_mut().poll(cx).is_ready() {
-                let duration = self
-                    .read_idle_timeout
-                    .expect("read-idle sleep without duration");
-                return self.close_with_error(Error::ReadIdleTimeout(duration));
+            if let Some(read_idle_sleep) = self.read_idle_sleep.as_mut() {
+                if read_idle_sleep.as_mut().poll(cx).is_ready() {
+                    let duration = self
+                        .read_idle_timeout
+                        .expect("read-idle sleep without duration");
+                    return self.close_with_error(Error::ReadIdleTimeout(duration));
+                }
             }
         }
 

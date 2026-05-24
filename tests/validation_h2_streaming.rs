@@ -1049,13 +1049,47 @@ fn h2_body_uses_wakeable_slot_not_mpsc() {
 
     let evidence = json!({
         "response_body_variant": "BodyInner::H2",
-        "delivery_state": "H2BodyShared { Mutex<bounded VecDeque slots>, consumer_waker, driver Notify }",
+        "delivery_state": "H2BodyShared { Mutex<bounded ring slots>, AtomicWaker consumer_waker, driver Notify }",
         "driver_delivery_has_mpsc_body_sender": false,
         "pooled_h2_api_returns_body_receiver": false,
         "flow_control_credit_release": "Body poll releases stream WINDOW_UPDATE credit after data is consumed"
     });
     fs::write(
         "target/validation/h2/VAL-H2-023.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn h2_data_hot_path_avoids_noop_async_flow_control_and_per_frame_command_checks() {
+    init_validation_dir();
+    let h2_connection_rs = include_str!("../src/transport/h2/connection.rs");
+    let h2_driver_rs = include_str!("../src/transport/h2/driver.rs");
+
+    assert!(
+        h2_connection_rs.contains("apply_conn_inbound_flow_control_delta"),
+        "connection DATA hot path should expose a synchronous no-update flow-control delta"
+    );
+    assert!(
+        h2_driver_rs.contains("apply_conn_inbound_flow_control_delta(data_len)"),
+        "driver DATA hot path should avoid awaiting connection WINDOW_UPDATE work when no update is due"
+    );
+    assert!(
+        h2_driver_rs.contains("FAST_PATH_COMMAND_CHECK_INTERVAL"),
+        "single-stream fast path should not poll command/inline queues before every DATA frame"
+    );
+    assert!(
+        h2_driver_rs.contains("Ordering::Relaxed"),
+        "body credit atomics should use relaxed ordering on the DATA hot path"
+    );
+    let evidence = json!({
+        "conn_flow_control": "synchronous delta with async WINDOW_UPDATE only when threshold is crossed",
+        "single_stream_fast_path": "batched command/inline queue checks",
+        "body_credit_ordering": "relaxed byte-credit atomics"
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-024.json",
         serde_json::to_string_pretty(&evidence).unwrap(),
     )
     .unwrap();

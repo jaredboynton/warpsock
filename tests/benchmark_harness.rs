@@ -33,6 +33,8 @@ fn streaming_benchmark_declares_enforceable_h1_h2_threshold_gate() {
     assert!(!source.contains("SPECTER_BENCH_FORCE_THRESHOLD_FAIL"));
     assert!(!source.contains("SPECTER_BENCH_REAL"));
     assert!(source.contains("\"localhost_real_measurement\""));
+    assert!(source.contains("\"localhost_paired_real_measurement\""));
+    assert!(source.contains("run_paired_real_measurements"));
 }
 
 #[test]
@@ -45,9 +47,11 @@ fn streaming_benchmark_declares_enforceable_request_body_streaming_gate() {
     assert!(source.contains("struct RequestBodySchedule"));
     assert!(source.contains("request_body_schedule: Some(RequestBodySchedule::standard())"));
     assert!(source.contains("direction: \"request\""));
-    assert!(source.contains("reqwest::Body::wrap_stream"));
+    assert!(source.contains("reqwest::Body::wrap(PacingRequestHttpBody::new(body_stream))"));
+    assert!(source.contains("SizeHint::with_exact(BENCH_REQ_BODY_LEN)"));
     assert!(source.contains("RequestBuilder::body_stream_sized -> send_streaming"));
     assert!(source.contains("run_real_request_body_measurement"));
+    assert!(source.contains("run_paired_request_body_measurements"));
     assert!(source.contains("--response-body-streaming"));
     assert!(source.contains("--request-body-streaming"));
     assert!(source.contains("--self-test-request-threshold-failure"));
@@ -63,6 +67,12 @@ fn streaming_benchmark_declares_enforceable_request_body_streaming_gate() {
     assert!(source.contains("throughput_wilcoxon_signed_rank_p_value < 0.01"));
     assert!(source.contains("request_payload_schedule_ms()"));
     assert!(source.contains("BENCH_REQ_BODY_LEN"));
+    assert!(source.contains("corrected upload-complete TTFT"));
+    assert!(source.contains("used as the request-row threshold denominator"));
+    assert!(
+        source.contains("PacingRequestBodyStream::<specter::Error>::new(\n        stream_anchor")
+    );
+    assert!(source.contains("PacingRequestBodyStream::<io::Error>::new(\n        stream_anchor"));
     assert!(source.contains("response status/headers"));
     assert!(!source.contains("producer-bottlenecked"));
     assert!(!source.contains(
@@ -82,12 +92,15 @@ fn thresholded_streaming_benchmark_uses_delayed_multi_chunk_workload() {
     assert!(source.contains("const BENCH_CHUNK_DELAY_MS: u64 = 1;"));
     assert!(source.contains("payload_schedule_ms = payload_schedule_ms();"));
     assert!(source.contains("let chunk_count = BENCH_CHUNK_COUNT;"));
-    assert!(source.contains(
-        "corrected_client_overhead_duration(body_transfer_duration, payload_schedule_duration)"
-    ));
+    assert!(source.contains("DenominatorEvidence::from_duration_minus_duration("));
+    assert!(source.contains("body_transfer_duration,"));
+    assert!(source.contains("payload_schedule_duration,"));
+    assert!(source.contains("record_response_gap_overheads_by_index"));
     assert!(source.contains("throughput_values.push(bytes as f64 / denominator);"));
-    assert!(source.contains("response rows use first observed response body byte through final observed response body byte"));
-    assert!(source.contains("request rows use first yielded request body chunk through response headers/upload-complete"));
+    assert!(source.contains(
+        "response rows divide decoded response body bytes by final fixture DATA write-stamp to final observed body-chunk delivery overhead"
+    ));
+    assert!(source.contains("request rows divide uploaded request body bytes by corrected upload-complete write-overhead"));
     assert!(source.contains("throughput_improvement_pct >= 5.0"));
     assert!(source.contains("p95_throughput_regression_pct <= 5.0"));
     assert!(source.contains("body_transfer_duration_ns"));
@@ -109,6 +122,8 @@ fn benchmark_fixtures_use_monotonic_deadline_spin_wait_pacing() {
     assert!(source.contains("std::hint::spin_loop()"));
     assert!(source.contains("inter_chunk_target_deadlines_ms"));
     assert!(source.contains("pace_chunk_until(target).await;"));
+    assert!(source.contains("fn bind_tcp_preflight(port: u16)"));
+    assert!(source.contains("socket.set_reuse_address(true)"));
 
     let pattern = ["tokio::time::sleep(Duration::from_millis(", "delay_ms"].join("");
     assert!(
@@ -127,6 +142,10 @@ fn benchmark_fixtures_use_monotonic_deadline_spin_wait_pacing() {
     assert!(
         source.contains("let chunk_send_anchor = Instant::now();"),
         "benchmark fixtures must anchor each stream's chunk emission to a single Instant for drift-free pacing; saw no anchor",
+    );
+    assert!(
+        source.contains("worker_threads = 4"),
+        "streaming benchmark should leave separate workers for fixture, driver, hyper, and measurement tasks",
     );
 }
 
@@ -156,6 +175,18 @@ fn benchmark_harness_tests_do_not_mask_failures_with_tautologies() {
     assert!(!source.contains(&tautology));
 }
 
+#[test]
+fn websocket_benchmark_declares_fastwebsockets_gate() {
+    let source = std::fs::read_to_string("benches/websocket_vs_fastwebsockets.rs").unwrap();
+
+    assert!(source.contains("fastwebsockets_version: \"0.10.0\""));
+    assert!(source.contains("pass_match_or_exceed"));
+    assert!(source.contains("specter.messages_per_sec >= fast.messages_per_sec"));
+    assert!(source.contains("--require-thresholds"));
+    assert!(source.contains("DEFAULT_WARMUP_MESSAGES"));
+    assert!(source.contains("fastwebsockets::WebSocket::after_handshake(stream, Role::Server)"));
+}
+
 #[tokio::test]
 async fn test_h1_streaming_local() {
     let _ = tracing_subscriber::fmt()
@@ -163,9 +194,8 @@ async fn test_h1_streaming_local() {
         .try_init();
 
     // Start H1 server in a background task
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3201")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -184,7 +214,7 @@ async fn test_h1_streaming_local() {
     // High-level send_streaming currently only supports H2, so H1 streaming should fail or fall back.
     // Let's verify that send_streaming returns an error if version is forced to H1.
     let req = client
-        .get("http://127.0.0.1:3201/stream")
+        .get(&format!("http://{addr}/stream"))
         .version(HttpVersion::Http1_1);
     let mut response = req.send_streaming().await.unwrap();
     assert_eq!(response.status().as_u16(), 200);

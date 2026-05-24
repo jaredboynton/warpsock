@@ -7,8 +7,9 @@ use std::time::Duration;
 use streaming_vs_reqwest::{
     body_transfer_duration, corrected_client_overhead_duration, evaluate_comparable_threshold,
     inter_chunk_gaps_ns, pace_chunk_until, paired_wilcoxon_signed_rank_p_value,
-    record_request_sample, record_sample, request_body_transfer_duration, spin_wait_until,
-    summarize_send_gaps, ActualSendGap, DenominatorEvidence, Metrics,
+    record_request_sample, record_sample, request_body_transfer_duration,
+    response_client_overhead_from_gaps, spin_wait_until, summarize_send_gaps, ActualSendGap,
+    DenominatorEvidence, Metrics,
 };
 
 fn metrics(ttft_ns: f64, bytes_per_sec: f64, p95_bytes_per_sec: f64, p95_ns: f64) -> Metrics {
@@ -37,6 +38,7 @@ fn metrics(ttft_ns: f64, bytes_per_sec: f64, p95_bytes_per_sec: f64, p95_ns: f64
         actual_send_gap: ActualSendGap::empty(),
         ttft_samples_ns,
         bytes_per_sec_samples,
+        response_gap_overhead_by_index_ns: Vec::new(),
     }
 }
 
@@ -204,30 +206,87 @@ fn throughput_sample_uses_corrected_client_overhead_duration_not_ttft_or_raw_dur
     let mut chunk_rates = Vec::new();
     let mut body_transfer_duration_values = Vec::new();
     let mut client_overhead_duration_values = Vec::new();
+    let mut client_overhead_unclamped_duration_values = Vec::new();
+    let mut client_overhead_denominator_floor_count = 0;
     let mut send_gap_samples_ns = Vec::new();
 
     record_sample(
         Duration::from_millis(2),
         Duration::from_millis(8),
         Duration::from_millis(7),
+        DenominatorEvidence::from_unclamped_ns(1_000_000.0),
         5 * 1024,
         5,
-        &[1_000_000.0, 1_000_000.0, 1_000_000.0, 1_000_000.0],
+        &[1_250_000.0, 1_250_000.0, 1_250_000.0, 1_250_000.0],
         &mut ttft_values,
         &mut throughput_values,
         &mut chunk_rates,
         &mut body_transfer_duration_values,
         &mut client_overhead_duration_values,
+        &mut client_overhead_unclamped_duration_values,
+        &mut client_overhead_denominator_floor_count,
         &mut send_gap_samples_ns,
     );
 
     assert_eq!(ttft_values, vec![2_000_000.0]);
     assert_eq!(body_transfer_duration_values, vec![8_000_000.0]);
     assert_eq!(client_overhead_duration_values, vec![1_000_000.0]);
+    assert_eq!(client_overhead_unclamped_duration_values, vec![1_000_000.0]);
+    assert_eq!(client_overhead_denominator_floor_count, 0);
     assert_eq!(throughput_values.len(), 1);
     assert!((throughput_values[0] - 5_120_000.0).abs() < f64::EPSILON);
     assert!((chunk_rates[0] - 5_000.0).abs() < f64::EPSILON);
     assert_eq!(send_gap_samples_ns.len(), 4);
+}
+
+#[test]
+fn response_gap_overhead_diagnostic_uses_per_gap_pacing_overage_with_floor_evidence() {
+    let evidence =
+        response_client_overhead_from_gaps(&[1_250_000.0, 900_000.0, 1_100_000.0, 1_000_000.0]);
+
+    assert_eq!(evidence.duration, Duration::from_nanos(350_000));
+    assert_eq!(evidence.unclamped_duration_ns, 350_000.0);
+    assert_eq!(evidence.floor_count, 0);
+
+    let floor = response_client_overhead_from_gaps(&[900_000.0, 950_000.0]);
+    assert_eq!(floor.duration, Duration::from_nanos(1));
+    assert_eq!(floor.floor_count, 1);
+}
+
+#[test]
+fn response_throughput_denominator_uses_supplied_delivery_evidence_not_decoded_gap_count() {
+    let mut ttft_values = Vec::new();
+    let mut throughput_values = Vec::new();
+    let mut chunk_rates = Vec::new();
+    let mut body_transfer_duration_values = Vec::new();
+    let mut client_overhead_duration_values = Vec::new();
+    let mut client_overhead_unclamped_duration_values = Vec::new();
+    let mut client_overhead_denominator_floor_count = 0;
+    let mut send_gap_samples_ns = Vec::new();
+
+    record_sample(
+        Duration::from_millis(2),
+        Duration::from_millis(8),
+        Duration::from_millis(7),
+        DenominatorEvidence::from_unclamped_ns(1_000_000.0),
+        5 * 1024,
+        5,
+        &[900_000.0, 950_000.0, 980_000.0, 990_000.0, 995_000.0],
+        &mut ttft_values,
+        &mut throughput_values,
+        &mut chunk_rates,
+        &mut body_transfer_duration_values,
+        &mut client_overhead_duration_values,
+        &mut client_overhead_unclamped_duration_values,
+        &mut client_overhead_denominator_floor_count,
+        &mut send_gap_samples_ns,
+    );
+
+    assert_eq!(client_overhead_duration_values, vec![1_000_000.0]);
+    assert_eq!(client_overhead_unclamped_duration_values, vec![1_000_000.0]);
+    assert_eq!(client_overhead_denominator_floor_count, 0);
+    assert_eq!(throughput_values, vec![5_120_000.0]);
+    assert_eq!(send_gap_samples_ns.len(), 5);
 }
 
 #[test]
@@ -272,7 +331,7 @@ fn request_body_throughput_uses_upload_complete_denominator_and_emits_floor_evid
         &mut send_gap_samples_ns,
     );
 
-    assert_eq!(ttft_values, vec![9_000_000.0]);
+    assert_eq!(ttft_values, vec![1.0]);
     assert_eq!(body_transfer_duration_values, vec![8_000_000.0]);
     assert_eq!(client_overhead_unclamped_duration_values, vec![0.0]);
     assert_eq!(client_overhead_duration_values, vec![1.0]);
@@ -283,6 +342,49 @@ fn request_body_throughput_uses_upload_complete_denominator_and_emits_floor_evid
     assert_eq!(throughput_values, vec![5_120_000_000_000.0]);
     assert_eq!(chunk_rates, vec![5_000_000_000.0]);
     assert_eq!(send_gap_samples_ns.len(), 4);
+}
+
+#[test]
+fn request_body_gate_uses_write_overhead_not_first_to_header_window() {
+    let mut ttft_values = Vec::new();
+    let mut throughput_values = Vec::new();
+    let mut chunk_rates = Vec::new();
+    let mut body_transfer_duration_values = Vec::new();
+    let mut client_overhead_duration_values = Vec::new();
+    let mut client_overhead_unclamped_duration_values = Vec::new();
+    let mut client_overhead_denominator_floor_count = 0;
+    let mut client_write_overhead_duration_values = Vec::new();
+    let mut client_write_overhead_unclamped_duration_values = Vec::new();
+    let mut client_write_overhead_denominator_floor_count = 0;
+    let mut send_gap_samples_ns = Vec::new();
+
+    record_request_sample(
+        Duration::from_millis(20),
+        Duration::from_millis(9),
+        Duration::from_millis(8),
+        DenominatorEvidence::from_unclamped_ns(2_000_000.0),
+        5 * 1024,
+        5,
+        &[],
+        &mut ttft_values,
+        &mut throughput_values,
+        &mut chunk_rates,
+        &mut body_transfer_duration_values,
+        &mut client_overhead_duration_values,
+        &mut client_overhead_unclamped_duration_values,
+        &mut client_overhead_denominator_floor_count,
+        &mut client_write_overhead_duration_values,
+        &mut client_write_overhead_unclamped_duration_values,
+        &mut client_write_overhead_denominator_floor_count,
+        &mut send_gap_samples_ns,
+    );
+
+    assert_eq!(ttft_values, vec![2_000_000.0]);
+    assert_eq!(client_overhead_duration_values, vec![2_000_000.0]);
+    assert_eq!(client_overhead_unclamped_duration_values, vec![2_000_000.0]);
+    assert_eq!(client_overhead_denominator_floor_count, 0);
+    assert!((throughput_values[0] - 2_560_000.0).abs() < f64::EPSILON);
+    assert_eq!(client_write_overhead_duration_values, vec![2_000_000.0]);
 }
 
 #[test]

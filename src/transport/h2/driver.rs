@@ -21,15 +21,17 @@ pub type StreamingHeadersResult = Result<(u16, Vec<(String, String)>)>;
 
 use crate::error::{Error, Result};
 use crate::request::{RequestBody, RequestBodyStream};
-use crate::transport::h2::body::{H2BodyPush, H2BodyShared};
+use crate::transport::h2::body::{H2BodyDataPush, H2BodyPush, H2BodyShared};
 use crate::transport::h2::connection::{
     ControlAction, H2Connection as RawH2Connection, StreamResponse,
 };
 use crate::transport::h2::frame::{flags, ErrorCode, FrameHeader, FrameType};
-use crate::transport::h2::tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
+use crate::transport::h2::tunnel::{H2Tunnel, H2TunnelCredit, H2TunnelEvent, H2TunnelOutbound};
 use crate::transport::h2::H2TransportConfig;
 
 const STREAM_WINDOW_UPDATE_MIN_INCREMENT: usize = 32 * 1024;
+const FAST_PATH_COMMAND_CHECK_INTERVAL: usize = 8;
+const FAST_PATH_BODY_QUEUE_YIELD_FRAME_BUDGET: usize = 2;
 
 /// Command sent from handle to driver
 pub enum DriverCommand {
@@ -258,7 +260,62 @@ impl DriverStreamState {
 
 struct DriverTunnelState {
     inbound_tx: mpsc::Sender<Result<H2TunnelEvent>>,
+    pending_inbound: VecDeque<Result<H2TunnelEvent>>,
     pending_outbound: VecDeque<H2TunnelOutbound>,
+    recv_window: i32,
+    pending_recv_window_update: usize,
+    credit: Arc<H2TunnelCredit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelInboundStatus {
+    Open,
+    Blocked,
+    Closed,
+    Remove,
+}
+
+impl DriverTunnelState {
+    fn push_inbound(&mut self, event: H2TunnelEvent) -> TunnelInboundStatus {
+        let item = Ok(event);
+        if !self.pending_inbound.is_empty() {
+            self.pending_inbound.push_back(item);
+            return TunnelInboundStatus::Open;
+        }
+
+        match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+            TunnelInboundStatus::Blocked => TunnelInboundStatus::Open,
+            status => status,
+        }
+    }
+
+    fn flush_inbound(&mut self) -> TunnelInboundStatus {
+        while let Some(item) = self.pending_inbound.pop_front() {
+            match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+                TunnelInboundStatus::Open => {}
+                TunnelInboundStatus::Blocked => return TunnelInboundStatus::Open,
+                status => return status,
+            }
+        }
+        TunnelInboundStatus::Open
+    }
+
+    fn try_send_inbound(
+        inbound_tx: &mpsc::Sender<Result<H2TunnelEvent>>,
+        pending_inbound: &mut VecDeque<Result<H2TunnelEvent>>,
+        item: Result<H2TunnelEvent>,
+    ) -> TunnelInboundStatus {
+        let remove_after_send = matches!(item, Ok(H2TunnelEvent::EndStream));
+        match inbound_tx.try_send(item) {
+            Ok(()) if remove_after_send => TunnelInboundStatus::Remove,
+            Ok(()) => TunnelInboundStatus::Open,
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                pending_inbound.push_front(item);
+                TunnelInboundStatus::Blocked
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => TunnelInboundStatus::Closed,
+        }
+    }
 }
 
 /// HTTP/2 connection driver that runs in a background task
@@ -370,7 +427,9 @@ where
             // Try to flush any pending data (flow control)
             self.flush_pending_data().await?;
             self.flush_tunnel_data().await?;
+            self.flush_tunnel_inbound().await?;
             self.apply_released_body_credits().await?;
+            self.apply_released_tunnel_credits().await?;
             self.flush_pending_streaming_bodies().await?;
             self.check_keepalive_timeout()?;
             self.refresh_inline_eligibility();
@@ -387,7 +446,6 @@ where
             let keepalive_delay = self.keepalive_delay();
             let retry_streaming_backpressure =
                 self.has_pending_streaming_body() || self.has_request_body_work();
-            let wait_for_body_progress = self.has_body_progress_work();
 
             tokio::select! {
                 biased;
@@ -418,7 +476,7 @@ where
                 }
 
                 // Drain freshly registered inline streams.
-                inline = self.inline_register_rx.recv() => {
+                inline = self.inline_register_rx.recv(), if !self.inline_register_rx.is_closed() => {
                     if let Some(reg) = inline {
                         self.register_inline_stream(reg);
                     }
@@ -462,7 +520,7 @@ where
                     }
                 } => {}
 
-                _ = self.body_progress_notify.notified(), if wait_for_body_progress => {}
+                _ = self.body_progress_notify.notified() => {}
             }
         }
         Ok(())
@@ -562,30 +620,35 @@ where
         };
 
         let mut processed_any = false;
+        let mut frames_since_queue_check = 0usize;
+        let mut queued_data_frames_since_yield = 0usize;
 
         loop {
-            match self.command_rx.try_recv() {
-                Ok(cmd) => {
+            if frames_since_queue_check >= FAST_PATH_COMMAND_CHECK_INTERVAL {
+                frames_since_queue_check = 0;
+                match self.command_rx.try_recv() {
+                    Ok(cmd) => {
+                        self.store_stream_recv_window(stream_id, recv_window);
+                        self.pending_requests.push_back(cmd);
+                        return Ok(true);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.store_stream_recv_window(stream_id, recv_window);
+                        return Ok(processed_any);
+                    }
+                }
+
+                if let Ok(reg) = self.inline_register_rx.try_recv() {
                     self.store_stream_recv_window(stream_id, recv_window);
-                    self.pending_requests.push_back(cmd);
+                    self.register_inline_stream(reg);
                     return Ok(true);
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.store_stream_recv_window(stream_id, recv_window);
-                    return Ok(processed_any);
+
+                if body_shared.is_closed() {
+                    self.cancel_stream_for_dropped_receiver(stream_id).await;
+                    return Ok(true);
                 }
-            }
-
-            if let Ok(reg) = self.inline_register_rx.try_recv() {
-                self.store_stream_recv_window(stream_id, recv_window);
-                self.register_inline_stream(reg);
-                return Ok(true);
-            }
-
-            if body_shared.is_closed() {
-                self.cancel_stream_for_dropped_receiver(stream_id).await;
-                return Ok(true);
             }
 
             let (header, payload) = match self.connection.read_next_frame().await {
@@ -596,6 +659,7 @@ where
                 }
             };
             processed_any = true;
+            frames_since_queue_check += 1;
 
             if header.stream_id == stream_id && header.frame_type == FrameType::Data {
                 let end_stream = (header.flags & flags::END_STREAM) != 0;
@@ -603,36 +667,60 @@ where
                     self.connection
                         .parse_inbound_data_payload(stream_id, header.flags, payload)?;
                 let data_len = data.len();
-                self.connection
-                    .apply_conn_inbound_flow_control(data_len)
-                    .await?;
-
+                let mut should_yield_for_body_queue = false;
+                if let Some(increment) = self
+                    .connection
+                    .apply_conn_inbound_flow_control_delta(data_len)
+                {
+                    self.connection
+                        .send_connection_window_update(increment)
+                        .await?;
+                }
                 if data_len > 0 {
                     recv_window -= data_len as i32;
                 }
-
-                if !data.is_empty() {
-                    match body_shared.push(Ok(data)) {
-                        H2BodyPush::Accepted => {}
-                        H2BodyPush::Full(item) => {
-                            if let Some(stream) = self.streams.get_mut(&stream_id) {
-                                stream.recv_window = recv_window;
-                                stream.pending_streaming_body.push_back(item);
-                                if end_stream {
-                                    stream.pending_streaming_end = true;
-                                }
+                let push = body_shared.push_data(data, end_stream);
+                match push {
+                    H2BodyDataPush::Accepted { queued_len } => {
+                        if queued_len > 1 {
+                            queued_data_frames_since_yield += 1;
+                            should_yield_for_body_queue = queued_data_frames_since_yield
+                                >= FAST_PATH_BODY_QUEUE_YIELD_FRAME_BUDGET;
+                            if should_yield_for_body_queue {
+                                queued_data_frames_since_yield = 0;
                             }
-                            return Ok(true);
+                        } else {
+                            queued_data_frames_since_yield = 0;
                         }
-                        H2BodyPush::Closed => {
-                            self.cancel_stream_for_dropped_receiver(stream_id).await;
-                            return Ok(true);
+                    }
+                    H2BodyDataPush::Full(data) => {
+                        if let Some(stream) = self.streams.get_mut(&stream_id) {
+                            stream.recv_window = recv_window;
+                            stream.pending_streaming_body.push_back(Ok(data));
+                            if end_stream {
+                                stream.pending_streaming_end = true;
+                            }
                         }
+                        return Ok(true);
+                    }
+                    H2BodyDataPush::Closed => {
+                        self.cancel_stream_for_dropped_receiver(stream_id).await;
+                        return Ok(true);
+                    }
+                }
+                if should_yield_for_body_queue {
+                    tokio::task::yield_now().await;
+                    if body_shared.is_closed() {
+                        self.cancel_stream_for_dropped_receiver(stream_id).await;
+                        return Ok(true);
                     }
                 }
 
                 if end_stream {
-                    body_shared.finish();
+                    if data_len == 0 {
+                        body_shared.finish();
+                    }
+                    tokio::task::yield_now().await;
                     self.complete_stream(stream_id);
                     return Ok(true);
                 }
@@ -682,16 +770,6 @@ where
         self.streams
             .values()
             .any(|stream| stream.request_stream.is_some())
-    }
-
-    fn has_body_progress_work(&self) -> bool {
-        self.streams.values().any(|stream| {
-            stream
-                .streaming_body
-                .as_ref()
-                .is_some_and(|body| body.is_closed() || body.has_released_recv_bytes())
-                || stream.request_stream.is_some()
-        })
     }
 
     /// Handle SendRequest command
@@ -897,6 +975,10 @@ where
             Ok((stream_id, end_stream)) => {
                 let (outbound_tx, outbound_rx) = mpsc::channel(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel(32);
+                let initial_window_size = self.connection.local_initial_window_size();
+                let initial_recv_window = initial_window_size as i32;
+                let credit =
+                    H2TunnelCredit::new(self.body_progress_notify.clone(), initial_window_size);
                 if end_stream {
                     let _ = inbound_tx.send(Ok(H2TunnelEvent::EndStream)).await;
                     self.connection.remove_stream(stream_id);
@@ -921,13 +1003,21 @@ where
                         stream_id,
                         DriverTunnelState {
                             inbound_tx,
+                            pending_inbound: VecDeque::new(),
                             pending_outbound: VecDeque::new(),
+                            recv_window: initial_recv_window,
+                            pending_recv_window_update: 0,
+                            credit: credit.clone(),
                         },
                     );
                 }
 
                 if response_tx
-                    .send(Ok(H2Tunnel::new(outbound_tx, inbound_rx)))
+                    .send(Ok(H2Tunnel::new_with_credit(
+                        outbound_tx,
+                        inbound_rx,
+                        credit,
+                    )))
                     .is_err()
                 {
                     tracing::debug!("Tunnel response channel closed after open");
@@ -1233,6 +1323,52 @@ where
         Ok(())
     }
 
+    async fn flush_tunnel_inbound(&mut self) -> Result<()> {
+        if self.tunnels.is_empty() {
+            return Ok(());
+        }
+
+        let stream_ids: Vec<u32> = self.tunnels.keys().copied().collect();
+        for stream_id in stream_ids {
+            let status = self
+                .tunnels
+                .get_mut(&stream_id)
+                .map(DriverTunnelState::flush_inbound)
+                .unwrap_or(TunnelInboundStatus::Open);
+            self.apply_tunnel_inbound_status(stream_id, status).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_tunnel_inbound_status(
+        &mut self,
+        stream_id: u32,
+        status: TunnelInboundStatus,
+    ) -> Result<()> {
+        match status {
+            TunnelInboundStatus::Open | TunnelInboundStatus::Blocked => {}
+            TunnelInboundStatus::Remove => {
+                self.tunnels.remove(&stream_id);
+                self.connection.remove_stream(stream_id);
+                self.process_pending_requests().await?;
+            }
+            TunnelInboundStatus::Closed => {
+                self.tunnels.remove(&stream_id);
+                self.connection.remove_stream(stream_id);
+                if let Err(e) = self
+                    .connection
+                    .send_rst_stream(stream_id, ErrorCode::Cancel)
+                    .await
+                {
+                    tracing::warn!("Failed to send RST_STREAM for dropped tunnel: {:?}", e);
+                }
+                self.process_pending_requests().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_released_body_credits(&mut self) -> Result<()> {
         let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
         for stream_id in stream_ids {
@@ -1263,6 +1399,57 @@ where
                     let increment = stream.pending_recv_window_update.min(u32::MAX as usize);
                     stream.pending_recv_window_update -= increment;
                     stream.recv_window = stream.recv_window.saturating_add(increment as i32);
+                    Some(increment as u32)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(increment) = increment {
+                self.connection
+                    .send_stream_window_update(stream_id, increment)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_released_tunnel_credits(&mut self) -> Result<()> {
+        let stream_ids: Vec<u32> = self.tunnels.keys().copied().collect();
+        for stream_id in stream_ids {
+            let (released, closed) = self
+                .tunnels
+                .get(&stream_id)
+                .map(|tunnel| {
+                    (
+                        tunnel.credit.take_released_recv_bytes(),
+                        tunnel.inbound_tx.is_closed(),
+                    )
+                })
+                .unwrap_or((0, false));
+
+            if closed {
+                self.apply_tunnel_inbound_status(stream_id, TunnelInboundStatus::Closed)
+                    .await?;
+                continue;
+            }
+
+            if released == 0 {
+                continue;
+            }
+
+            let refresh_threshold = self.connection.flow_control_refresh_threshold();
+            let increment = self.tunnels.get_mut(&stream_id).and_then(|tunnel| {
+                tunnel.pending_recv_window_update =
+                    tunnel.pending_recv_window_update.saturating_add(released);
+                let should_update = tunnel.pending_recv_window_update
+                    >= STREAM_WINDOW_UPDATE_MIN_INCREMENT
+                    || tunnel.recv_window < refresh_threshold;
+                if should_update {
+                    let increment = tunnel.pending_recv_window_update.min(u32::MAX as usize);
+                    tunnel.pending_recv_window_update -= increment;
+                    tunnel.recv_window = tunnel.recv_window.saturating_add(increment as i32);
                     Some(increment as u32)
                 } else {
                     None
@@ -1581,23 +1768,35 @@ where
                     self.connection
                         .parse_inbound_data_payload(stream_id, header.flags, payload)?;
                 let data_len = data.len();
-                self.connection
-                    .apply_conn_inbound_flow_control(data_len)
-                    .await?;
+                if let Some(increment) = self
+                    .connection
+                    .apply_conn_inbound_flow_control_delta(data_len)
+                {
+                    self.connection
+                        .send_connection_window_update(increment)
+                        .await?;
+                }
 
                 if let Some(tunnel) = self.tunnels.get_mut(&stream_id) {
+                    if data_len > 0 {
+                        tunnel.recv_window -= data_len as i32;
+                    }
+
+                    let mut status = TunnelInboundStatus::Open;
                     if !data.is_empty() {
-                        let _ = tunnel.inbound_tx.send(Ok(H2TunnelEvent::Data(data))).await;
+                        status = tunnel.push_inbound(H2TunnelEvent::Data(data));
                     }
-                    if end_stream {
-                        let _ = tunnel.inbound_tx.send(Ok(H2TunnelEvent::EndStream)).await;
-                        self.tunnels.remove(&stream_id);
+                    if status == TunnelInboundStatus::Open && end_stream {
+                        status = tunnel.push_inbound(H2TunnelEvent::EndStream);
                     }
+                    self.apply_tunnel_inbound_status(stream_id, status).await?;
                     return Ok(());
                 }
 
                 let mut should_cancel = false;
                 let mut should_complete = false;
+                let mut should_finish_body = false;
+                let mut should_yield_before_complete = false;
 
                 if let Some(stream) = self.streams.get_mut(&stream_id) {
                     if data_len > 0 {
@@ -1607,12 +1806,13 @@ where
                     if let Some(body) = stream.streaming_body.as_ref() {
                         if !data.is_empty() {
                             if stream.pending_streaming_body.is_empty() {
-                                match body.push(Ok(data)) {
-                                    H2BodyPush::Accepted => {}
-                                    H2BodyPush::Full(item) => {
-                                        stream.pending_streaming_body.push_back(item);
+                                let push = body.push_data(data, end_stream);
+                                match push {
+                                    H2BodyDataPush::Accepted { .. } => {}
+                                    H2BodyDataPush::Full(data) => {
+                                        stream.pending_streaming_body.push_back(Ok(data));
                                     }
-                                    H2BodyPush::Closed => {
+                                    H2BodyDataPush::Closed => {
                                         should_cancel = true;
                                     }
                                 }
@@ -1624,6 +1824,8 @@ where
                         if end_stream {
                             if stream.pending_streaming_body.is_empty() {
                                 should_complete = true;
+                                should_finish_body = data_len == 0;
+                                should_yield_before_complete = true;
                             } else {
                                 stream.pending_streaming_end = true;
                             }
@@ -1640,12 +1842,17 @@ where
                 }
 
                 if should_complete {
-                    if let Some(body) = self
-                        .streams
-                        .get(&stream_id)
-                        .and_then(|stream| stream.streaming_body.as_ref())
-                    {
-                        body.finish();
+                    if should_finish_body {
+                        if let Some(body) = self
+                            .streams
+                            .get(&stream_id)
+                            .and_then(|stream| stream.streaming_body.as_ref())
+                        {
+                            body.finish();
+                        }
+                    }
+                    if should_yield_before_complete {
+                        tokio::task::yield_now().await;
                     }
                     self.complete_stream(stream_id);
                 }
@@ -1665,8 +1872,10 @@ where
 
     /// Complete a stream: build response and send
     fn complete_stream(&mut self, stream_id: u32) {
-        self.connection.remove_stream(stream_id);
         if let Some(mut stream) = self.streams.remove(&stream_id) {
+            if !stream.inline {
+                self.connection.remove_stream(stream_id);
+            }
             Self::note_stream_removed(&stream, &self.inline_active);
             if let Some(tx) = stream.response_tx.take() {
                 // If no status was received, this is a protocol violation

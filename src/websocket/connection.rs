@@ -12,6 +12,8 @@ use crate::websocket::frame::{decode_frame, encode_frame, FrameConfig, FrameDeco
 use crate::websocket::message::{CloseFrame, Message};
 use crate::websocket::WebSocketConfig;
 
+const READ_CHUNK_SIZE: usize = 16 * 1024;
+
 #[derive(Debug)]
 pub struct WebSocket {
     stream: MaybeHttpsStream,
@@ -115,12 +117,12 @@ impl WebSocket {
                     None => {}
                 }
             } else {
-                let mut scratch = [0_u8; 8192];
+                self.read_buffer.reserve(READ_CHUNK_SIZE);
                 let n = Self::io_with_timeout(
                     &self.url,
                     self.read_timeout,
                     "read",
-                    self.stream.read(&mut scratch),
+                    self.stream.read_buf(&mut self.read_buffer),
                 )
                 .await?;
                 if n == 0 {
@@ -130,7 +132,6 @@ impl WebSocket {
                         Err(WebSocketError::connection_closed(&self.url))
                     };
                 }
-                self.read_buffer.extend_from_slice(&scratch[..n]);
             }
         }
     }
@@ -167,8 +168,7 @@ impl WebSocket {
             "write",
             self.stream.write_all(&bytes),
         )
-        .await?;
-        Self::io_with_timeout(&self.url, self.write_timeout, "flush", self.stream.flush()).await
+        .await
     }
 
     async fn write_control(&mut self, opcode: OpCode, payload: &[u8]) -> WebSocketResult<()> {
@@ -178,7 +178,8 @@ impl WebSocket {
                 "control frame payload exceeds 125 bytes",
             ));
         }
-        self.write_frame(opcode, payload).await
+        self.write_frame(opcode, payload).await?;
+        Self::io_with_timeout(&self.url, self.write_timeout, "flush", self.stream.flush()).await
     }
 
     async fn send_close_raw(&mut self, frame: Option<CloseFrame>) -> WebSocketResult<()> {

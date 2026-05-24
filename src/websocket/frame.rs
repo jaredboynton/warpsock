@@ -150,18 +150,18 @@ impl FrameDecoder {
 }
 
 pub(crate) fn encode_frame(opcode: OpCode, payload: &[u8], mask: bool) -> WebSocketResult<Bytes> {
-    let mut out = Vec::with_capacity(14 + payload.len());
-    out.push(0x80 | opcode as u8);
+    let mut out = BytesMut::with_capacity(14 + payload.len());
+    out.extend_from_slice(&[0x80 | opcode as u8]);
 
     let mask_bit = if mask { 0x80 } else { 0 };
     match payload.len() {
-        0..=125 => out.push(mask_bit | payload.len() as u8),
+        0..=125 => out.extend_from_slice(&[mask_bit | payload.len() as u8]),
         126..=65535 => {
-            out.push(mask_bit | 126);
+            out.extend_from_slice(&[mask_bit | 126]);
             out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         }
         _ => {
-            out.push(mask_bit | 127);
+            out.extend_from_slice(&[mask_bit | 127]);
             out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         }
     }
@@ -173,17 +173,24 @@ pub(crate) fn encode_frame(opcode: OpCode, payload: &[u8], mask: bool) -> WebSoc
             message: format!("failed to generate frame mask: {e}"),
         })?;
         out.extend_from_slice(&key);
-        out.extend(
-            payload
-                .iter()
-                .enumerate()
-                .map(|(i, byte)| byte ^ key[i % 4]),
-        );
+        let payload_start = out.len();
+        out.extend_from_slice(payload);
+        let masked_payload = &mut out[payload_start..];
+        let mut chunks = masked_payload.chunks_exact_mut(4);
+        for chunk in &mut chunks {
+            chunk[0] ^= key[0];
+            chunk[1] ^= key[1];
+            chunk[2] ^= key[2];
+            chunk[3] ^= key[3];
+        }
+        for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+            *byte ^= key[index];
+        }
     } else {
         out.extend_from_slice(payload);
     }
 
-    Ok(Bytes::from(out))
+    Ok(out.freeze())
 }
 
 pub(crate) fn decode_frame(

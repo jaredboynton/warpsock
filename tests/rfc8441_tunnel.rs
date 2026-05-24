@@ -2,9 +2,9 @@ use bytes::Bytes;
 use http::Uri;
 use specter::fingerprint::http2::Http2Settings;
 use specter::transport::h2::{
-    flags, DriverCommand, FrameHeader, FrameType, H2Driver, H2Handle, H2TransportConfig,
-    H2TunnelEvent, PseudoHeaderOrder, RawH2Connection, SettingsFrame, CONNECTION_PREFACE,
-    FRAME_HEADER_SIZE,
+    flags, DataFrame, DriverCommand, FrameHeader, FrameType, H2Driver, H2Handle, H2TransportConfig,
+    H2TunnelEvent, PseudoHeaderOrder, RawH2Connection, SettingsFrame, WindowUpdateFrame,
+    CONNECTION_PREFACE, FRAME_HEADER_SIZE,
 };
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
@@ -96,16 +96,21 @@ async fn write_headers(
 }
 
 fn spawn_driver() -> (H2Handle, DuplexStream, tokio::task::JoinHandle<()>) {
+    spawn_driver_with_settings(Http2Settings::default())
+}
+
+fn spawn_driver_with_settings(
+    settings: Http2Settings,
+) -> (H2Handle, DuplexStream, tokio::task::JoinHandle<()>) {
     let (client, server) = duplex(8192);
     let (command_tx, command_rx) = mpsc::channel(8);
     let goaway_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = H2Handle::new(command_tx.clone(), goaway_received.clone());
     let driver_command_tx = command_tx;
     let driver_task = tokio::spawn(async move {
-        let conn =
-            RawH2Connection::connect(client, Http2Settings::default(), PseudoHeaderOrder::Chrome)
-                .await
-                .unwrap();
+        let conn = RawH2Connection::connect(client, settings, PseudoHeaderOrder::Chrome)
+            .await
+            .unwrap();
         let driver = H2Driver::new(
             conn,
             driver_command_tx,
@@ -297,6 +302,124 @@ async fn rfc8441_tunnel_send_bytes_wakes_idle_driver() {
     assert_eq!(data.flags & flags::END_STREAM, 0);
 
     drop(tunnel);
+    driver_task.abort();
+}
+
+#[tokio::test]
+async fn rfc8441_tunnel_inbound_data_releases_stream_window() {
+    let mut settings = Http2Settings::default();
+    settings.initial_window_size = 20 * 1024;
+    let (handle, mut server, mut driver_task) = spawn_driver_with_settings(settings);
+    let uri: Uri = "wss://example.com/chat".parse().unwrap();
+
+    read_client_preface_and_settings(&mut server).await;
+    write_settings(&mut server, &[(0x8, 1), (0x3, 100)]).await;
+
+    let open = tokio::spawn(async move { handle.open_websocket_tunnel(uri, vec![]).await });
+    let (headers, _) = read_headers_frame(&mut server).await;
+    write_headers(&mut server, headers.stream_id, &[0x88], false).await;
+
+    let mut tunnel = timeout(Duration::from_secs(1), open)
+        .await
+        .expect("tunnel open must not hang")
+        .unwrap()
+        .expect("status 200 should return a tunnel");
+
+    let first = Bytes::from(vec![b'a'; 4 * 1024]);
+    let second = Bytes::from(vec![b'b'; 4 * 1024]);
+    server
+        .write_all(&DataFrame::new(headers.stream_id, first.clone()).serialize())
+        .await
+        .unwrap();
+    server.flush().await.unwrap();
+    let first_received = tokio::select! {
+        event = tunnel.recv_bytes() => event
+            .expect("first inbound tunnel DATA channel should stay open")
+            .expect("first inbound tunnel DATA event"),
+        result = &mut driver_task => panic!("driver exited before first inbound DATA: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            panic!("first inbound tunnel DATA should arrive")
+        }
+    };
+    assert_eq!(first_received, first);
+
+    server
+        .write_all(&DataFrame::new(headers.stream_id, second.clone()).serialize())
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), tunnel.recv_bytes())
+            .await
+            .expect("second inbound tunnel DATA should arrive")
+            .unwrap()
+            .expect("second inbound tunnel DATA event"),
+        second
+    );
+
+    let stream_window_update = timeout(Duration::from_secs(1), async {
+        loop {
+            let (header, payload) = read_non_ack_frame(&mut server).await;
+            if header.frame_type == FrameType::WindowUpdate && header.stream_id == headers.stream_id
+            {
+                break WindowUpdateFrame::parse(header.stream_id, payload)
+                    .expect("valid stream WINDOW_UPDATE");
+            }
+        }
+    })
+    .await
+    .expect("inbound tunnel bytes should release stream receive credit");
+
+    assert_eq!(stream_window_update.stream_id, headers.stream_id);
+    assert_eq!(stream_window_update.increment, 8 * 1024);
+
+    drop(tunnel);
+    driver_task.abort();
+}
+
+#[tokio::test]
+async fn rfc8441_slow_tunnel_consumer_does_not_block_driver() {
+    let (handle, mut server, driver_task) = spawn_driver();
+    let first_uri: Uri = "wss://example.com/slow".parse().unwrap();
+    let second_uri: Uri = "wss://example.com/fast".parse().unwrap();
+
+    read_client_preface_and_settings(&mut server).await;
+    write_settings(&mut server, &[(0x8, 1), (0x3, 100)]).await;
+
+    let first_handle = handle.clone();
+    let first_open =
+        tokio::spawn(async move { first_handle.open_websocket_tunnel(first_uri, vec![]).await });
+    let (first_headers, _) = read_headers_frame(&mut server).await;
+    write_headers(&mut server, first_headers.stream_id, &[0x88], false).await;
+    let first_tunnel = timeout(Duration::from_secs(1), first_open)
+        .await
+        .expect("first tunnel open must not hang")
+        .unwrap()
+        .expect("first tunnel should open");
+
+    for _ in 0..33 {
+        server
+            .write_all(
+                &DataFrame::new(first_headers.stream_id, Bytes::from_static(b"x")).serialize(),
+            )
+            .await
+            .unwrap();
+    }
+    server.flush().await.unwrap();
+
+    let second_open =
+        tokio::spawn(async move { handle.open_websocket_tunnel(second_uri, vec![]).await });
+    let (second_headers, _) = timeout(Duration::from_secs(1), read_headers_frame(&mut server))
+        .await
+        .expect("driver must still send new tunnel HEADERS while first tunnel consumer is idle");
+    write_headers(&mut server, second_headers.stream_id, &[0x88], false).await;
+    let second_tunnel = timeout(Duration::from_secs(1), second_open)
+        .await
+        .expect("second tunnel open must not hang")
+        .unwrap()
+        .expect("second tunnel should open");
+
+    drop(first_tunnel);
+    drop(second_tunnel);
     driver_task.abort();
 }
 

@@ -15,7 +15,11 @@ use crate::error::{Error, Result};
 use crate::fingerprint::http2::Http2Settings;
 use crate::response::Response as SpecterResponse;
 
-use super::frame::*;
+use super::frame::{
+    flags, ContinuationFrame, DataFrame, ErrorCode, FrameHeader, FrameType, GoAwayFrame,
+    HeadersFrame, PingFrame, PriorityFrame, PushPromiseFrame, RstStreamFrame, SettingsFrame,
+    SettingsId, WindowUpdateFrame, CONNECTION_PREFACE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_SIZE,
+};
 use super::hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};
 use super::hpack_impl::Encoder as RawHpackEncoder;
 use super::write_half::H2WriteHalf;
@@ -237,7 +241,7 @@ where
             conn_recv_window: (DEFAULT_INITIAL_WINDOW_SIZE + settings.initial_window_update) as i32,
             peer_settings: PeerSettings::default(),
             peer_max_frame_size: Arc::new(AtomicU32::new(DEFAULT_MAX_FRAME_SIZE)),
-            read_buf: BytesMut::with_capacity(16384),
+            read_buf: BytesMut::with_capacity(DEFAULT_MAX_FRAME_SIZE as usize + FRAME_HEADER_SIZE),
             pending_headers: None,
             goaway_last_stream_id: None,
         };
@@ -935,13 +939,24 @@ where
     /// that own their own `recv_window` use this to keep connection-level
     /// flow control correct without re-entering `self.streams`.
     pub async fn apply_conn_inbound_flow_control(&mut self, data_len: usize) -> Result<()> {
+        if let Some(increment) = self.apply_conn_inbound_flow_control_delta(data_len) {
+            self.send_window_update(0, increment).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply connection-level inbound flow-control bookkeeping without
+    /// awaiting. Returns the connection WINDOW_UPDATE increment when the
+    /// refresh threshold is crossed.
+    pub fn apply_conn_inbound_flow_control_delta(&mut self, data_len: usize) -> Option<u32> {
         self.conn_recv_window -= data_len as i32;
         if self.conn_recv_window < WINDOW_UPDATE_THRESHOLD {
             let increment = DEFAULT_INITIAL_WINDOW_SIZE;
-            self.send_window_update(0, increment).await?;
             self.conn_recv_window += increment as i32;
+            Some(increment)
+        } else {
+            None
         }
-        Ok(())
     }
 
     /// Send a stream-level WINDOW_UPDATE without touching `self.streams`.
@@ -953,6 +968,13 @@ where
         increment: u32,
     ) -> Result<()> {
         self.send_window_update(stream_id, increment).await
+    }
+
+    /// Send a connection-level WINDOW_UPDATE after synchronous DATA
+    /// bookkeeping reports that the connection window crossed its refresh
+    /// threshold.
+    pub async fn send_connection_window_update(&mut self, increment: u32) -> Result<()> {
+        self.send_window_update(0, increment).await
     }
 
     /// Locally configured initial window size used when a new stream is

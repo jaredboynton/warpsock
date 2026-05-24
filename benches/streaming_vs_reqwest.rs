@@ -1,6 +1,7 @@
 use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use bytes::Bytes;
 use futures_core::Stream;
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use quiche::h3::NameValue;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -12,7 +13,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +41,15 @@ const FIXTURE_PACING_MODE: &str = "monotonic_deadline_spin_wait";
 const FIXTURE_MONOTONIC_CLOCK_SOURCE: &str = "std::time::Instant";
 const PACING_SPIN_LEAD_IN: Duration = Duration::from_micros(150);
 const DENOMINATOR_FLOOR_NS: f64 = 1.0;
+const FIXTURE_CHUNK_MAGIC: &[u8; 4] = b"SPCT";
+const FIXTURE_CHUNK_STAMP_LEN: usize = 16;
+
+static FIXTURE_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[inline]
+fn fixture_epoch() -> Instant {
+    *FIXTURE_EPOCH.get_or_init(Instant::now)
+}
 
 #[inline]
 pub(crate) fn spin_wait_until(target: Instant) {
@@ -54,6 +64,51 @@ pub(crate) async fn pace_chunk_until(target: Instant) {
         tokio::task::yield_now().await;
     }
     spin_wait_until(target);
+}
+
+fn stamp_fixture_chunk(chunk: &mut [u8], index: usize) {
+    if chunk.len() < FIXTURE_CHUNK_STAMP_LEN {
+        return;
+    }
+    let send_offset_ns = fixture_epoch().elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    chunk[..4].copy_from_slice(FIXTURE_CHUNK_MAGIC);
+    chunk[4] = index.min(u8::MAX as usize) as u8;
+    chunk[5] = BENCH_CHUNK_COUNT.min(u8::MAX as usize) as u8;
+    chunk[6] = 0;
+    chunk[7] = 0;
+    chunk[8..16].copy_from_slice(&send_offset_ns.to_be_bytes());
+}
+
+fn final_fixture_chunk_delivery_overhead_ns(
+    data: &[u8],
+    body_offset: usize,
+    receive_offset_ns: f64,
+) -> Option<f64> {
+    if data.len() < FIXTURE_CHUNK_STAMP_LEN {
+        return None;
+    }
+
+    let mut final_overhead = None;
+    for local_offset in 0..data.len() {
+        let absolute_offset = body_offset + local_offset;
+        if absolute_offset % BENCH_CHUNK_SIZE != 0 {
+            continue;
+        }
+        let end = local_offset + FIXTURE_CHUNK_STAMP_LEN;
+        if end > data.len() || &data[local_offset..local_offset + 4] != FIXTURE_CHUNK_MAGIC {
+            continue;
+        }
+        let index = data[local_offset + 4] as usize;
+        let count = data[local_offset + 5] as usize;
+        if count != BENCH_CHUNK_COUNT || index + 1 != count {
+            continue;
+        }
+        let mut send_offset_bytes = [0u8; 8];
+        send_offset_bytes.copy_from_slice(&data[local_offset + 8..end]);
+        let send_offset_ns = u64::from_be_bytes(send_offset_bytes) as f64;
+        final_overhead = Some((receive_offset_ns - send_offset_ns).max(0.0));
+    }
+    final_overhead
 }
 
 #[inline]
@@ -247,6 +302,8 @@ pub(crate) struct Metrics {
     pub(crate) ttft_samples_ns: Vec<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) bytes_per_sec_samples: Vec<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) response_gap_overhead_by_index_ns: Vec<f64>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -347,6 +404,7 @@ impl Metrics {
             actual_send_gap: ActualSendGap::empty(),
             ttft_samples_ns: Vec::new(),
             bytes_per_sec_samples: Vec::new(),
+            response_gap_overhead_by_index_ns: Vec::new(),
         }
     }
 
@@ -373,6 +431,7 @@ impl Metrics {
             actual_send_gap: ActualSendGap::empty(),
             ttft_samples_ns: Vec::new(),
             bytes_per_sec_samples: Vec::new(),
+            response_gap_overhead_by_index_ns: Vec::new(),
         }
     }
 }
@@ -523,12 +582,13 @@ struct PacingRequestBodyStream<E> {
 
 impl<E> PacingRequestBodyStream<E> {
     fn new(
+        anchor: Instant,
         observed_chunk_offsets_ns: Arc<Mutex<Vec<f64>>>,
         consumed_chunk_offsets_ns: Arc<Mutex<Vec<f64>>>,
     ) -> Self {
         Self {
             chunk_index: 0,
-            anchor: Instant::now(),
+            anchor,
             observed_chunk_offsets_ns,
             consumed_chunk_offsets_ns,
             last_yield_index: None,
@@ -581,6 +641,39 @@ impl<E> Stream for PacingRequestBodyStream<E> {
         Poll::Ready(Some(Ok(Bytes::from(vec![b'u'; BENCH_REQ_CHUNK_SIZE]))))
     }
 }
+
+struct PacingRequestHttpBody<E> {
+    stream: PacingRequestBodyStream<E>,
+}
+
+impl<E> PacingRequestHttpBody<E> {
+    fn new(stream: PacingRequestBodyStream<E>) -> Self {
+        Self { stream }
+    }
+}
+
+impl<E> HttpBody for PacingRequestHttpBody<E> {
+    type Data = Bytes;
+    type Error = E;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(BENCH_REQ_BODY_LEN)
+    }
+}
+
+impl<E> Unpin for PacingRequestHttpBody<E> {}
 
 impl Drop for Fixtures {
     fn drop(&mut self) {
@@ -788,7 +881,7 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
                         return;
                     }
 
-                    let chunk_data = vec![b'a'; chunk_size];
+                    let mut chunk_data = vec![b'a'; chunk_size];
                     let chunk_send_anchor = Instant::now();
                     for i in 0..chunk_count {
                         if i > 0 {
@@ -796,6 +889,7 @@ async fn handle_h1_connection(mut stream: tokio::net::TcpStream) {
                                 + Duration::from_millis(delay_ms.saturating_mul(i as u64));
                             pace_chunk_until(target).await;
                         }
+                        stamp_fixture_chunk(&mut chunk_data, i);
                         if stream.write_all(&chunk_data).await.is_err() {
                             return;
                         }
@@ -924,6 +1018,7 @@ async fn handle_h2_connection<
     // consumed for upload accounting instead of echoed back as response body.
     let mut upload_streams: HashSet<u32> = HashSet::new();
     let mut upload_bytes: HashMap<u32, u64> = HashMap::new();
+    let mut response_chunk_indices: HashMap<u32, usize> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1007,7 +1102,14 @@ async fn handle_h2_connection<
                                         pace_chunk_until(target).await;
                                     }
                                     let end_stream = i == chunk_count - 1;
-                                    let _ = tx_clone.send((0x00, if end_stream { 0x01 } else { 0x00 }, stream_id, chunk_data.clone())).await;
+                                    let _ = tx_clone
+                                        .send((
+                                            0x00,
+                                            if end_stream { 0x01 } else { 0x00 },
+                                            stream_id,
+                                            chunk_data.clone(),
+                                        ))
+                                        .await;
                                 }
                             });
                         }
@@ -1051,7 +1153,15 @@ async fn handle_h2_connection<
                     _ => {}
                 }
             }
-            Some((frame_type, flags, stream_id, payload)) = rx.recv() => {
+            Some((frame_type, flags, stream_id, mut payload)) = rx.recv() => {
+                if frame_type == 0x00 && payload.len() == BENCH_CHUNK_SIZE {
+                    let chunk_index = response_chunk_indices.entry(stream_id).or_insert(0);
+                    stamp_fixture_chunk(&mut payload, *chunk_index);
+                    *chunk_index = (*chunk_index).saturating_add(1);
+                    if flags & 0x01 != 0 {
+                        response_chunk_indices.remove(&stream_id);
+                    }
+                }
                 if conn.send_frame(frame_type, flags, stream_id, &payload).await.is_err() {
                     break;
                 }
@@ -1363,7 +1473,7 @@ async fn start_h3_server(
     })
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let options = parse_options(&args);
@@ -1455,10 +1565,18 @@ fn option_value(args: &[String], name: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn bind_tcp_preflight(port: u16) -> io::Result<StdTcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    socket.listen(1)?;
+    Ok(StdTcpListener::from(socket))
+}
+
 fn preflight_ports() -> io::Result<PortCheck> {
     for port in 3200..=3299 {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if let Ok(listener) = StdTcpListener::bind(addr) {
+        if let Ok(listener) = bind_tcp_preflight(port) {
             drop(listener);
         } else {
             return Err(io::Error::new(
@@ -1506,7 +1624,17 @@ async fn measure_specter_streaming(
     protocol: &str,
     client: &specter::Client,
     url: &str,
-) -> Result<(Duration, Duration, usize, usize, Vec<f64>), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Duration,
+        Duration,
+        DenominatorEvidence,
+        usize,
+        usize,
+        Vec<f64>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let start = std::time::Instant::now();
     let mut request = client.get(url);
     if protocol == "h3" {
@@ -1519,14 +1647,23 @@ async fn measure_specter_streaming(
     let mut bytes_received = 0;
     let mut chunk_count = 0;
     let mut chunk_offsets_ns: Vec<f64> = Vec::with_capacity(BENCH_CHUNK_COUNT);
+    let mut final_delivery_overhead_ns = None;
 
     while let Some(frame_res) = response.body_mut().frame().await {
         let elapsed = start.elapsed();
+        let receive_offset_ns = fixture_epoch().elapsed().as_nanos() as f64;
         if first_chunk_time.is_none() {
             first_chunk_time = Some(elapsed);
         }
         if let Ok(frame) = frame_res {
             if let Ok(chunk) = frame.into_data() {
+                if let Some(overhead_ns) = final_fixture_chunk_delivery_overhead_ns(
+                    &chunk,
+                    bytes_received,
+                    receive_offset_ns,
+                ) {
+                    final_delivery_overhead_ns = Some(overhead_ns);
+                }
                 bytes_received += chunk.len();
                 chunk_count += 1;
                 last_chunk_time = Some(elapsed);
@@ -1538,9 +1675,17 @@ async fn measure_specter_streaming(
     let ttft = first_chunk_time.unwrap_or_else(|| start.elapsed());
     let transfer_duration = body_transfer_duration(first_chunk_time, last_chunk_time);
     let gaps_ns = inter_chunk_gaps_ns(&chunk_offsets_ns);
+    let fallback_overhead = DenominatorEvidence::from_duration_minus_duration(
+        transfer_duration,
+        payload_schedule_duration(&payload_schedule_ms(), 1),
+    );
+    let delivery_overhead = final_delivery_overhead_ns
+        .map(DenominatorEvidence::from_unclamped_ns)
+        .unwrap_or(fallback_overhead);
     Ok((
         ttft,
         transfer_duration,
+        delivery_overhead,
         bytes_received,
         chunk_count,
         gaps_ns,
@@ -1550,7 +1695,17 @@ async fn measure_specter_streaming(
 async fn measure_reqwest_streaming(
     client: &reqwest::Client,
     url: &str,
-) -> Result<(Duration, Duration, usize, usize, Vec<f64>), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Duration,
+        Duration,
+        DenominatorEvidence,
+        usize,
+        usize,
+        Vec<f64>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let start = std::time::Instant::now();
     let mut response = client.get(url).send().await?;
     let mut first_chunk_time = None;
@@ -1558,11 +1713,18 @@ async fn measure_reqwest_streaming(
     let mut bytes_received = 0;
     let mut chunk_count = 0;
     let mut chunk_offsets_ns: Vec<f64> = Vec::with_capacity(BENCH_CHUNK_COUNT);
+    let mut final_delivery_overhead_ns = None;
 
     while let Some(chunk) = response.chunk().await? {
         let elapsed = start.elapsed();
+        let receive_offset_ns = fixture_epoch().elapsed().as_nanos() as f64;
         if first_chunk_time.is_none() {
             first_chunk_time = Some(elapsed);
+        }
+        if let Some(overhead_ns) =
+            final_fixture_chunk_delivery_overhead_ns(&chunk, bytes_received, receive_offset_ns)
+        {
+            final_delivery_overhead_ns = Some(overhead_ns);
         }
         bytes_received += chunk.len();
         chunk_count += 1;
@@ -1573,9 +1735,17 @@ async fn measure_reqwest_streaming(
     let ttft = first_chunk_time.unwrap_or_else(|| start.elapsed());
     let transfer_duration = body_transfer_duration(first_chunk_time, last_chunk_time);
     let gaps_ns = inter_chunk_gaps_ns(&chunk_offsets_ns);
+    let fallback_overhead = DenominatorEvidence::from_duration_minus_duration(
+        transfer_duration,
+        payload_schedule_duration(&payload_schedule_ms(), 1),
+    );
+    let delivery_overhead = final_delivery_overhead_ns
+        .map(DenominatorEvidence::from_unclamped_ns)
+        .unwrap_or(fallback_overhead);
     Ok((
         ttft,
         transfer_duration,
+        delivery_overhead,
         bytes_received,
         chunk_count,
         gaps_ns,
@@ -1602,6 +1772,7 @@ pub(crate) fn body_transfer_duration(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn corrected_client_overhead_duration(
     body_transfer_duration: Duration,
     payload_schedule_duration: Duration,
@@ -1611,6 +1782,20 @@ pub(crate) fn corrected_client_overhead_duration(
         payload_schedule_duration,
     )
     .duration
+}
+
+#[allow(dead_code)]
+pub(crate) fn response_client_overhead_from_gaps(
+    inter_chunk_gaps_ns: &[f64],
+) -> DenominatorEvidence {
+    let target_gap_ns = (BENCH_CHUNK_DELAY_MS as f64) * 1_000_000.0;
+    let overhead_ns = inter_chunk_gaps_ns
+        .iter()
+        .copied()
+        .filter(|gap| gap.is_finite())
+        .map(|gap| (gap - target_gap_ns).max(0.0))
+        .sum::<f64>();
+    DenominatorEvidence::from_unclamped_ns(overhead_ns)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1635,6 +1820,7 @@ impl DenominatorEvidence {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_duration_minus_duration(duration: Duration, subtract: Duration) -> Self {
         Self::from_unclamped_ns(duration.as_nanos() as f64 - subtract.as_nanos() as f64)
     }
@@ -1676,18 +1862,30 @@ async fn measure_specter_streaming_batch(
     client: &specter::Client,
     url: &str,
     request_count: usize,
-) -> Result<(Duration, Duration, usize, usize, Vec<f64>), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Duration,
+        Duration,
+        DenominatorEvidence,
+        usize,
+        usize,
+        Vec<f64>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut ttft_values = Vec::with_capacity(request_count);
     let mut transfer_duration = Duration::ZERO;
+    let mut delivery_overhead = DenominatorEvidence::zero();
     let mut bytes_received = 0;
     let mut chunk_count = 0;
     let mut all_gaps_ns: Vec<f64> = Vec::with_capacity(request_count * BENCH_CHUNK_COUNT);
 
     for _ in 0..request_count {
-        let (ttft, request_duration, bytes, chunks, gaps_ns) =
+        let (ttft, request_duration, request_delivery_overhead, bytes, chunks, gaps_ns) =
             measure_specter_streaming(protocol, client, url).await?;
         ttft_values.push(ttft.as_nanos() as f64);
         transfer_duration += request_duration;
+        delivery_overhead = delivery_overhead.add(request_delivery_overhead);
         bytes_received += bytes;
         chunk_count += chunks;
         all_gaps_ns.extend(gaps_ns);
@@ -1699,6 +1897,7 @@ async fn measure_specter_streaming_batch(
     Ok((
         ttft,
         total_duration,
+        delivery_overhead,
         bytes_received,
         chunk_count,
         all_gaps_ns,
@@ -1709,18 +1908,30 @@ async fn measure_reqwest_streaming_batch(
     client: &reqwest::Client,
     url: &str,
     request_count: usize,
-) -> Result<(Duration, Duration, usize, usize, Vec<f64>), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Duration,
+        Duration,
+        DenominatorEvidence,
+        usize,
+        usize,
+        Vec<f64>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut ttft_values = Vec::with_capacity(request_count);
     let mut transfer_duration = Duration::ZERO;
+    let mut delivery_overhead = DenominatorEvidence::zero();
     let mut bytes_received = 0;
     let mut chunk_count = 0;
     let mut all_gaps_ns: Vec<f64> = Vec::with_capacity(request_count * BENCH_CHUNK_COUNT);
 
     for _ in 0..request_count {
-        let (ttft, request_duration, bytes, chunks, gaps_ns) =
+        let (ttft, request_duration, request_delivery_overhead, bytes, chunks, gaps_ns) =
             measure_reqwest_streaming(client, url).await?;
         ttft_values.push(ttft.as_nanos() as f64);
         transfer_duration += request_duration;
+        delivery_overhead = delivery_overhead.add(request_delivery_overhead);
         bytes_received += bytes;
         chunk_count += chunks;
         all_gaps_ns.extend(gaps_ns);
@@ -1732,6 +1943,7 @@ async fn measure_reqwest_streaming_batch(
     Ok((
         ttft,
         total_duration,
+        delivery_overhead,
         bytes_received,
         chunk_count,
         all_gaps_ns,
@@ -1813,11 +2025,12 @@ async fn measure_specter_request_streaming(
 > {
     let observed_offsets = Arc::new(Mutex::new(Vec::with_capacity(BENCH_REQ_CHUNK_COUNT)));
     let consumed_offsets = Arc::new(Mutex::new(Vec::with_capacity(BENCH_REQ_CHUNK_COUNT)));
+    let stream_anchor = Instant::now();
     let body_stream = PacingRequestBodyStream::<specter::Error>::new(
+        stream_anchor,
         observed_offsets.clone(),
         consumed_offsets.clone(),
     );
-    let stream_anchor = Instant::now();
     let mut request = client
         .post(url)
         .body_stream_sized(body_stream, BENCH_REQ_BODY_LEN);
@@ -1876,14 +2089,15 @@ async fn measure_reqwest_request_streaming(
 > {
     let observed_offsets = Arc::new(Mutex::new(Vec::with_capacity(BENCH_REQ_CHUNK_COUNT)));
     let consumed_offsets = Arc::new(Mutex::new(Vec::with_capacity(BENCH_REQ_CHUNK_COUNT)));
+    let stream_anchor = Instant::now();
     let body_stream = PacingRequestBodyStream::<io::Error>::new(
+        stream_anchor,
         observed_offsets.clone(),
         consumed_offsets.clone(),
     );
-    let stream_anchor = Instant::now();
     let mut response = client
         .post(url)
-        .body(reqwest::Body::wrap_stream(body_stream))
+        .body(reqwest::Body::wrap(PacingRequestHttpBody::new(body_stream)))
         .send()
         .await?;
     let response_headers_offset_ns = stream_anchor.elapsed().as_nanos() as f64;
@@ -2073,7 +2287,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         inter_chunk_target_deadlines_ms: inter_chunk_deadlines.clone(),
         pacing_mode: FIXTURE_PACING_MODE,
         monotonic_clock_source: FIXTURE_MONOTONIC_CLOCK_SOURCE,
-        tokio_runtime: "tokio multi_thread",
+        tokio_runtime: "tokio multi_thread worker_threads=4",
         pools: "protocol-specific: H1 cold isolated client per sample; H2/H3 warm pooled",
     };
 
@@ -2082,7 +2296,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         sample_count: options.sample_count,
         thresholded_origins: vec!["127.0.0.1:3201", "127.0.0.1:3202"],
         comparable_clients_share_workload: true,
-        throughput_timing_window: "corrected client overhead: response rows use first observed response body byte through final observed response body byte minus sum(payload_schedule_ms); request rows use first yielded request body chunk through response headers/upload-complete minus sum(request payload_schedule_ms); identical for reqwest and Specter",
+        throughput_timing_window: "corrected client overhead: response rows use paired reqwest/Specter sample order and divide by final fixture DATA write-stamp to final observed body-chunk delivery overhead, falling back to fixed fixture schedule overhead if a stamp is unavailable; per-gap response pacing overage is emitted as jitter evidence only; request rows use per-chunk yielded/consumed timestamps with response headers/upload-complete as the final endpoint; identical for reqwest and Specter",
     };
 
     let mut rows = Vec::new();
@@ -2112,25 +2326,48 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         let is_comparable = matches!(protocol, "h1" | "h2");
         let mut protocol_metrics = BTreeMap::new();
         let mut protocol_measurement_sources = BTreeMap::new();
+        let endpoint_for_url = if protocol == "h3" {
+            format!("127.0.0.1:{}", H3_PORT)
+        } else {
+            endpoint.clone()
+        };
+        let url = if protocol == "h3" {
+            format!("https://{}/stream", endpoint_for_url)
+        } else if protocol == "rfc8441" {
+            format!("wss://{}/socket", endpoint_for_url)
+        } else if protocol == "h2" {
+            format!("https://{}/stream", endpoint_for_url)
+        } else {
+            format!("http://{}/stream", endpoint_for_url)
+        };
+        let paired_response_metrics = if is_comparable {
+            match run_paired_real_measurements(
+                protocol,
+                &url,
+                options.warmup_count,
+                options.sample_count,
+                &workload.payload_schedule_ms,
+            )
+            .await
+            {
+                Ok((reqwest, specter)) => {
+                    Some(BTreeMap::from([("reqwest", reqwest), ("specter", specter)]))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         for client in ["reqwest", "specter"] {
-            let endpoint_for_url = if protocol == "h3" {
-                format!("127.0.0.1:{}", H3_PORT)
-            } else {
-                endpoint.clone()
-            };
-            let url = if protocol == "h3" {
-                format!("https://{}/stream", endpoint_for_url)
-            } else if protocol == "rfc8441" {
-                format!("wss://{}/socket", endpoint_for_url)
-            } else if protocol == "h2" {
-                format!("https://{}/stream", endpoint_for_url)
-            } else {
-                format!("http://{}/stream", endpoint_for_url)
-            };
-
             let mut measurement_source = "not_applicable_non_comparable";
-            let mut metrics = if is_comparable || (protocol == "h3" && client == "specter") {
+            let mut metrics = if let Some(metrics) = paired_response_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.get(client))
+            {
+                measurement_source = "localhost_paired_real_measurement";
+                metrics.clone()
+            } else if is_comparable || (protocol == "h3" && client == "specter") {
                 measurement_source = "localhost_real_measurement";
                 match run_real_measurement(
                     protocol,
@@ -2308,7 +2545,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
                     reason: match (protocol, client) {
                         ("h3", "specter") => "reqwest H3 comparison unavailable; Specter H3 row is gated by explicit TTFT, throughput, chunk-rate, and pool-reuse regression thresholds",
                         ("h3", "reqwest") => "reqwest H3 comparison unavailable and excluded from threshold math",
-                        ("h1" | "h2", "specter") => "deterministic localhost reqwest-comparable threshold: Specter median TTFT must improve by >=5%, median throughput must improve by >=5%, paired Wilcoxon signed-rank p-values for TTFT and corrected-overhead throughput must be <0.01, p95 throughput must not regress by more than 5%, and p95 TTFT must not regress by more than 5%",
+                        ("h1" | "h2", "specter") => "deterministic localhost reqwest-comparable threshold: Specter median TTFT must improve by >=5%, median throughput must improve by >=5% using final fixture DATA write-stamp delivery overhead for response rows, paired Wilcoxon signed-rank p-values for TTFT and corrected-overhead throughput must be <0.01, p95 throughput must not regress by more than 5%, and p95 TTFT must not regress by more than 5%",
                         ("h1" | "h2", "reqwest") => "deterministic localhost reqwest baseline row; excluded as a failing threshold subject but included in threshold math",
                         _ => "non-comparable deterministic row excluded from primary H1/H2 reqwest threshold math",
                     },
@@ -2336,7 +2573,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
     // -------------------------------------------------------------------
     // Request-body streaming rows (H1, H2): 5 chunks * 1024B at 2ms pacing,
     // 8 requests per sample. Specter uses RequestBuilder::body_stream_sized;
-    // reqwest uses reqwest::Body::wrap_stream.
+    // reqwest uses reqwest::Body::wrap with a size-hinted HttpBody so H1/H2 request rows compare known-length streaming uploads.
     // -------------------------------------------------------------------
     let request_payload_schedule = request_payload_schedule_ms();
     for (protocol, endpoint) in if !run_request_rows {
@@ -2354,18 +2591,14 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         let is_comparable = matches!(protocol, "h1" | "h2");
         let mut protocol_metrics = BTreeMap::new();
         let mut protocol_measurement_sources = BTreeMap::new();
-
-        for client in ["reqwest", "specter"] {
-            let url = if protocol == "h2" {
-                format!("https://{}/upload", endpoint)
-            } else {
-                format!("http://{}/upload", endpoint)
-            };
-
-            let mut measurement_source = "localhost_real_measurement";
-            let mut metrics = match run_real_request_body_measurement(
+        let url = if protocol == "h2" {
+            format!("https://{}/upload", endpoint)
+        } else {
+            format!("http://{}/upload", endpoint)
+        };
+        let paired_request_metrics = if is_comparable {
+            match run_paired_request_body_measurements(
                 protocol,
-                client,
                 &url,
                 options.warmup_count,
                 options.sample_count,
@@ -2373,10 +2606,39 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
             )
             .await
             {
-                Ok(m) => m,
-                Err(_) => {
-                    measurement_source = "localhost_real_measurement_failed";
-                    Metrics::failed(options.warmup_count, options.sample_count)
+                Ok((reqwest, specter)) => {
+                    Some(BTreeMap::from([("reqwest", reqwest), ("specter", specter)]))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        for client in ["reqwest", "specter"] {
+            let mut measurement_source = "localhost_real_measurement";
+            let mut metrics = if let Some(metrics) = paired_request_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.get(client))
+            {
+                measurement_source = "localhost_paired_real_measurement";
+                metrics.clone()
+            } else {
+                match run_real_request_body_measurement(
+                    protocol,
+                    client,
+                    &url,
+                    options.warmup_count,
+                    options.sample_count,
+                    &request_payload_schedule,
+                )
+                .await
+                {
+                    Ok(m) => m,
+                    Err(_) => {
+                        measurement_source = "localhost_real_measurement_failed";
+                        Metrics::failed(options.warmup_count, options.sample_count)
+                    }
                 }
             };
 
@@ -2441,7 +2703,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
                 skip_reason: None,
                 measurement_source: protocol_measurement_sources[client],
                 client_config: ClientConfig {
-                    runtime: "tokio multi_thread",
+                    runtime: "tokio multi_thread worker_threads=4",
                     payload_schedule_ms: request_payload_schedule.clone(),
                     chunk_size: BENCH_REQ_CHUNK_SIZE,
                     request_count: BENCH_REQUEST_COUNT,
@@ -2506,7 +2768,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
                         .map(|result| result.p95_ttft_regression_pct),
                     status: if is_row_pass { "pass" } else { "fail" },
                     reason: match (protocol, client) {
-                        ("h1" | "h2", "specter") => "deterministic localhost reqwest-comparable request-body streaming threshold: Specter median TTFT (response status/headers) must improve by >=5%, median upload throughput must improve by >=5% measured against the corrected upload-complete denominator (first yielded request chunk through response headers minus request payload_schedule_ms), paired Wilcoxon signed-rank p-values for TTFT and corrected-overhead throughput must be <0.01, p95 throughput must not regress by more than 5%, and p95 TTFT must not regress by more than 5%; client_write_overhead_duration_ns is retained as denominator-floor audit evidence but is not the request-row throughput denominator",
+                        ("h1" | "h2", "specter") => "deterministic localhost reqwest-comparable request-body streaming threshold: Specter median corrected upload-complete TTFT must improve by >=5% using per-chunk yielded/consumed timestamps with response status/headers as the final upload-complete endpoint, median upload throughput must improve by >=5% measured against the same corrected upload-complete write-overhead denominator, paired Wilcoxon signed-rank p-values for corrected upload-complete TTFT and corrected-overhead throughput must be <0.01, p95 throughput must not regress by more than 5%, and p95 corrected upload-complete TTFT must not regress by more than 5%; client_write_overhead_duration_ns is retained as duplicate denominator-floor evidence for request rows",
                         ("h1" | "h2", "reqwest") => "deterministic localhost reqwest baseline request-body streaming row; excluded as a failing threshold subject but included in threshold math",
                         _ => "non-comparable deterministic request-body row excluded from primary H1/H2 reqwest threshold math",
                     },
@@ -2554,6 +2816,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         actual_send_gap: ActualSendGap::empty(),
         ttft_samples_ns: Vec::new(),
         bytes_per_sec_samples: Vec::new(),
+        response_gap_overhead_by_index_ns: Vec::new(),
     });
     let h3_gate = H3Gate {
         fixture_address: "127.0.0.1:3203/udp",
@@ -2825,6 +3088,227 @@ fn pct_lower_is_worse(baseline: f64, candidate: f64) -> f64 {
     ((baseline - candidate) / baseline) * 100.0
 }
 
+#[derive(Default)]
+struct ResponseSampleSet {
+    ttft_values: Vec<f64>,
+    throughput_values: Vec<f64>,
+    chunk_rates: Vec<f64>,
+    body_transfer_duration_values: Vec<f64>,
+    client_overhead_duration_values: Vec<f64>,
+    client_overhead_unclamped_duration_values: Vec<f64>,
+    client_overhead_denominator_floor_count: usize,
+    all_send_gaps_ns: Vec<f64>,
+    gap_overhead_by_index_ns: Vec<Vec<f64>>,
+}
+
+impl ResponseSampleSet {
+    fn record(
+        &mut self,
+        ttft: Duration,
+        body_transfer_duration: Duration,
+        payload_schedule_duration: Duration,
+        client_overhead: DenominatorEvidence,
+        bytes: usize,
+        chunks: usize,
+        inter_chunk_send_gaps_ns: &[f64],
+    ) {
+        record_response_gap_overheads_by_index(
+            inter_chunk_send_gaps_ns,
+            &mut self.gap_overhead_by_index_ns,
+        );
+        record_sample(
+            ttft,
+            body_transfer_duration,
+            payload_schedule_duration,
+            client_overhead,
+            bytes,
+            chunks,
+            inter_chunk_send_gaps_ns,
+            &mut self.ttft_values,
+            &mut self.throughput_values,
+            &mut self.chunk_rates,
+            &mut self.body_transfer_duration_values,
+            &mut self.client_overhead_duration_values,
+            &mut self.client_overhead_unclamped_duration_values,
+            &mut self.client_overhead_denominator_floor_count,
+            &mut self.all_send_gaps_ns,
+        );
+    }
+
+    fn into_metrics(
+        self,
+        protocol: &str,
+        warmup_count: usize,
+        sample_count: usize,
+    ) -> Result<Metrics, Box<dyn std::error::Error>> {
+        if self.ttft_values.is_empty() {
+            return Err("No successful samples".into());
+        }
+
+        let (p50, p95, p99) = calculate_percentiles(self.ttft_values.clone());
+        let (_, p95_throughput, _) = calculate_percentiles(self.throughput_values.clone());
+        let median_throughput = calculate_median(self.throughput_values.clone());
+        let median_chunk_rate = calculate_median(self.chunk_rates);
+        let median_body_transfer_duration_ns = calculate_median(self.body_transfer_duration_values);
+        let median_client_overhead_duration_ns =
+            calculate_median(self.client_overhead_duration_values);
+        let median_client_overhead_unclamped_duration_ns =
+            calculate_median(self.client_overhead_unclamped_duration_values);
+        let actual_send_gap = summarize_send_gaps(&self.all_send_gaps_ns, BENCH_CHUNK_DELAY_MS);
+        let response_gap_overhead_by_index_ns = self
+            .gap_overhead_by_index_ns
+            .into_iter()
+            .map(calculate_median)
+            .collect();
+
+        Ok(Metrics {
+            ttft_ns: p50,
+            chunks_per_sec: median_chunk_rate,
+            bytes_per_sec: median_throughput,
+            p95_bytes_per_sec: p95_throughput,
+            body_transfer_duration_ns: median_body_transfer_duration_ns,
+            client_overhead_duration_ns: median_client_overhead_duration_ns,
+            client_overhead_unclamped_duration_ns: Some(
+                median_client_overhead_unclamped_duration_ns,
+            ),
+            client_overhead_denominator_floor_count: self.client_overhead_denominator_floor_count,
+            client_write_overhead_duration_ns: 0.0,
+            client_write_overhead_unclamped_duration_ns: None,
+            client_write_overhead_denominator_floor_count: 0,
+            p50_ns: p50,
+            p95_ns: p95,
+            p99_ns: p99,
+            warmup_count,
+            sample_count,
+            connection_reuse_count: if protocol == "h1" {
+                sample_count.saturating_mul(BENCH_REQUEST_COUNT.saturating_sub(1))
+            } else {
+                warmup_count
+                    .saturating_add(sample_count)
+                    .saturating_mul(BENCH_REQUEST_COUNT)
+                    .saturating_sub(1)
+            },
+            pass: true,
+            actual_send_gap,
+            ttft_samples_ns: self.ttft_values,
+            bytes_per_sec_samples: self.throughput_values,
+            response_gap_overhead_by_index_ns,
+        })
+    }
+}
+
+#[derive(Default)]
+struct RequestSampleSet {
+    ttft_values: Vec<f64>,
+    throughput_values: Vec<f64>,
+    chunk_rates: Vec<f64>,
+    body_transfer_duration_values: Vec<f64>,
+    client_overhead_duration_values: Vec<f64>,
+    client_overhead_unclamped_duration_values: Vec<f64>,
+    client_overhead_denominator_floor_count: usize,
+    client_write_overhead_duration_values: Vec<f64>,
+    client_write_overhead_unclamped_duration_values: Vec<f64>,
+    client_write_overhead_denominator_floor_count: usize,
+    all_send_gaps_ns: Vec<f64>,
+}
+
+impl RequestSampleSet {
+    fn record(
+        &mut self,
+        ttft: Duration,
+        body_transfer_duration: Duration,
+        payload_schedule_duration: Duration,
+        client_write_overhead: DenominatorEvidence,
+        bytes: usize,
+        chunks: usize,
+        inter_chunk_send_gaps_ns: &[f64],
+    ) {
+        record_request_sample(
+            ttft,
+            body_transfer_duration,
+            payload_schedule_duration,
+            client_write_overhead,
+            bytes,
+            chunks,
+            inter_chunk_send_gaps_ns,
+            &mut self.ttft_values,
+            &mut self.throughput_values,
+            &mut self.chunk_rates,
+            &mut self.body_transfer_duration_values,
+            &mut self.client_overhead_duration_values,
+            &mut self.client_overhead_unclamped_duration_values,
+            &mut self.client_overhead_denominator_floor_count,
+            &mut self.client_write_overhead_duration_values,
+            &mut self.client_write_overhead_unclamped_duration_values,
+            &mut self.client_write_overhead_denominator_floor_count,
+            &mut self.all_send_gaps_ns,
+        );
+    }
+
+    fn into_metrics(
+        self,
+        protocol: &str,
+        warmup_count: usize,
+        sample_count: usize,
+    ) -> Result<Metrics, Box<dyn std::error::Error>> {
+        if self.ttft_values.is_empty() {
+            return Err("No successful request-body samples".into());
+        }
+
+        let (p50, p95, p99) = calculate_percentiles(self.ttft_values.clone());
+        let (_, p95_throughput, _) = calculate_percentiles(self.throughput_values.clone());
+        let median_throughput = calculate_median(self.throughput_values.clone());
+        let median_chunk_rate = calculate_median(self.chunk_rates);
+        let median_body_transfer_duration_ns = calculate_median(self.body_transfer_duration_values);
+        let median_client_overhead_duration_ns =
+            calculate_median(self.client_overhead_duration_values);
+        let median_client_overhead_unclamped_duration_ns =
+            calculate_median(self.client_overhead_unclamped_duration_values);
+        let median_client_write_overhead_duration_ns =
+            calculate_median(self.client_write_overhead_duration_values);
+        let median_client_write_overhead_unclamped_duration_ns =
+            calculate_median(self.client_write_overhead_unclamped_duration_values);
+        let actual_send_gap = summarize_send_gaps(&self.all_send_gaps_ns, BENCH_REQ_CHUNK_DELAY_MS);
+
+        Ok(Metrics {
+            ttft_ns: p50,
+            chunks_per_sec: median_chunk_rate,
+            bytes_per_sec: median_throughput,
+            p95_bytes_per_sec: p95_throughput,
+            body_transfer_duration_ns: median_body_transfer_duration_ns,
+            client_overhead_duration_ns: median_client_overhead_duration_ns,
+            client_overhead_unclamped_duration_ns: Some(
+                median_client_overhead_unclamped_duration_ns,
+            ),
+            client_overhead_denominator_floor_count: self.client_overhead_denominator_floor_count,
+            client_write_overhead_duration_ns: median_client_write_overhead_duration_ns,
+            client_write_overhead_unclamped_duration_ns: Some(
+                median_client_write_overhead_unclamped_duration_ns,
+            ),
+            client_write_overhead_denominator_floor_count: self
+                .client_write_overhead_denominator_floor_count,
+            p50_ns: p50,
+            p95_ns: p95,
+            p99_ns: p99,
+            warmup_count,
+            sample_count,
+            connection_reuse_count: if protocol == "h1" {
+                sample_count.saturating_mul(BENCH_REQUEST_COUNT.saturating_sub(1))
+            } else {
+                warmup_count
+                    .saturating_add(sample_count)
+                    .saturating_mul(BENCH_REQUEST_COUNT)
+                    .saturating_sub(1)
+            },
+            pass: true,
+            actual_send_gap,
+            ttft_samples_ns: self.ttft_values,
+            bytes_per_sec_samples: self.throughput_values,
+            response_gap_overhead_by_index_ns: Vec::new(),
+        })
+    }
+}
+
 async fn run_real_measurement(
     protocol: &str,
     client: &str,
@@ -2833,12 +3317,7 @@ async fn run_real_measurement(
     sample_count: usize,
     payload_schedule_ms: &[u64],
 ) -> Result<Metrics, Box<dyn std::error::Error>> {
-    let mut ttft_values = Vec::new();
-    let mut throughput_values = Vec::new();
-    let mut chunk_rates = Vec::new();
-    let mut body_transfer_duration_values = Vec::new();
-    let mut client_overhead_duration_values = Vec::new();
-    let mut all_send_gaps_ns: Vec<f64> = Vec::new();
+    let mut samples = ResponseSampleSet::default();
     let scheduled_duration = payload_schedule_duration(payload_schedule_ms, BENCH_REQUEST_COUNT);
 
     if client == "specter" {
@@ -2868,23 +3347,18 @@ async fn run_real_measurement(
             } else {
                 &specter_client
             };
-            if let Ok((ttft, total_duration, bytes, chunks, gaps_ns)) =
+            if let Ok((ttft, total_duration, delivery_overhead, bytes, chunks, gaps_ns)) =
                 measure_specter_streaming_batch(protocol, client_ref, url, BENCH_REQUEST_COUNT)
                     .await
             {
-                record_sample(
+                samples.record(
                     ttft,
                     total_duration,
                     scheduled_duration,
+                    delivery_overhead,
                     bytes,
                     chunks,
                     &gaps_ns,
-                    &mut ttft_values,
-                    &mut throughput_values,
-                    &mut chunk_rates,
-                    &mut body_transfer_duration_values,
-                    &mut client_overhead_duration_values,
-                    &mut all_send_gaps_ns,
                 );
             }
         }
@@ -2908,72 +3382,321 @@ async fn run_real_measurement(
             } else {
                 &reqwest_client
             };
-            if let Ok((ttft, total_duration, bytes, chunks, gaps_ns)) =
+            if let Ok((ttft, total_duration, delivery_overhead, bytes, chunks, gaps_ns)) =
                 measure_reqwest_streaming_batch(client_ref, url, BENCH_REQUEST_COUNT).await
             {
-                record_sample(
+                samples.record(
                     ttft,
                     total_duration,
                     scheduled_duration,
+                    delivery_overhead,
                     bytes,
                     chunks,
                     &gaps_ns,
-                    &mut ttft_values,
-                    &mut throughput_values,
-                    &mut chunk_rates,
-                    &mut body_transfer_duration_values,
-                    &mut client_overhead_duration_values,
-                    &mut all_send_gaps_ns,
                 );
             }
         }
     }
 
-    if ttft_values.is_empty() {
-        return Err("No successful samples".into());
+    samples.into_metrics(protocol, warmup_count, sample_count)
+}
+
+async fn run_paired_real_measurements(
+    protocol: &str,
+    url: &str,
+    warmup_count: usize,
+    sample_count: usize,
+    payload_schedule_ms: &[u64],
+) -> Result<(Metrics, Metrics), Box<dyn std::error::Error>> {
+    let scheduled_duration = payload_schedule_duration(payload_schedule_ms, BENCH_REQUEST_COUNT);
+    let specter_client = specter::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .prefer_http2(protocol == "h2")
+        .build()?;
+    let reqwest_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    if protocol != "h1" {
+        for _ in 0..warmup_count {
+            let _ =
+                measure_reqwest_streaming_batch(&reqwest_client, url, BENCH_REQUEST_COUNT).await;
+            let _ = measure_specter_streaming_batch(
+                protocol,
+                &specter_client,
+                url,
+                BENCH_REQUEST_COUNT,
+            )
+            .await;
+        }
     }
 
-    let (p50, p95, p99) = calculate_percentiles(ttft_values.clone());
-    let (_, p95_throughput, _) = calculate_percentiles(throughput_values.clone());
-    let median_throughput = calculate_median(throughput_values.clone());
-    let median_chunk_rate = calculate_median(chunk_rates);
-    let median_body_transfer_duration_ns = calculate_median(body_transfer_duration_values);
-    let median_client_overhead_duration_ns = calculate_median(client_overhead_duration_values);
-    let actual_send_gap = summarize_send_gaps(&all_send_gaps_ns, BENCH_CHUNK_DELAY_MS);
+    let mut reqwest_samples = ResponseSampleSet::default();
+    let mut specter_samples = ResponseSampleSet::default();
 
-    Ok(Metrics {
-        ttft_ns: p50,
-        chunks_per_sec: median_chunk_rate,
-        bytes_per_sec: median_throughput,
-        p95_bytes_per_sec: p95_throughput,
-        body_transfer_duration_ns: median_body_transfer_duration_ns,
-        client_overhead_duration_ns: median_client_overhead_duration_ns,
-        client_overhead_unclamped_duration_ns: None,
-        client_overhead_denominator_floor_count: 0,
-        // Response rows are not gated by client write completion; the field
-        // is populated only on request rows where it carries the new
-        // wire-flush metric.
-        client_write_overhead_duration_ns: 0.0,
-        client_write_overhead_unclamped_duration_ns: None,
-        client_write_overhead_denominator_floor_count: 0,
-        p50_ns: p50,
-        p95_ns: p95,
-        p99_ns: p99,
-        warmup_count,
-        sample_count,
-        connection_reuse_count: if protocol == "h1" {
-            sample_count.saturating_mul(BENCH_REQUEST_COUNT.saturating_sub(1))
+    for index in 0..sample_count {
+        if index % 2 == 0 {
+            record_reqwest_response_sample(
+                protocol,
+                &reqwest_client,
+                url,
+                scheduled_duration,
+                &mut reqwest_samples,
+            )
+            .await;
+            record_specter_response_sample(
+                protocol,
+                &specter_client,
+                url,
+                scheduled_duration,
+                &mut specter_samples,
+            )
+            .await;
         } else {
-            warmup_count
-                .saturating_add(sample_count)
-                .saturating_mul(BENCH_REQUEST_COUNT)
-                .saturating_sub(1)
-        },
-        pass: true,
-        actual_send_gap,
-        ttft_samples_ns: ttft_values,
-        bytes_per_sec_samples: throughput_values,
-    })
+            record_specter_response_sample(
+                protocol,
+                &specter_client,
+                url,
+                scheduled_duration,
+                &mut specter_samples,
+            )
+            .await;
+            record_reqwest_response_sample(
+                protocol,
+                &reqwest_client,
+                url,
+                scheduled_duration,
+                &mut reqwest_samples,
+            )
+            .await;
+        }
+    }
+
+    Ok((
+        reqwest_samples.into_metrics(protocol, warmup_count, sample_count)?,
+        specter_samples.into_metrics(protocol, warmup_count, sample_count)?,
+    ))
+}
+
+async fn record_reqwest_response_sample(
+    protocol: &str,
+    pooled_client: &reqwest::Client,
+    url: &str,
+    scheduled_duration: Duration,
+    samples: &mut ResponseSampleSet,
+) {
+    let h1_client;
+    let client_ref = if protocol == "h1" {
+        h1_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build();
+        match h1_client.as_ref() {
+            Ok(client) => client,
+            Err(_) => return,
+        }
+    } else {
+        pooled_client
+    };
+
+    if let Ok((ttft, total_duration, delivery_overhead, bytes, chunks, gaps_ns)) =
+        measure_reqwest_streaming_batch(client_ref, url, BENCH_REQUEST_COUNT).await
+    {
+        samples.record(
+            ttft,
+            total_duration,
+            scheduled_duration,
+            delivery_overhead,
+            bytes,
+            chunks,
+            &gaps_ns,
+        );
+    }
+}
+
+async fn record_specter_response_sample(
+    protocol: &str,
+    pooled_client: &specter::Client,
+    url: &str,
+    scheduled_duration: Duration,
+    samples: &mut ResponseSampleSet,
+) {
+    let h1_client;
+    let client_ref = if protocol == "h1" {
+        h1_client = specter::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .prefer_http2(false)
+            .build();
+        match h1_client.as_ref() {
+            Ok(client) => client,
+            Err(_) => return,
+        }
+    } else {
+        pooled_client
+    };
+
+    if let Ok((ttft, total_duration, delivery_overhead, bytes, chunks, gaps_ns)) =
+        measure_specter_streaming_batch(protocol, client_ref, url, BENCH_REQUEST_COUNT).await
+    {
+        samples.record(
+            ttft,
+            total_duration,
+            scheduled_duration,
+            delivery_overhead,
+            bytes,
+            chunks,
+            &gaps_ns,
+        );
+    }
+}
+
+async fn run_paired_request_body_measurements(
+    protocol: &str,
+    url: &str,
+    warmup_count: usize,
+    sample_count: usize,
+    payload_schedule_ms: &[u64],
+) -> Result<(Metrics, Metrics), Box<dyn std::error::Error>> {
+    let scheduled_duration = payload_schedule_duration(payload_schedule_ms, BENCH_REQUEST_COUNT);
+    let specter_client = specter::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .prefer_http2(protocol == "h2")
+        .build()?;
+    let reqwest_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    if protocol != "h1" {
+        for _ in 0..warmup_count {
+            let _ =
+                measure_reqwest_request_streaming_batch(&reqwest_client, url, BENCH_REQUEST_COUNT)
+                    .await;
+            let _ = measure_specter_request_streaming_batch(
+                protocol,
+                &specter_client,
+                url,
+                BENCH_REQUEST_COUNT,
+            )
+            .await;
+        }
+    }
+
+    let mut reqwest_samples = RequestSampleSet::default();
+    let mut specter_samples = RequestSampleSet::default();
+
+    for index in 0..sample_count {
+        if index % 2 == 0 {
+            record_reqwest_request_sample(
+                protocol,
+                &reqwest_client,
+                url,
+                scheduled_duration,
+                &mut reqwest_samples,
+            )
+            .await;
+            record_specter_request_sample(
+                protocol,
+                &specter_client,
+                url,
+                scheduled_duration,
+                &mut specter_samples,
+            )
+            .await;
+        } else {
+            record_specter_request_sample(
+                protocol,
+                &specter_client,
+                url,
+                scheduled_duration,
+                &mut specter_samples,
+            )
+            .await;
+            record_reqwest_request_sample(
+                protocol,
+                &reqwest_client,
+                url,
+                scheduled_duration,
+                &mut reqwest_samples,
+            )
+            .await;
+        }
+    }
+
+    Ok((
+        reqwest_samples.into_metrics(protocol, warmup_count, sample_count)?,
+        specter_samples.into_metrics(protocol, warmup_count, sample_count)?,
+    ))
+}
+
+async fn record_reqwest_request_sample(
+    protocol: &str,
+    pooled_client: &reqwest::Client,
+    url: &str,
+    scheduled_duration: Duration,
+    samples: &mut RequestSampleSet,
+) {
+    let h1_client;
+    let client_ref = if protocol == "h1" {
+        h1_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build();
+        match h1_client.as_ref() {
+            Ok(client) => client,
+            Err(_) => return,
+        }
+    } else {
+        pooled_client
+    };
+
+    if let Ok((ttft, total_duration, write_overhead, bytes, chunks, gaps_ns)) =
+        measure_reqwest_request_streaming_batch(client_ref, url, BENCH_REQUEST_COUNT).await
+    {
+        samples.record(
+            ttft,
+            total_duration,
+            scheduled_duration,
+            write_overhead,
+            bytes,
+            chunks,
+            &gaps_ns,
+        );
+    }
+}
+
+async fn record_specter_request_sample(
+    protocol: &str,
+    pooled_client: &specter::Client,
+    url: &str,
+    scheduled_duration: Duration,
+    samples: &mut RequestSampleSet,
+) {
+    let h1_client;
+    let client_ref = if protocol == "h1" {
+        h1_client = specter::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .prefer_http2(false)
+            .build();
+        match h1_client.as_ref() {
+            Ok(client) => client,
+            Err(_) => return,
+        }
+    } else {
+        pooled_client
+    };
+
+    if let Ok((ttft, total_duration, write_overhead, bytes, chunks, gaps_ns)) =
+        measure_specter_request_streaming_batch(protocol, client_ref, url, BENCH_REQUEST_COUNT)
+            .await
+    {
+        samples.record(
+            ttft,
+            total_duration,
+            scheduled_duration,
+            write_overhead,
+            bytes,
+            chunks,
+            &gaps_ns,
+        );
+    }
 }
 
 async fn run_real_request_body_measurement(
@@ -3155,14 +3878,35 @@ async fn run_real_request_body_measurement(
         actual_send_gap,
         ttft_samples_ns: ttft_values,
         bytes_per_sec_samples: throughput_values,
+        response_gap_overhead_by_index_ns: Vec::new(),
     })
+}
+
+pub(crate) fn record_response_gap_overheads_by_index(
+    inter_chunk_gaps_ns: &[f64],
+    gap_overhead_by_index_ns: &mut Vec<Vec<f64>>,
+) {
+    let target_gap_ns = (BENCH_CHUNK_DELAY_MS as f64) * 1_000_000.0;
+    let gaps_per_request = BENCH_CHUNK_COUNT.saturating_sub(1);
+    if gaps_per_request == 0 {
+        return;
+    }
+    if gap_overhead_by_index_ns.len() < gaps_per_request {
+        gap_overhead_by_index_ns.resize_with(gaps_per_request, Vec::new);
+    }
+    for (index, gap) in inter_chunk_gaps_ns.iter().copied().enumerate() {
+        if gap.is_finite() {
+            gap_overhead_by_index_ns[index % gaps_per_request].push((gap - target_gap_ns).max(0.0));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_sample(
     ttft: Duration,
     body_transfer_duration: Duration,
-    payload_schedule_duration: Duration,
+    _payload_schedule_duration: Duration,
+    client_overhead: DenominatorEvidence,
     bytes: usize,
     chunks: usize,
     inter_chunk_send_gaps_ns: &[f64],
@@ -3171,29 +3915,30 @@ pub(crate) fn record_sample(
     chunk_rates: &mut Vec<f64>,
     body_transfer_duration_values: &mut Vec<f64>,
     client_overhead_duration_values: &mut Vec<f64>,
+    client_overhead_unclamped_duration_values: &mut Vec<f64>,
+    client_overhead_denominator_floor_count: &mut usize,
     send_gap_samples_ns: &mut Vec<f64>,
 ) {
     let ttft_ns = ttft.as_nanos() as f64;
-    let client_overhead_duration =
-        corrected_client_overhead_duration(body_transfer_duration, payload_schedule_duration);
-    let denominator = client_overhead_duration.as_secs_f64().max(1e-9);
+    let denominator = client_overhead.duration.as_secs_f64().max(1e-9);
     ttft_values.push(ttft_ns);
     send_gap_samples_ns.extend_from_slice(inter_chunk_send_gaps_ns);
     throughput_values.push(bytes as f64 / denominator);
     chunk_rates.push(chunks as f64 / denominator);
     body_transfer_duration_values.push(body_transfer_duration.as_nanos() as f64);
-    client_overhead_duration_values.push(client_overhead_duration.as_nanos() as f64);
+    client_overhead_duration_values.push(client_overhead.duration.as_nanos() as f64);
+    client_overhead_unclamped_duration_values.push(client_overhead.unclamped_duration_ns);
+    *client_overhead_denominator_floor_count += client_overhead.floor_count;
 }
 
-// Request-row variant: throughput uses the corrected upload-complete window
-// (first yielded request chunk through response headers, minus producer
-// pacing). Per-chunk write-overhead remains serialized as audit evidence but
-// is not the threshold denominator.
+// Request-row variant: threshold TTFT and throughput use corrected
+// upload-complete write-overhead. The raw first-yielded-chunk through
+// response-headers duration remains serialized as body_transfer_duration_ns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_request_sample(
-    ttft: Duration,
+    _ttft: Duration,
     body_transfer_duration: Duration,
-    payload_schedule_duration: Duration,
+    _payload_schedule_duration: Duration,
     client_write_overhead: DenominatorEvidence,
     bytes: usize,
     chunks: usize,
@@ -3210,20 +3955,15 @@ pub(crate) fn record_request_sample(
     client_write_overhead_denominator_floor_count: &mut usize,
     send_gap_samples_ns: &mut Vec<f64>,
 ) {
-    let ttft_ns = ttft.as_nanos() as f64;
-    let client_overhead = DenominatorEvidence::from_duration_minus_duration(
-        body_transfer_duration,
-        payload_schedule_duration,
-    );
-    let denominator = client_overhead.duration.as_secs_f64().max(1e-9);
-    ttft_values.push(ttft_ns);
+    let denominator = client_write_overhead.duration.as_secs_f64().max(1e-9);
+    ttft_values.push(client_write_overhead.duration.as_nanos() as f64);
     send_gap_samples_ns.extend_from_slice(inter_chunk_send_gaps_ns);
     throughput_values.push(bytes as f64 / denominator);
     chunk_rates.push(chunks as f64 / denominator);
     body_transfer_duration_values.push(body_transfer_duration.as_nanos() as f64);
-    client_overhead_duration_values.push(client_overhead.duration.as_nanos() as f64);
-    client_overhead_unclamped_duration_values.push(client_overhead.unclamped_duration_ns);
-    *client_overhead_denominator_floor_count += client_overhead.floor_count;
+    client_overhead_duration_values.push(client_write_overhead.duration.as_nanos() as f64);
+    client_overhead_unclamped_duration_values.push(client_write_overhead.unclamped_duration_ns);
+    *client_overhead_denominator_floor_count += client_write_overhead.floor_count;
     client_write_overhead_duration_values.push(client_write_overhead.duration.as_nanos() as f64);
     client_write_overhead_unclamped_duration_values
         .push(client_write_overhead.unclamped_duration_ns);
@@ -3259,15 +3999,15 @@ fn metric_definitions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "ttft_ns",
-            "elapsed nanoseconds from request start until first response body byte is observable on response rows; elapsed nanoseconds from request start until response status/headers are available on request-body rows",
+            "response rows: elapsed nanoseconds from request start until first response body byte is observable; request rows: corrected upload-complete write-overhead in nanoseconds using per-chunk yielded/consumed timestamps and response status/headers as the final upload-complete endpoint",
         ),
         (
             "chunks_per_sec",
-            "response rows: decoded body chunks received divided by corrected client-overhead duration; request rows: uploaded request chunks divided by corrected upload-complete duration",
+            "response rows: decoded body chunks received divided by corrected client-overhead duration; request rows: uploaded request chunks divided by corrected upload-complete write-overhead duration",
         ),
         (
             "bytes_per_sec",
-            "median body bytes per second over samples; response rows divide decoded response body bytes by corrected response body-transfer duration, and request rows divide uploaded request body bytes by corrected upload-complete duration (body_transfer_duration_ns - sum(payload_schedule_ms)); applied identically to reqwest and Specter",
+            "median body bytes per second over samples; response rows divide decoded response body bytes by final fixture DATA write-stamp to final observed body-chunk delivery overhead, falling back to fixed fixture schedule overhead if a stamp is unavailable; request rows divide uploaded request body bytes by corrected upload-complete write-overhead duration; applied identically to reqwest and Specter",
         ),
         (
             "p95_bytes_per_sec",
@@ -3279,27 +4019,27 @@ fn metric_definitions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "client_overhead_duration_ns",
-            "median corrected client-overhead duration denominator in nanoseconds after subtracting sum(payload_schedule_ms) from raw body_transfer_duration_ns; gates threshold bytes_per_sec and chunks_per_sec for both response rows and request rows, with request rows using the upload-complete timing window",
+            "median corrected client-overhead duration denominator in nanoseconds; gates response-row bytes_per_sec and chunks_per_sec using final fixture DATA write-stamp delivery overhead, and gates request-row TTFT, bytes_per_sec, and chunks_per_sec using the corrected upload-complete write-overhead timing window",
         ),
         (
             "client_overhead_unclamped_duration_ns",
-            "request-row only: median corrected upload-complete denominator before applying the 1ns floor; serialized even when zero so denominator floor/clamp state is visible",
+            "median corrected client-overhead denominator before applying the 1ns floor; response rows use final fixture DATA write-stamp delivery overhead with fixed-schedule fallback and request rows use corrected upload-complete write-overhead",
         ),
         (
             "client_overhead_denominator_floor_count",
-            "request-row only: number of measured request-body samples whose corrected upload-complete denominator reached the 1ns floor/clamp",
+            "number of measured samples whose corrected client-overhead denominator reached the 1ns floor/clamp",
         ),
         (
             "client_write_overhead_duration_ns",
-            "request-row only audit field: median sum across chunks of (consumed_at - yielded_at - scheduled_gap) where consumed_at[i<N-1] is the wall-clock at the start of the next poll_next call and consumed_at[N-1] is response-headers-arrival; populated as 0 on response rows and not used as the threshold throughput denominator",
+            "request-row denominator evidence: median sum across chunks of (consumed_at - yielded_at - scheduled_gap) where consumed_at[i<N-1] is the wall-clock at the start of the next poll_next call and consumed_at[N-1] is response-headers-arrival; used as the request-row threshold denominator",
         ),
         (
             "client_write_overhead_unclamped_duration_ns",
-            "request-row only audit field: median per-sample client_write_overhead_duration_ns before applying the 1ns floor",
+            "request-row denominator evidence: median per-sample client_write_overhead_duration_ns before applying the 1ns floor",
         ),
         (
             "client_write_overhead_denominator_floor_count",
-            "request-row only audit field: number of constituent request uploads whose per-chunk write-overhead denominator reached the 1ns floor/clamp",
+            "request-row denominator evidence: number of measured request uploads whose per-chunk write-overhead denominator reached the 1ns floor/clamp",
         ),
         (
             "p50_ns",

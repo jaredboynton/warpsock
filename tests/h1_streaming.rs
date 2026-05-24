@@ -626,6 +626,10 @@ async fn h1_body_polls_socket_with_reusable_buffer() {
         !source.contains("tokio::sync::mpsc") && !source.contains("mpsc::"),
         "H1 response streaming must not route chunks through mpsc"
     );
+    assert!(
+        source.contains("timeouts_enabled"),
+        "H1 response hot path should skip timeout polling when no body timeouts are configured"
+    );
 
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();

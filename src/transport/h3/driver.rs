@@ -156,10 +156,19 @@ struct DriverTunnelState {
     outbound_rx: Option<mpsc::Receiver<H3TunnelOutbound>>,
     inbound_tx: mpsc::Sender<Result<H3TunnelEvent>>,
     inbound_rx: Option<mpsc::Receiver<Result<H3TunnelEvent>>>,
+    pending_inbound: VecDeque<Result<H3TunnelEvent>>,
     pending_outbound: VecDeque<H3TunnelOutbound>,
     opened: bool,
     status: Option<u16>,
     headers: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelInboundStatus {
+    Open,
+    Blocked,
+    Closed,
+    Remove,
 }
 
 impl DriverTunnelState {
@@ -173,10 +182,52 @@ impl DriverTunnelState {
             outbound_rx: Some(outbound_rx),
             inbound_tx,
             inbound_rx: Some(inbound_rx),
+            pending_inbound: VecDeque::new(),
             pending_outbound: VecDeque::new(),
             opened: false,
             status: None,
             headers: Vec::new(),
+        }
+    }
+
+    fn push_inbound(&mut self, event: H3TunnelEvent) -> TunnelInboundStatus {
+        let item = Ok(event);
+        if !self.pending_inbound.is_empty() {
+            self.pending_inbound.push_back(item);
+            return TunnelInboundStatus::Open;
+        }
+
+        match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+            TunnelInboundStatus::Blocked => TunnelInboundStatus::Open,
+            status => status,
+        }
+    }
+
+    fn flush_inbound(&mut self) -> TunnelInboundStatus {
+        while let Some(item) = self.pending_inbound.pop_front() {
+            match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+                TunnelInboundStatus::Open => {}
+                TunnelInboundStatus::Blocked => return TunnelInboundStatus::Open,
+                status => return status,
+            }
+        }
+        TunnelInboundStatus::Open
+    }
+
+    fn try_send_inbound(
+        inbound_tx: &mpsc::Sender<Result<H3TunnelEvent>>,
+        pending_inbound: &mut VecDeque<Result<H3TunnelEvent>>,
+        item: Result<H3TunnelEvent>,
+    ) -> TunnelInboundStatus {
+        let remove_after_send = matches!(item, Ok(H3TunnelEvent::EndStream));
+        match inbound_tx.try_send(item) {
+            Ok(()) if remove_after_send => TunnelInboundStatus::Remove,
+            Ok(()) => TunnelInboundStatus::Open,
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                pending_inbound.push_front(item);
+                TunnelInboundStatus::Blocked
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => TunnelInboundStatus::Closed,
         }
     }
 }
@@ -272,6 +323,7 @@ impl H3Driver {
             self.flush_streaming_body_recvs().await?;
             self.flush_request_bodies().await?;
             self.flush_tunnel_data().await?;
+            self.flush_tunnel_inbound().await?;
 
             loop {
                 match self.conn.send(&mut out) {
@@ -642,6 +694,32 @@ impl H3Driver {
         }
 
         Ok(())
+    }
+
+    async fn flush_tunnel_inbound(&mut self) -> Result<()> {
+        let stream_ids: Vec<u64> = self.tunnels.keys().copied().collect();
+        for stream_id in stream_ids {
+            let status = self
+                .tunnels
+                .get_mut(&stream_id)
+                .map(DriverTunnelState::flush_inbound)
+                .unwrap_or(TunnelInboundStatus::Open);
+            self.apply_tunnel_inbound_status(stream_id, status);
+        }
+        Ok(())
+    }
+
+    fn apply_tunnel_inbound_status(&mut self, stream_id: u64, status: TunnelInboundStatus) {
+        match status {
+            TunnelInboundStatus::Open | TunnelInboundStatus::Blocked => {}
+            TunnelInboundStatus::Remove => {
+                self.tunnels.remove(&stream_id);
+            }
+            TunnelInboundStatus::Closed => {
+                self.reset_cancel_stream(stream_id);
+                self.tunnels.remove(&stream_id);
+            }
+        }
     }
 
     async fn process_h3_events(&mut self) -> Result<()> {
@@ -1050,15 +1128,18 @@ impl H3Driver {
         let mut buf = vec![0u8; 65535];
 
         if let Some(tunnel) = self.tunnels.get_mut(&stream_id) {
+            let mut status = TunnelInboundStatus::Open;
             loop {
                 match self.h3_conn.recv_body(&mut self.conn, stream_id, &mut buf) {
                     Ok(0) => break,
                     Ok(len) => {
                         if tunnel.opened {
-                            let _ = tunnel
-                                .inbound_tx
-                                .send(Ok(H3TunnelEvent::Data(Bytes::copy_from_slice(&buf[..len]))))
-                                .await;
+                            status = tunnel.push_inbound(H3TunnelEvent::Data(
+                                Bytes::copy_from_slice(&buf[..len]),
+                            ));
+                            if status != TunnelInboundStatus::Open {
+                                break;
+                            }
                         } else if let Some(tx) = tunnel.response_tx.take() {
                             let _ = tx.send(Err(Error::HttpProtocol(
                                 "RFC 9220 tunnel DATA received before :status 200".into(),
@@ -1069,6 +1150,7 @@ impl H3Driver {
                     Err(e) => return Err(Error::Quic(format!("H3 recv body failed: {}", e))),
                 }
             }
+            self.apply_tunnel_inbound_status(stream_id, status);
             return Ok(());
         }
 
@@ -1125,13 +1207,15 @@ impl H3Driver {
     }
 
     async fn handle_finished_event(&mut self, stream_id: u64) -> Result<()> {
-        if let Some(mut tunnel) = self.tunnels.remove(&stream_id) {
+        if let Some(tunnel) = self.tunnels.get_mut(&stream_id) {
             if tunnel.opened {
-                let _ = tunnel.inbound_tx.send(Ok(H3TunnelEvent::EndStream)).await;
+                let status = tunnel.push_inbound(H3TunnelEvent::EndStream);
+                self.apply_tunnel_inbound_status(stream_id, status);
             } else if let Some(tx) = tunnel.response_tx.take() {
                 let _ = tx.send(Err(Error::HttpProtocol(
                     "RFC 9220 tunnel completed before :status 200".into(),
                 )));
+                self.tunnels.remove(&stream_id);
             }
             return Ok(());
         }
@@ -1171,14 +1255,13 @@ impl H3Driver {
     }
 
     async fn handle_reset_event(&mut self, stream_id: u64, error_code: u64) -> Result<()> {
-        if let Some(mut tunnel) = self.tunnels.remove(&stream_id) {
+        if let Some(tunnel) = self.tunnels.get_mut(&stream_id) {
             if tunnel.opened {
-                let _ = tunnel
-                    .inbound_tx
-                    .send(Ok(H3TunnelEvent::Reset(error_code.to_string())))
-                    .await;
+                let status = tunnel.push_inbound(H3TunnelEvent::Reset(error_code.to_string()));
+                self.apply_tunnel_inbound_status(stream_id, status);
             } else if let Some(tx) = tunnel.response_tx.take() {
                 let _ = tx.send(Err(Error::Quic(format!("Stream reset: {}", error_code))));
+                self.tunnels.remove(&stream_id);
             }
             return Ok(());
         }
@@ -1204,16 +1287,15 @@ impl H3Driver {
         let tunnel_ids: Vec<u64> = self.tunnels.keys().copied().collect();
         for stream_id in tunnel_ids {
             if stream_id > id {
-                if let Some(mut tunnel) = self.tunnels.remove(&stream_id) {
+                if let Some(tunnel) = self.tunnels.get_mut(&stream_id) {
                     if tunnel.opened {
-                        let _ = tunnel
-                            .inbound_tx
-                            .send(Ok(H3TunnelEvent::GoAway { id }))
-                            .await;
+                        let status = tunnel.push_inbound(H3TunnelEvent::GoAway { id });
+                        self.apply_tunnel_inbound_status(stream_id, status);
                     } else if let Some(tx) = tunnel.response_tx.take() {
                         let _ = tx.send(Err(Error::HttpProtocol(format!(
                             "HTTP/3 GOAWAY received id={id}"
                         ))));
+                        self.tunnels.remove(&stream_id);
                     }
                 }
             }

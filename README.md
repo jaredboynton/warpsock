@@ -234,6 +234,19 @@ Local/CI checks:
 - `cargo run --example protocol_test -- --verbose` walks through HTTP/1.1 preference, HTTP/2 pooling, HTTP/3 only, and connection header filtering. Pass `--target example.com` to test a custom origin.
 - `cargo clippy -p specter -- -D warnings` stays clean to make CI fail-fast on regressions.
 
+### Streaming benchmarks vs reqwest
+
+Specter includes deterministic localhost streaming benchmarks against `reqwest 0.12`. The persisted 2026-05-24 proof artifacts show Specter meeting the configured H1/H2 request-body and response-body gates: at least 5% median TTFT improvement, at least 5% median throughput improvement, Wilcoxon p-value below 0.01, p95 throughput regression at most 5%, and RFC 8441/WebSocket coexistence preserved.
+
+| Workload | Protocol | TTFT Improvement | Throughput Improvement | Throughput p-value | Artifact |
+| --- | --- | ---: | ---: | ---: | --- |
+| Response-body streaming | H1 | +64.19% | +28.81% | 3.97e-8 | [`h1h2-response-pushdata-budget-s100.json`](docs/benchmarks/2026-05-24-streaming/h1h2-response-pushdata-budget-s100.json) |
+| Response-body streaming | H2 | +32.85% | +5.98% | 0.00258 | [`h1h2-response-pushdata-budget-s100.json`](docs/benchmarks/2026-05-24-streaming/h1h2-response-pushdata-budget-s100.json) |
+| Request-body streaming | H1 | +10.82% | +12.13% | 3.21e-10 | [`h1h2-request-pushdata-budget-s100.json`](docs/benchmarks/2026-05-24-streaming/h1h2-request-pushdata-budget-s100.json) |
+| Request-body streaming | H2 | +17.73% | +21.55% | 0 | [`h1h2-request-pushdata-budget-s100.json`](docs/benchmarks/2026-05-24-streaming/h1h2-request-pushdata-budget-s100.json) |
+
+See [`docs/benchmarks/2026-05-24-streaming/`](docs/benchmarks/2026-05-24-streaming/) for the summary, raw JSON artifacts, exact commands, and RFC 8441 coexistence proof. These are deterministic local benchmark results, not a claim that every network or workload is faster.
+
 ## Development
 
 ### Pre-commit Hooks

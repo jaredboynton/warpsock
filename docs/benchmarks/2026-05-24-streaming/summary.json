@@ -1,0 +1,125 @@
+{
+  "title": "Specter streaming benchmark proof against reqwest 0.12",
+  "date": "2026-05-24",
+  "comparison": "Specter vs reqwest 0.12 on deterministic localhost streaming fixtures",
+  "thresholds": {
+    "median_ttft_improvement_pct_at_least": 5,
+    "median_throughput_improvement_pct_at_least": 5,
+    "wilcoxon_p_value_less_than": 0.01,
+    "p95_regression_pct_at_most": 5
+  },
+  "artifacts": [
+    {
+      "kind": "response-body streaming",
+      "file": "h1h2-response-pushdata-budget-s100.json",
+      "command": "cargo bench --bench streaming_vs_reqwest -- --protocol h1,h2 --response-body-streaming --samples 100 --warmups 5 --require-thresholds --json target/bench-results/h1h2-response-pushdata-budget-s100.json",
+      "threshold_summary": {
+        "required_thresholds_passed": true,
+        "failed_rows": [],
+        "negative_threshold_self_check": "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false; --self-test-threshold-failure induces required H1/H2 comparable threshold failures, including median win and p95 regression failures; Wilcoxon p-value failures are part of the same required_thresholds_passed gate; --self-test-h3-threshold-failure induces an H3 gate failure"
+      },
+      "rfc8441_coexistence": {
+        "status": "pass",
+        "contamination_detected": false,
+        "concurrency_level": 2,
+        "tunnel_stream_id": 1,
+        "streaming_stream_id": 3
+      },
+      "rows": [
+        {
+          "protocol": "h1",
+          "client": "specter",
+          "sample_count": 100,
+          "ttft_improvement_pct": 64.18983435506415,
+          "throughput_improvement_pct": 28.81044215099515,
+          "throughput_wilcoxon_signed_rank_p_value": 3.968705764023639e-8,
+          "p95_throughput_regression_pct": -20.038359705513066,
+          "client_overhead_duration_ns": 540562.5,
+          "status": "pass"
+        },
+        {
+          "protocol": "h2",
+          "client": "specter",
+          "sample_count": 100,
+          "ttft_improvement_pct": 32.85008403361345,
+          "throughput_improvement_pct": 5.978724887687112,
+          "throughput_wilcoxon_signed_rank_p_value": 0.0025784201862453227,
+          "p95_throughput_regression_pct": -4.860241622463833,
+          "client_overhead_duration_ns": 564728.5,
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "kind": "request-body streaming",
+      "file": "h1h2-request-pushdata-budget-s100.json",
+      "command": "cargo bench --bench streaming_vs_reqwest -- --protocol h1,h2 --request-body-streaming --samples 100 --warmups 5 --require-thresholds --json target/bench-results/h1h2-request-pushdata-budget-s100.json",
+      "threshold_summary": {
+        "required_thresholds_passed": true,
+        "failed_rows": [],
+        "negative_threshold_self_check": "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false; --self-test-threshold-failure induces required H1/H2 comparable threshold failures, including median win and p95 regression failures; Wilcoxon p-value failures are part of the same required_thresholds_passed gate; --self-test-h3-threshold-failure induces an H3 gate failure"
+      },
+      "rfc8441_coexistence": {
+        "status": "pass",
+        "contamination_detected": false,
+        "concurrency_level": 2,
+        "tunnel_stream_id": 1,
+        "streaming_stream_id": 3
+      },
+      "rows": [
+        {
+          "protocol": "h1",
+          "client": "specter",
+          "sample_count": 100,
+          "ttft_improvement_pct": 10.820881942509311,
+          "throughput_improvement_pct": 12.13416540192791,
+          "throughput_wilcoxon_signed_rank_p_value": 3.2101166169695716e-10,
+          "p95_throughput_regression_pct": -10.793184122893914,
+          "client_overhead_duration_ns": 820875.5,
+          "status": "pass"
+        },
+        {
+          "protocol": "h2",
+          "client": "specter",
+          "sample_count": 100,
+          "ttft_improvement_pct": 17.72923623226003,
+          "throughput_improvement_pct": 21.550946312382667,
+          "throughput_wilcoxon_signed_rank_p_value": 0,
+          "p95_throughput_regression_pct": -18.281643060085884,
+          "client_overhead_duration_ns": 864186.5,
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "kind": "RFC 8441 coexistence",
+      "file": "rfc8441-pushdata-budget-live.json",
+      "command": "cargo bench --bench streaming_vs_reqwest -- --protocol rfc8441 --json target/bench-results/rfc8441-pushdata-budget-live.json",
+      "threshold_summary": {
+        "required_thresholds_passed": true,
+        "failed_rows": [],
+        "negative_threshold_self_check": "implemented: --require-thresholds exits non-zero when required_thresholds_passed is false; --self-test-threshold-failure induces required H1/H2 comparable threshold failures, including median win and p95 regression failures; Wilcoxon p-value failures are part of the same required_thresholds_passed gate; --self-test-h3-threshold-failure induces an H3 gate failure"
+      },
+      "rfc8441_coexistence": {
+        "status": "pass",
+        "contamination_detected": false,
+        "concurrency_level": 2,
+        "tunnel_stream_id": 1,
+        "streaming_stream_id": 3
+      },
+      "rows": [
+        {
+          "protocol": "rfc8441",
+          "client": "specter",
+          "sample_count": 30,
+          "ttft_improvement_pct": null,
+          "throughput_improvement_pct": null,
+          "throughput_wilcoxon_signed_rank_p_value": null,
+          "p95_throughput_regression_pct": null,
+          "client_overhead_duration_ns": 0,
+          "status": "pass"
+        }
+      ]
+    }
+  ]
+}
