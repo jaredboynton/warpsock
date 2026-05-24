@@ -54,14 +54,12 @@ async fn high_level_streaming_reuses_pooled_h2_connection() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -185,14 +183,12 @@ async fn response_headers_arrive_before_body_completion() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -314,14 +310,12 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -439,14 +433,12 @@ async fn end_stream_closes_body_receiver_cleanly() {
             };
             let (_len, frame_type, flags, stream_id, _payload) = frame;
             match frame_type {
-                0x04 => {
-                    if flags & 0x01 == 0 && !settings_sent {
-                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                            .await
-                            .unwrap();
-                        conn.send_settings_ack().await.unwrap();
-                        settings_sent = true;
-                    }
+                0x04 if flags & 0x01 == 0 && !settings_sent => {
+                    conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                        .await
+                        .unwrap();
+                    conn.send_settings_ack().await.unwrap();
+                    settings_sent = true;
                 }
                 0x01 => {
                     let response_headers =
@@ -542,14 +534,12 @@ async fn header_only_response_completes_without_body_chunks() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -630,14 +620,12 @@ async fn regular_h2_requests_coexist_with_streaming_on_one_connection() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&payload).unwrap();
@@ -771,14 +759,12 @@ async fn fragmented_headers_stream_correctly() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers = encoder.encode(&[
@@ -882,14 +868,12 @@ async fn informational_headers_and_trailers_do_not_corrupt_streaming() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         // 1. Send informational 103 Early Hints
@@ -1120,14 +1104,12 @@ async fn concurrent_multiplexed_streams_keep_chunks_isolated() {
             };
             let (_len, frame_type, flags, stream_id, _payload) = frame;
             match frame_type {
-                0x04 => {
-                    if flags & 0x01 == 0 && !settings_sent {
-                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                            .await
-                            .unwrap();
-                        conn.send_settings_ack().await.unwrap();
-                        settings_sent = true;
-                    }
+                0x04 if flags & 0x01 == 0 && !settings_sent => {
+                    conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                        .await
+                        .unwrap();
+                    conn.send_settings_ack().await.unwrap();
+                    settings_sent = true;
                 }
                 0x01 => {
                     let response_headers =
@@ -1228,14 +1210,12 @@ async fn rst_stream_error_is_scoped_to_reset_stream() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -1374,14 +1354,12 @@ async fn goaway_refreshes_pool_without_data_loss() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         streams_seen += 1;
@@ -1528,14 +1506,12 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -1647,14 +1623,12 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         request_count += 1;
@@ -1780,15 +1754,13 @@ async fn flow_control_windows_advance_during_large_streams() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            // Configure small initial window size (SETTINGS_INITIAL_WINDOW_SIZE = 16384)
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 16384)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        // Configure small initial window size (SETTINGS_INITIAL_WINDOW_SIZE = 16384)
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 16384)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -1882,14 +1854,12 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let response_headers =
@@ -1997,14 +1967,12 @@ async fn streaming_timeouts_are_enforced_per_phase() {
             };
             let (_len, frame_type, flags, stream_id, _payload) = frame;
             match frame_type {
-                0x04 => {
-                    if flags & 0x01 == 0 && !settings_sent {
-                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                            .await
-                            .unwrap();
-                        conn.send_settings_ack().await.unwrap();
-                        settings_sent = true;
-                    }
+                0x04 if flags & 0x01 == 0 && !settings_sent => {
+                    conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                        .await
+                        .unwrap();
+                    conn.send_settings_ack().await.unwrap();
+                    settings_sent = true;
                 }
                 0x01 => {
                     let decoded = decoder.decode(&_payload).unwrap();
@@ -2160,15 +2128,13 @@ async fn request_body_flow_control_with_streaming_response() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            // Configure small initial window size (SETTINGS_INITIAL_WINDOW_SIZE = 16384)
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 16384)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        // Configure small initial window size (SETTINGS_INITIAL_WINDOW_SIZE = 16384)
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 16384)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         conn.send_window_update(0, 65535).await.unwrap();
@@ -2282,14 +2248,12 @@ async fn stale_h2_pool_entries_are_evicted_before_reuse() {
                 };
                 let (_len, frame_type, flags, stream_id, _payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&_payload).unwrap();
@@ -2409,14 +2373,12 @@ async fn stale_h2_pool_retry_response_is_finalized() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
-                                .await
-                                .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535)])
+                            .await
+                            .unwrap();
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&payload).unwrap();
@@ -2578,20 +2540,13 @@ async fn rfc8441_tunnel_coexists_with_streaming_on_one_connection() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            // Send SETTINGS with ENABLE_CONNECT_PROTOCOL = 1
-                            conn.send_settings(&[
-                                (0x01, 4096),
-                                (0x03, 100),
-                                (0x04, 65535),
-                                (0x08, 1),
-                            ])
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        // Send SETTINGS with ENABLE_CONNECT_PROTOCOL = 1
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535), (0x08, 1)])
                             .await
                             .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&payload).unwrap();
@@ -2740,19 +2695,12 @@ async fn rfc8441_and_streaming_data_routing_remains_independent() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            conn.send_settings(&[
-                                (0x01, 4096),
-                                (0x03, 100),
-                                (0x04, 65535),
-                                (0x08, 1),
-                            ])
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535), (0x08, 1)])
                             .await
                             .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&payload).unwrap();
@@ -3077,20 +3025,13 @@ async fn rfc8441_failures_are_isolated_from_streaming() {
                 };
                 let (_len, frame_type, flags, stream_id, payload) = frame;
                 match frame_type {
-                    0x04 => {
-                        if flags & 0x01 == 0 && !settings_sent {
-                            // Send settings with ENABLE_CONNECT_PROTOCOL = 1
-                            conn.send_settings(&[
-                                (0x01, 4096),
-                                (0x03, 100),
-                                (0x04, 65535),
-                                (0x08, 1),
-                            ])
+                    0x04 if flags & 0x01 == 0 && !settings_sent => {
+                        // Send settings with ENABLE_CONNECT_PROTOCOL = 1
+                        conn.send_settings(&[(0x01, 4096), (0x03, 100), (0x04, 65535), (0x08, 1)])
                             .await
                             .unwrap();
-                            conn.send_settings_ack().await.unwrap();
-                            settings_sent = true;
-                        }
+                        conn.send_settings_ack().await.unwrap();
+                        settings_sent = true;
                     }
                     0x01 => {
                         let decoded = decoder.decode(&payload).unwrap();

@@ -2,7 +2,9 @@ use specter::fingerprint::tls::NativeH3TlsFeatureStatus;
 use specter::fingerprint::{
     FingerprintProfile, H3Settings, Http3Fingerprint, QuicTransportParams, TlsFingerprint,
 };
+use specter::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
 use specter::{Client, H3Backend, H3Client};
+use std::time::Duration;
 
 #[test]
 fn chrome_http3_fingerprint_exposes_quic_h3_and_grease_knobs() {
@@ -130,4 +132,24 @@ fn tls_fingerprint_reports_native_h3_resumption_and_zero_rtt_capability() {
     );
     assert!(capabilities.supports_session_resumption());
     assert!(capabilities.supports_zero_rtt());
+}
+
+#[test]
+fn h3_client_exposes_shared_native_h3_session_cache_for_resumption() {
+    let cache = NativeH3SessionCache::with_capacity(8, Duration::from_secs(60));
+    let key = NativeH3SessionCacheKey::new(
+        "example.com",
+        [b"h3".to_vec()],
+        true,
+        Some("tls=chrome;h3=chrome".to_string()),
+    );
+    cache.insert(key, b"cached-session".as_slice(), 0, None);
+
+    let client = H3Client::new().with_native_session_cache(cache.clone());
+    assert_eq!(client.native_session_cache().len(), 1);
+
+    let cloned = client.clone();
+    cloned.native_session_cache().clear();
+
+    assert!(client.native_session_cache().is_empty());
 }
