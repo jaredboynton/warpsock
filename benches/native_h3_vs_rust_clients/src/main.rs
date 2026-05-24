@@ -1426,7 +1426,9 @@ fn spawn_local_native_h3_connection(
     client_source_cid: specter::transport::h3::quic::ConnectionId,
     server_source_cid: specter::transport::h3::quic::ConnectionId,
 ) {
-    let fingerprint = specter::fingerprint::Http3Fingerprint::chrome();
+    let mut fingerprint = specter::fingerprint::Http3Fingerprint::chrome();
+    fingerprint.transport.initial_max_streams_bidi = LOCAL_FIXTURE_MAX_STREAMS;
+    fingerprint.transport.initial_max_streams_uni = LOCAL_FIXTURE_MAX_STREAMS;
     let Ok(handshake) = specter::transport::h3::handshake::NativeQuicServerHandshake::new(
         &fingerprint,
         &cert_pem,
@@ -1999,6 +2001,8 @@ async fn measure_specter_native(
 ) -> anyhow::Result<BenchmarkRow> {
     let mut fingerprint = specter::fingerprint::Http3Fingerprint::chrome();
     fingerprint.transport.ack_eliciting_threshold = 128;
+    fingerprint.transport.initial_max_streams_bidi = LOCAL_FIXTURE_MAX_STREAMS;
+    fingerprint.transport.initial_max_streams_uni = LOCAL_FIXTURE_MAX_STREAMS;
     let client = specter::H3Client::new()
         .danger_accept_invalid_certs(true)
         .with_http3_fingerprint(fingerprint)
