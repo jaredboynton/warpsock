@@ -288,6 +288,7 @@ fn quinn_transport_row_from_samples(samples: &[AdapterSample]) -> BenchmarkRow {
     adapter_row_from_samples("quinn_transport", "quinn_transport_adapter", samples)
 }
 
+#[cfg(any(test, feature = "s2n-quic-transport"))]
 fn s2n_quic_transport_row_from_samples(samples: &[AdapterSample]) -> BenchmarkRow {
     adapter_row_from_samples("s2n_quic_transport", "s2n_quic_transport_adapter", samples)
 }
@@ -355,10 +356,7 @@ fn placeholder_rows(
     competitor_specs()
         .into_iter()
         .map(|spec| {
-            if let Some(row) = imported_competitor_rows
-                .iter()
-                .find(|row| row.competitor_id == spec.id)
-            {
+            if let Some(row) = best_imported_competitor_row(imported_competitor_rows, spec.id) {
                 return row.clone();
             }
             if spec.id == "specter_native" {
@@ -381,6 +379,24 @@ fn placeholder_rows(
             }
         })
         .collect()
+}
+
+fn best_imported_competitor_row<'a>(
+    rows: &'a [BenchmarkRow],
+    competitor_id: &str,
+) -> Option<&'a BenchmarkRow> {
+    rows.iter()
+        .filter(|row| row.competitor_id == competitor_id)
+        .max_by_key(|row| imported_row_status_rank(row.status.as_str()))
+}
+
+fn imported_row_status_rank(status: &str) -> u8 {
+    match status {
+        "measured_pass" => 3,
+        "measured_fail" => 2,
+        "pending_adapter" | "pending_measurement" => 0,
+        _ => 1,
+    }
 }
 
 fn superiority_gate(rows: &[BenchmarkRow]) -> SuperiorityGate {
@@ -479,6 +495,7 @@ fn artifact_with_competitor_artifacts<S: AsRef<str>>(
     )
 }
 
+#[cfg(test)]
 fn artifact_with_competitor_rows<S: AsRef<str>>(
     specter_streaming_artifact_json: Option<&str>,
     competitor_artifact_jsons: &[S],
@@ -2551,6 +2568,35 @@ mod tests {
             artifact.superiority_gate.reason,
             "no_h3_superiority_claim_without_all_required_rows"
         );
+    }
+
+    #[test]
+    fn artifact_import_prefers_measured_rows_over_pending_placeholders() {
+        let pending_artifact_json = r#"{
+          "rows": [
+            { "competitor_id": "s2n_quic_transport", "status": "pending_adapter", "p50_ttft_ns": null, "p95_ttft_ns": null, "bytes_per_sec": null, "source": "native_h3_vs_rust_clients_harness" }
+          ]
+        }"#;
+        let measured_artifact_json = r#"{
+          "rows": [
+            { "competitor_id": "s2n_quic_transport", "status": "measured_pass", "p50_ttft_ns": 10.0, "p95_ttft_ns": 20.0, "bytes_per_sec": 30.0, "source": "s2n_quic_transport_adapter" }
+          ]
+        }"#;
+
+        let artifact = super::artifact_with_competitor_artifacts(
+            None,
+            &[pending_artifact_json, measured_artifact_json],
+        );
+
+        let row = artifact
+            .rows
+            .iter()
+            .find(|row| row.competitor_id == "s2n_quic_transport")
+            .expect("s2n row should exist");
+
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.p50_ttft_ns, Some(10.0));
+        assert_eq!(row.source, "s2n_quic_transport_adapter");
     }
 
     #[test]
