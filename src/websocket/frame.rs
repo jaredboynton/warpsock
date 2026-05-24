@@ -202,13 +202,6 @@ impl FrameDecoder {
 }
 
 #[inline]
-pub(crate) fn encode_frame(opcode: OpCode, payload: &[u8], mask_rng: &mut MaskRng) -> Bytes {
-    let mut out = BytesMut::with_capacity(14 + payload.len());
-    encode_frame_into(opcode, payload, mask_rng, &mut out);
-    out.freeze()
-}
-
-#[inline]
 pub(crate) fn encode_frame_into(
     opcode: OpCode,
     payload: &[u8],
