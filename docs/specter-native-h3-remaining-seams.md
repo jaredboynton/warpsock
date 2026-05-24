@@ -10,7 +10,7 @@ Repo: `/Users/jaredboynton/__devlocal/specter`
 - `reqwest_h3` now works against the local native fixture by using a preconfigured rustls/quinn config pinned to `TLS13_AES_128_GCM_SHA256` and `h3` ALPN.
 - Native QUIC ACK state now clears pending ACKs after send without forgetting ACK ranges, preventing the ACK storm that caused repeated streaming requests to hang.
 - Native QUIC frame codec now round-trips RFC9000 ACK_ECN frames (`0x03`), validates ACK_ECN counters, records CE growth, and applies ACK_ECN ranges like ordinary ACK ranges.
-- Native QUIC now has send-time tracking, client Handshake CRYPTO PTO retransmission, event-level peer close draining, Retry/VN packet primitives, and client PATH_CHALLENGE/PATH_RESPONSE token lifecycle coverage.
+- Native QUIC now has send-time tracking, ACK-driven RTT/PTO estimator updates, client Handshake CRYPTO PTO retransmission, event-level peer close draining, Retry/VN packet primitives, and client PATH_CHALLENGE/PATH_RESPONSE token lifecycle coverage.
 - Native H3 now exposes a reusable `H3Handle` path for low-overhead repeated requests and a same-URL hot handle cache for the higher-level `H3Client` path.
 - Native H3 TLS now advertises certificate compression from the TLS fingerprint, emits raw ordered QUIC transport parameters when configured, and exposes capability status that makes session resumption/0-RTT explicitly unsupported until wired.
 - Native H3 scheduling now has in-connection request-body/tunnel DATA rotation plus a pool-level `OriginFairQueue` primitive; H3Client dispatch is not yet wired to that pool primitive.
@@ -124,6 +124,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Added ACK_ECN frame encode/decode support, counter validation, CE growth tracking, and ACK_ECN range handling in the native QUIC loss detector.
 - Added native QUIC Version Negotiation and Retry packet parsing primitives, RFC9001 QUIC v1 Retry integrity tag calculation/validation, and client PATH_CHALLENGE packetization with matching PATH_RESPONSE validation; full Retry/VN handshake and path migration integration remain pending.
 - Added QUIC send-time tracking and client Handshake CRYPTO PTO retransmission while preserving CRYPTO offsets and fresh packet numbers; full packet-space recovery remains pending.
+- Wired ACK-frame processing to sample RTT from newly ACKed largest sent packets, update latest/min/smoothed RTT and RTT variance, and feed the current PTO estimate.
 - Added event-level peer `CONNECTION_CLOSE` draining so inbound close frames stop further H3 event processing; close timers/retransmit remain pending.
 - Fixed native server QUIC transport parameters for required connection-ID fields and fixed server/client CID handling for 1-RTT packet routing.
 - Added a same-fixture `specter_native_rfc9220_tunnel` benchmark row that opens RFC9220/WebSocket-over-H3 against the native fixture, echoes H3 DATA, and records TTFT/throughput separately from the H3 streaming superiority gate.
@@ -140,7 +141,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 
 - Native QUIC ACK_ECN frame encode/decode, counter validation, CE growth tracking, and loss-detector ACK range handling are implemented; remaining ECN work is outbound marking, CE-driven congestion response, and PMTU/path probing policy.
 - Version Negotiation and Retry packet parsing, QUIC v1 Retry integrity validation, and client PATH_CHALLENGE/PATH_RESPONSE token lifecycle handling are implemented; remaining work is Retry/VN handshake integration and full per-address path migration state.
-- QUIC send-time tracking, client Handshake CRYPTO PTO retransmission, and event-level peer close draining are implemented; remaining recovery work is full RFC9002 timers/backoff, Initial/server CRYPTO PTO, and close-drain timer/retransmit behavior.
+- QUIC send-time tracking, ACK-driven RTT/PTO estimator updates, client Handshake CRYPTO PTO retransmission, and event-level peer close draining are implemented; remaining recovery work is full RFC9002 timers/backoff, Initial/server CRYPTO PTO, and close-drain timer/retransmit behavior.
 - Client/server same-fixture ACK decimation now has a `max_ack_delay_ms` timer path; remaining ACK work is browser-capture parity for tuned thresholds.
 - The latest full same-fixture proof emits no fixture packet-error events, and fixture events now serialize stable `category`/`fatal` fields; keep this as a regression guard, not an active cleanup gap.
 - `quinn_transport` and optional `s2n_quic_transport` have measured transport-only comparator adapters; they remain non-H3 rows and are not required for the H3 superiority gate.
@@ -152,7 +153,7 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 
 ## Remaining gaps
 
-- Native QUIC still needs full packet-space RFC9002 PTO/timer-driven recovery with RTT/backoff, Initial/server CRYPTO PTO retransmission, RFC-grade close-drain timing beyond the bounded client replay window, key update handling, Version Negotiation/Retry handshake integration beyond packet primitives, ECN socket marking plus CE-driven congestion response, and path migration/validation beyond the client token lifecycle.
+- Native QUIC still needs full packet-space RFC9002 PTO/timer-driven recovery with PTO backoff, Initial/server CRYPTO PTO retransmission, RFC-grade close-drain timing beyond the bounded client replay window, key update handling, Version Negotiation/Retry handshake integration beyond packet primitives, ECN socket marking plus CE-driven congestion response, and path migration/validation beyond the client token lifecycle.
 - Browser-capture ACK parity remains open for per-browser/version ACK behavior and the tuned `ack_eliciting_threshold = 128` benchmark profile.
 - RFC9220/WebSocket-over-H3 still lacks p99-scale samples and a dedicated tunnel superiority gate/claim, even though low-level `quiche` and `tokio-quiche` raw tunnel comparator adapters now have n=30 rows.
 - TLS/H3 fingerprint gaps remain: extension ordering/permutation evidence and control, `SSL_SESSION` ticket capture/replay, 0-RTT send with replay policy, capture-derived raw transport-parameter presets, and dynamic connection-ID placeholder handling inside raw ordered transport-parameter lists.

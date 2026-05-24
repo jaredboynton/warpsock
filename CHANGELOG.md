@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Native HTTP/3 comparator proof**: Documented the n=30 same-fixture native H3 benchmark against `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest_h3`, plus RFC 9220 tunnel workload artifacts, measured low-level `quiche`/`tokio-quiche` RFC 9220 comparator rows, and remaining production-hardening caveats.
 
 ### Changed
-- **Native HTTP/3 gap closure**: Tightened delayed ACK handling, ACK_ECN parsing/loss-detector handling, Retry/VN packet primitives, raw ordered QUIC transport parameters, TLS certificate-compression and extension-order behavior wiring, RFC 9220 tunnel scheduling/backpressure, transport-only QUIC comparators, low-level RFC 9220 comparator adapters, and client CONNECTION_CLOSE drain replay while keeping unresolved production gaps explicit in docs.
+- **Native HTTP/3 gap closure**: Tightened delayed ACK handling, ACK-driven RTT/PTO estimator updates, ACK_ECN parsing/loss-detector handling, Retry/VN packet primitives, raw ordered QUIC transport parameters, TLS certificate-compression and extension-order behavior wiring, RFC 9220 tunnel scheduling/backpressure, transport-only QUIC comparators, low-level RFC 9220 comparator adapters, and client CONNECTION_CLOSE drain replay while keeping unresolved production gaps explicit in docs.
 
 ## [4.0.1] - 2026-05-24
 
