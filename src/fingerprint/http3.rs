@@ -94,7 +94,9 @@ impl RawQuicTransportParameter {
         }
     }
 
-    pub(crate) fn connection_id_placeholder(&self) -> Option<RawQuicTransportParameterConnectionId> {
+    pub(crate) fn connection_id_placeholder(
+        &self,
+    ) -> Option<RawQuicTransportParameterConnectionId> {
         match (self.id, self.value.as_slice()) {
             (
                 Self::ORIGINAL_DESTINATION_CONNECTION_ID_ID,
@@ -104,10 +106,9 @@ impl RawQuicTransportParameter {
                 Self::INITIAL_SOURCE_CONNECTION_ID_ID,
                 Self::INITIAL_SOURCE_CONNECTION_ID_PLACEHOLDER,
             ) => Some(RawQuicTransportParameterConnectionId::InitialSource),
-            (
-                Self::RETRY_SOURCE_CONNECTION_ID_ID,
-                Self::RETRY_SOURCE_CONNECTION_ID_PLACEHOLDER,
-            ) => Some(RawQuicTransportParameterConnectionId::RetrySource),
+            (Self::RETRY_SOURCE_CONNECTION_ID_ID, Self::RETRY_SOURCE_CONNECTION_ID_PLACEHOLDER) => {
+                Some(RawQuicTransportParameterConnectionId::RetrySource)
+            }
             _ => None,
         }
     }
