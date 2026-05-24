@@ -49,6 +49,32 @@ fn native_h3_driver_defers_receive_credit_while_streaming_bodies_are_backpressur
 }
 
 #[test]
+fn native_h3_driver_flushes_receive_credit_from_consumed_body_bytes() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let body_progress = driver
+        .split("_ = self.body_progress_notify.notified() =>")
+        .nth(1)
+        .expect("body progress branch")
+        .split("}")
+        .next()
+        .expect("body progress branch body");
+
+    assert!(
+        driver.contains("apply_released_body_credits"),
+        "native H3 driver must collect public body-consumed bytes before advertising receive credit"
+    );
+    assert!(
+        driver.contains("take_released_recv_bytes"),
+        "native H3 driver must read byte-precise H3BodyShared release counters"
+    );
+    assert!(
+        body_progress.contains("apply_released_body_credits().await?"),
+        "body progress must apply consumed body-byte credit before flushing receive-window updates"
+    );
+}
+
+#[test]
 fn native_mock_h3_server_schedules_receive_flow_control_updates() {
     let mock_server = std::fs::read_to_string("tests/helpers/mock_h3_server.rs")
         .expect("native mock H3 server source");
