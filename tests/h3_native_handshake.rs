@@ -15,8 +15,8 @@ use specter::transport::h3::native_driver::{
 };
 use specter::transport::h3::quic::{
     decode_frames, decode_long_header, derive_initial_key_material,
-    derive_packet_key_material_from_secret, encode_frame, encode_initial_header,
-    encode_long_header, initial_crypto_plaintext, open_long_header_packet,
+    derive_next_packet_key_material, derive_packet_key_material_from_secret, encode_frame,
+    encode_initial_header, encode_long_header, initial_crypto_plaintext, open_long_header_packet,
     open_short_header_packet, protect_long_header_packet, protect_short_header_packet,
     retry_integrity_tag_v1, split_long_header_datagram, ConnectionId, LongHeaderPacket,
     LongHeaderType, QuicFrame,
@@ -439,6 +439,91 @@ fn native_h3_server_handshake_packetizes_handshake_done() {
     assert!(frames
         .iter()
         .any(|frame| matches!(frame, QuicFrame::HandshakeDone)));
+}
+
+#[test]
+fn native_h3_client_opens_server_packet_after_one_rtt_key_update() {
+    let fingerprint = Http3Fingerprint::chrome();
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut client = NativeQuicHandshake::client_with_verify_peer(
+        "localhost",
+        &fingerprint,
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+        false,
+    )
+    .unwrap();
+    let (cert_pem, key_pem) = helpers::tls::cached_cert_and_key_pem();
+    let mut server = NativeQuicServerHandshake::new(
+        &fingerprint,
+        &cert_pem,
+        &key_pem,
+        client_destination_cid,
+        client_source_cid.clone(),
+        ConnectionId::from_static(b"native-server-cid"),
+    )
+    .unwrap();
+    let server_flight = server
+        .process_client_initial(client.client_initial().packet.as_ref())
+        .unwrap();
+    let processed = client
+        .process_server_datagram(&server_flight.datagram)
+        .unwrap();
+    let client_finished = Bytes::from(
+        processed
+            .iter()
+            .flat_map(|processed| processed.handshake_crypto_out.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    let client_finished_packet = client
+        .build_client_handshake_crypto_packet(client_finished)
+        .unwrap()
+        .unwrap();
+    let processed = server
+        .process_client_handshake(client_finished_packet.packet.as_ref())
+        .unwrap();
+    let server_application_keys = processed
+        .secrets
+        .iter()
+        .find(|secret| {
+            secret.direction == QuicSecretDirection::Write
+                && secret.level == QuicEncryptionLevel::Application
+        })
+        .unwrap()
+        .packet_key_material()
+        .unwrap();
+    let next_keys = derive_next_packet_key_material(&server_application_keys).unwrap();
+    let mut payload = encode_frame(&QuicFrame::Ping).to_vec();
+    payload.resize(24, 0);
+    let packet =
+        protect_short_header_packet(&next_keys, &client_source_cid, 0, 2, true, &payload).unwrap();
+
+    let frames = client.open_server_application_packet(&packet).unwrap();
+
+    assert!(frames.iter().any(|frame| matches!(frame, QuicFrame::Ping)));
+}
+
+#[test]
+fn native_h3_server_opens_client_packet_after_one_rtt_key_update() {
+    let (_, mut client, mut server) = completed_native_server_handshake();
+
+    client.force_key_update().unwrap();
+    let packet = client
+        .build_client_application_stream_packet(0, Bytes::from_static(b"phase1"), false)
+        .unwrap()
+        .unwrap();
+    let frames = server
+        .open_client_application_packet(packet.packet.as_ref())
+        .unwrap();
+
+    assert!(server.read_key_phase());
+    assert!(frames.iter().any(|frame| {
+        matches!(
+            frame,
+            QuicFrame::Stream { stream_id: 0, data, .. } if data == b"phase1".as_slice()
+        )
+    }));
 }
 
 #[test]
@@ -1720,6 +1805,381 @@ fn native_h3_handshake_validates_retry_and_queues_new_initial() {
 }
 
 #[test]
+fn native_h3_handshake_retry_restarts_initial_crypto_offset_at_zero_with_new_dcid() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let retry_source_cid = ConnectionId::from_static(b"retry-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    let retry = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &retry_source_cid,
+        b"retry-token",
+    );
+
+    handshake
+        .process_server_datagram(&retry)
+        .expect("valid Retry is accepted");
+    let pending = handshake
+        .take_pending_client_initial()
+        .expect("Retry queues a token-bearing Initial");
+
+    let packets = split_long_header_datagram(pending.packet.as_ref()).unwrap();
+    let retry_keys = derive_initial_key_material(retry_source_cid.as_bytes()).unwrap();
+    let opened = open_long_header_packet(
+        &retry_keys.client,
+        pending.packet.as_ref(),
+        packets[0].packet_number_offset,
+        1,
+    )
+    .unwrap();
+    let frames = decode_frames(&opened.payload).unwrap();
+    assert!(
+        matches!(&frames[0], QuicFrame::Crypto { offset, .. } if *offset == 0),
+        "Retry Initial must restart CRYPTO offset at zero per RFC9000 section 7.2"
+    );
+    assert!(handshake.retry_received());
+}
+
+#[test]
+fn native_h3_handshake_ignores_second_retry_per_rfc9000_section_17_2_5_2() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let first_retry_source_cid = ConnectionId::from_static(b"retry-scid-1");
+    let second_retry_source_cid = ConnectionId::from_static(b"retry-scid-2");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+
+    let first = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &first_retry_source_cid,
+        b"first-token",
+    );
+    handshake
+        .process_server_datagram(&first)
+        .expect("first Retry is accepted");
+    let first_pending = handshake
+        .take_pending_client_initial()
+        .expect("first Retry queues an Initial");
+    let first_header = decode_long_header(&first_pending.packet).unwrap();
+    assert_eq!(first_header.token, Bytes::from_static(b"first-token"));
+
+    let second = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &second_retry_source_cid,
+        b"second-token",
+    );
+    handshake
+        .process_server_datagram(&second)
+        .expect("second Retry must be silently discarded per RFC9000 section 17.2.5.2");
+
+    assert!(handshake.take_pending_client_initial().is_none());
+}
+
+#[test]
+fn native_h3_handshake_discards_retry_after_server_initial_packet_observed() {
+    let fingerprint = Http3Fingerprint::chrome();
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let server_source_cid = ConnectionId::from_static(b"native-server-cid");
+    let mut client = NativeQuicHandshake::client_with_verify_peer(
+        "localhost",
+        &fingerprint,
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+        false,
+    )
+    .unwrap();
+    let (cert_pem, key_pem) = helpers::tls::cached_cert_and_key_pem();
+    let mut server = NativeQuicServerHandshake::new(
+        &fingerprint,
+        &cert_pem,
+        &key_pem,
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+        server_source_cid,
+    )
+    .unwrap();
+    let server_flight = server
+        .process_client_initial(client.client_initial().packet.as_ref())
+        .unwrap();
+    client
+        .process_server_datagram(&server_flight.datagram)
+        .expect("server Initial+Handshake flight is accepted");
+
+    let late_retry = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &ConnectionId::from_static(b"late-retry-scid"),
+        b"late-retry-token",
+    );
+
+    client
+        .process_server_datagram(&late_retry)
+        .expect("late Retry must be silently discarded per RFC9000 section 17.2.5.1");
+    assert!(client.take_pending_client_initial().is_none());
+}
+
+#[test]
+fn native_h3_handshake_discards_retry_with_corrupted_integrity_tag() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let retry_source_cid = ConnectionId::from_static(b"retry-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    let mut retry = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &retry_source_cid,
+        b"retry-token",
+    )
+    .to_vec();
+    let last = retry.len() - 1;
+    retry[last] ^= 0x01;
+
+    handshake
+        .process_server_datagram(&retry)
+        .expect("Retry with invalid integrity tag must be silently discarded");
+    assert!(handshake.take_pending_client_initial().is_none());
+    assert!(!handshake.retry_received());
+}
+
+#[test]
+fn native_h3_handshake_discards_retry_with_empty_token_per_rfc9000_section_17_2_5() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let retry_source_cid = ConnectionId::from_static(b"retry-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    let retry = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &retry_source_cid,
+        b"",
+    );
+
+    handshake
+        .process_server_datagram(&retry)
+        .expect("Retry with empty token must be silently discarded");
+    assert!(handshake.take_pending_client_initial().is_none());
+    assert!(!handshake.retry_received());
+}
+
+#[test]
+fn native_h3_handshake_discards_retry_whose_source_cid_matches_original_destination() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    let retry = retry_packet(
+        &client_destination_cid,
+        &client_source_cid,
+        &client_destination_cid,
+        b"retry-token",
+    );
+
+    handshake
+        .process_server_datagram(&retry)
+        .expect("Retry whose source CID equals original DCID must be discarded");
+    assert!(handshake.take_pending_client_initial().is_none());
+}
+
+#[test]
+fn native_h3_handshake_version_negotiation_restarts_with_supported_draft_version() {
+    const DRAFT_VERSION: u32 = 0x0000_0029;
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    handshake
+        .set_supported_versions(vec![1, DRAFT_VERSION])
+        .unwrap();
+    let original_initial = handshake.client_initial().packet.clone();
+
+    let vn = version_negotiation_packet(
+        &client_source_cid,
+        &client_destination_cid,
+        &[DRAFT_VERSION, 0x709a_50c4],
+    );
+    let processed = handshake
+        .process_server_datagram(&vn)
+        .expect("VN that lists a supported draft must trigger restart");
+    let pending = handshake
+        .take_pending_client_initial()
+        .expect("VN restart queues a fresh Initial");
+
+    assert!(processed.is_empty());
+    assert!(handshake.version_negotiation_received());
+    assert_eq!(handshake.client_initial_version(), DRAFT_VERSION);
+    assert_ne!(pending.packet, original_initial);
+
+    let header = decode_long_header(&pending.packet).unwrap();
+    assert_eq!(
+        header.version, DRAFT_VERSION,
+        "VN restart must encode the chosen version in the Initial header"
+    );
+    assert_eq!(header.destination_cid, client_destination_cid);
+    assert_ne!(
+        header.source_cid, client_source_cid,
+        "VN restart must regenerate a fresh source connection ID"
+    );
+    assert_eq!(
+        header.source_cid.as_bytes().len(),
+        client_source_cid.as_bytes().len(),
+    );
+}
+
+#[test]
+fn native_h3_handshake_version_negotiation_errors_when_no_supported_version_in_list() {
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    let vn = version_negotiation_packet(
+        &client_source_cid,
+        &client_destination_cid,
+        &[0xff00_001d, 0x709a_50c4],
+    );
+
+    let err = handshake
+        .process_server_datagram(&vn)
+        .expect_err("VN without overlap must surface a clear error");
+
+    assert!(err.to_string().contains("version_negotiation_failed"));
+    assert!(handshake.take_pending_client_initial().is_none());
+    assert!(!handshake.version_negotiation_received());
+}
+
+#[test]
+fn native_h3_handshake_ignores_second_version_negotiation_after_restart() {
+    const DRAFT_VERSION: u32 = 0x0000_0029;
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    handshake
+        .set_supported_versions(vec![1, DRAFT_VERSION])
+        .unwrap();
+
+    let first_vn = version_negotiation_packet(
+        &client_source_cid,
+        &client_destination_cid,
+        &[DRAFT_VERSION],
+    );
+    handshake
+        .process_server_datagram(&first_vn)
+        .expect("first VN triggers restart");
+    let first_pending = handshake
+        .take_pending_client_initial()
+        .expect("first VN restart queues an Initial");
+    let new_source_cid = decode_long_header(&first_pending.packet)
+        .unwrap()
+        .source_cid;
+
+    let second_vn =
+        version_negotiation_packet(&new_source_cid, &client_destination_cid, &[DRAFT_VERSION]);
+    let processed = handshake
+        .process_server_datagram(&second_vn)
+        .expect("subsequent VN must be silently ignored");
+
+    assert!(processed.is_empty());
+    assert!(handshake.take_pending_client_initial().is_none());
+}
+
+#[test]
+fn native_h3_handshake_retry_after_version_negotiation_restart_uses_new_source_cid() {
+    const DRAFT_VERSION: u32 = 0x0000_0029;
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let retry_source_cid = ConnectionId::from_static(b"retry-scid-vn");
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+    )
+    .unwrap();
+    handshake
+        .set_supported_versions(vec![1, DRAFT_VERSION])
+        .unwrap();
+
+    let vn = version_negotiation_packet(
+        &client_source_cid,
+        &client_destination_cid,
+        &[DRAFT_VERSION],
+    );
+    handshake
+        .process_server_datagram(&vn)
+        .expect("VN restart succeeds");
+    let restarted = handshake
+        .take_pending_client_initial()
+        .expect("VN restart queues fresh Initial");
+    let new_source_cid = decode_long_header(&restarted.packet).unwrap().source_cid;
+
+    let retry = retry_packet(
+        &client_destination_cid,
+        &new_source_cid,
+        &retry_source_cid,
+        b"vn-retry-token",
+    );
+    handshake
+        .process_server_datagram(&retry)
+        .expect("Retry against post-VN attempt is accepted");
+    let retry_initial = handshake
+        .take_pending_client_initial()
+        .expect("Retry restart queues a token-bearing Initial");
+    let retry_header = decode_long_header(&retry_initial.packet).unwrap();
+
+    assert_eq!(retry_header.destination_cid, retry_source_cid);
+    assert_eq!(retry_header.source_cid, new_source_cid);
+    assert_eq!(retry_header.token, Bytes::from_static(b"vn-retry-token"));
+    assert!(handshake.retry_received());
+}
+
+#[test]
 fn native_h3_handshake_rejects_server_original_dcid_transport_parameter_mismatch() {
     let fingerprint = Http3Fingerprint::chrome();
     let client_destination_cid = ConnectionId::from_static(b"server-dcid");
@@ -2021,7 +2481,7 @@ fn native_h3_server_retransmits_unacked_initial_and_handshake_crypto_after_pto()
     let client_destination_cid = ConnectionId::from_static(b"server-dcid");
     let client_source_cid = ConnectionId::from_static(b"client-scid");
     let server_source_cid = ConnectionId::from_static(b"native-server-cid");
-    let mut client = NativeQuicHandshake::client_with_verify_peer(
+    let client = NativeQuicHandshake::client_with_verify_peer(
         "localhost",
         &fingerprint,
         client_destination_cid.clone(),
@@ -2059,11 +2519,23 @@ fn native_h3_server_retransmits_unacked_initial_and_handshake_crypto_after_pto()
 
     assert_eq!(retransmits.len(), 2);
     assert_eq!(retransmits[0].packet_type, LongHeaderType::Initial);
-    assert_eq!(retransmits[0].packet_number, server_flight.packets[0].packet_number + 1);
-    assert_eq!(retransmits[0].crypto_data, server_flight.packets[0].crypto_data);
+    assert_eq!(
+        retransmits[0].packet_number,
+        server_flight.packets[0].packet_number + 1
+    );
+    assert_eq!(
+        retransmits[0].crypto_data,
+        server_flight.packets[0].crypto_data
+    );
     assert_eq!(retransmits[1].packet_type, LongHeaderType::Handshake);
-    assert_eq!(retransmits[1].packet_number, server_flight.packets[1].packet_number + 1);
-    assert_eq!(retransmits[1].crypto_data, server_flight.packets[1].crypto_data);
+    assert_eq!(
+        retransmits[1].packet_number,
+        server_flight.packets[1].packet_number + 1
+    );
+    assert_eq!(
+        retransmits[1].crypto_data,
+        server_flight.packets[1].crypto_data
+    );
 
     let initial_keys = derive_initial_key_material(client_destination_cid.as_bytes()).unwrap();
     let opened_initial = open_long_header_packet(

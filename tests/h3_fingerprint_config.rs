@@ -120,14 +120,14 @@ fn tls_fingerprint_reports_native_h3_resumption_and_zero_rtt_capability() {
 
     assert_eq!(
         capabilities.session_resumption,
-        NativeH3TlsFeatureStatus::Unsupported {
-            reason: "native H3 does not yet wire BoringSSL session tickets into the QUIC handshake"
-        }
+        NativeH3TlsFeatureStatus::Supported,
+        "native H3 wires SSL_CTX_sess_set_new_cb / SSL_set_session per RFC 8446 section 4.6.1"
     );
     assert_eq!(
         capabilities.zero_rtt,
-        NativeH3TlsFeatureStatus::Unsupported {
-            reason: "native H3 cannot send 0-RTT until session resumption and early-data transport replay are implemented"
-        }
+        NativeH3TlsFeatureStatus::Supported,
+        "native H3 wires SSL_set_quic_early_data_context per RFC 9001 section 4.6"
     );
+    assert!(capabilities.supports_session_resumption());
+    assert!(capabilities.supports_zero_rtt());
 }

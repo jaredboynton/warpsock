@@ -219,20 +219,18 @@ fn native_tls_deterministic_extension_order_policy_disables_permutation() {
 }
 
 #[test]
-fn native_h3_tls_capabilities_make_resumption_and_zero_rtt_gaps_explicit() {
+fn native_h3_tls_capabilities_report_supported_resumption_and_zero_rtt() {
     let capabilities = native_h3_tls_capabilities(&TlsFingerprint::chrome());
 
     assert_eq!(
         capabilities.session_resumption,
-        NativeH3TlsFeatureStatus::Unsupported {
-            reason: "native H3 does not yet wire BoringSSL session tickets into the QUIC handshake"
-        }
+        NativeH3TlsFeatureStatus::Supported,
+        "native H3 now wires BoringSSL session tickets into the QUIC handshake per RFC 8446 section 4.6.1"
     );
     assert_eq!(
         capabilities.zero_rtt,
-        NativeH3TlsFeatureStatus::Unsupported {
-            reason: "native H3 cannot send 0-RTT until session resumption and early-data transport replay are implemented"
-        }
+        NativeH3TlsFeatureStatus::Supported,
+        "native H3 now configures SSL_set_quic_early_data_context per RFC 9001 section 4.6"
     );
 }
 

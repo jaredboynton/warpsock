@@ -201,7 +201,7 @@ fn native_h3_driver_retains_connection_close_for_draining_replay() {
         "draining native H3 driver must replay CONNECTION_CLOSE on inbound peer packets instead of processing them"
     );
     assert!(
-        drive_loop.matches("drain_connection_close(&mut buf).await?").count() >= 2,
+        drive_loop.matches("run_close_window(&mut buf).await?").count() >= 2,
         "local idle/client-shutdown closes must remain in a bounded drain window and replay CONNECTION_CLOSE before driver exit"
     );
 }
@@ -271,6 +271,70 @@ fn native_h3_driver_schedules_request_body_and_tunnel_data_fairly() {
     assert!(
         driver.contains("data_budget") && driver.contains("record_data_sent"),
         "native H3 sends must use a bounded, adaptive per-turn DATA budget"
+    );
+}
+
+#[test]
+fn native_h3_driver_releases_tunnel_outbound_credit_per_wire_chunk() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let send_tunnel_data = driver
+        .split("async fn send_tunnel_data")
+        .nth(1)
+        .expect("native H3 driver must enqueue tunnel outbound data")
+        .split("async fn flush_scheduled_send_work")
+        .next()
+        .expect("send_tunnel_data section");
+    let flush_once = driver
+        .split("async fn flush_tunnel_data_once")
+        .nth(1)
+        .expect("native H3 driver must flush tunnel data")
+        .split("async fn flush_request_stream_bodies_once")
+        .next()
+        .expect("flush_tunnel_data_once section");
+
+    assert!(
+        send_tunnel_data.contains("DriverPendingTunnelOutbound::from_outbound"),
+        "driver must wrap outbound tunnel chunks with per-outbound byte-credit accounting"
+    );
+    assert!(
+        flush_once.contains("record_chunk_sent"),
+        "driver must release tunnel outbound byte credit as each wire chunk is sent"
+    );
+    assert!(
+        flush_once.contains("drain_remaining_credit"),
+        "driver must drain any remaining tunnel outbound credit when a queued outbound is fully consumed"
+    );
+    assert!(
+        !flush_once.contains("release_send_bytes(outbound.bytes.len())"),
+        "driver must not release a whole queued outbound's credit after only a partial DATA write"
+    );
+}
+
+#[test]
+fn h3_client_slow_path_uses_origin_fair_dispatcher() {
+    let h3_client = std::fs::read_to_string("src/transport/h3/mod.rs").expect("h3 module source");
+    let pooled_handle = h3_client
+        .split("async fn pooled_handle")
+        .nth(1)
+        .expect("H3Client must have pooled_handle")
+        .split("fn pool_key")
+        .next()
+        .expect("pooled_handle section");
+    let dispatcher_index = pooled_handle
+        .find("self.dispatcher.acquire")
+        .expect("H3Client slow path must acquire an origin-fair dispatcher ticket");
+    let connect_index = pooled_handle
+        .find("H3Connection::connect")
+        .expect("H3Client slow path must establish fresh connections");
+
+    assert!(
+        dispatcher_index < connect_index,
+        "H3Client must enter origin-fair admission before opening a fresh native H3 connection"
+    );
+    assert!(
+        pooled_handle.contains("OriginKey"),
+        "H3Client dispatcher admission must be keyed by origin, not by full fingerprint/pool key"
     );
 }
 
