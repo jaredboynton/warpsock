@@ -658,6 +658,22 @@ impl NativeQuicTlsSession {
     }
 }
 
+fn native_h3_early_data_context(
+    fingerprint: &Http3Fingerprint,
+    transport_parameters: &Bytes,
+) -> Bytes {
+    let mut context = Vec::new();
+    context.extend_from_slice(b"specter-native-h3-0rtt-v1");
+    context.extend_from_slice(&(fingerprint.alpn_protocols.len() as u16).to_be_bytes());
+    for protocol in &fingerprint.alpn_protocols {
+        context.extend_from_slice(&(protocol.len() as u16).to_be_bytes());
+        context.extend_from_slice(protocol);
+    }
+    context.extend_from_slice(&(transport_parameters.len() as u32).to_be_bytes());
+    context.extend_from_slice(transport_parameters);
+    Bytes::from(context)
+}
+
 fn apply_tls_fingerprint(
     builder: &mut SslContextBuilder,
     fingerprint: &TlsFingerprint,
