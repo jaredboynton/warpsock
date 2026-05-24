@@ -2195,6 +2195,392 @@ async fn measure_specter_native_http3_stream_with_client(
     ))
 }
 
+async fn measure_quiche_direct_rfc9220_tunnel(
+    url: &str,
+    warmups: usize,
+    samples: usize,
+) -> anyhow::Result<BenchmarkRow> {
+    for _ in 0..warmups {
+        let _ = measure_quiche_direct_rfc9220_tunnel_once(url)?;
+    }
+
+    let mut measured = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        measured.push(measure_quiche_direct_rfc9220_tunnel_once(url)?);
+    }
+
+    Ok(quiche_direct_rfc9220_tunnel_row_from_samples(&measured))
+}
+
+fn measure_quiche_direct_rfc9220_tunnel_once(url: &str) -> anyhow::Result<AdapterSample> {
+    let url = url::Url::parse(url)?;
+    let peer_addr = url
+        .socket_addrs(|| Some(443))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("URL resolved to no socket addresses"))?;
+    let bind_addr = if peer_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.set_nonblocking(true)?;
+    let local_addr = socket.local_addr()?;
+
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    config.verify_peer(false);
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+    config.set_max_idle_timeout(30_000);
+    config.set_max_recv_udp_payload_size(QUICHE_MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(QUICHE_MAX_DATAGRAM_SIZE);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
+    config.set_disable_active_migration(true);
+
+    let scid_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_be_bytes();
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    for (index, byte) in scid.iter_mut().enumerate() {
+        *byte = scid_seed[index % scid_seed.len()] ^ (index as u8);
+    }
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let server_name = url.host_str();
+    let mut conn = quiche::connect(server_name, &scid, local_addr, peer_addr, &mut config)?;
+    let mut h3_config = quiche::h3::Config::new()?;
+    h3_config.enable_extended_connect(true);
+    let mut h3_conn = None;
+    let mut req_sent = false;
+    let mut stream_id = None;
+    let mut echoed = Vec::new();
+    let start = Instant::now();
+    let deadline = start + ADAPTER_TIMEOUT;
+    let request_headers = quiche_rfc9220_tunnel_headers(&url)?;
+    let payload = rfc9220_tunnel_payload(b'q');
+    let mut recv_buf = [0u8; 65535];
+    let mut out = [0u8; QUICHE_MAX_DATAGRAM_SIZE];
+
+    flush_quiche_packets(&socket, &mut conn, &mut out)?;
+
+    while Instant::now() < deadline {
+        loop {
+            match socket.recv_from(&mut recv_buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo {
+                        to: local_addr,
+                        from,
+                    };
+                    if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info) {
+                        if err != quiche::Error::Done {
+                            return Err(anyhow::anyhow!("quiche RFC 9220 recv failed: {err:?}"));
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        if conn.is_closed() {
+            anyhow::bail!("quiche RFC 9220 connection closed before tunnel echo completed");
+        }
+
+        if conn.is_established() && h3_conn.is_none() {
+            h3_conn = Some(quiche::h3::Connection::with_transport(
+                &mut conn, &h3_config,
+            )?);
+        }
+
+        if let Some(http3) = h3_conn.as_mut() {
+            if !req_sent {
+                let opened_stream_id = http3.send_request(&mut conn, &request_headers, false)?;
+                let written = http3.send_body(&mut conn, opened_stream_id, payload.as_ref(), true)?;
+                if written != payload.len() {
+                    anyhow::bail!(
+                        "quiche RFC 9220 partial tunnel write: expected {}, wrote {}",
+                        payload.len(),
+                        written
+                    );
+                }
+                stream_id = Some(opened_stream_id);
+                req_sent = true;
+            }
+
+            loop {
+                match http3.poll(&mut conn) {
+                    Ok((_, quiche::h3::Event::Headers { .. })) => {}
+                    Ok((event_stream_id, quiche::h3::Event::Data)) => loop {
+                        match http3.recv_body(&mut conn, event_stream_id, &mut recv_buf) {
+                            Ok(read) => echoed.extend_from_slice(&recv_buf[..read]),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(err) => {
+                                return Err(anyhow::anyhow!(
+                                    "quiche RFC 9220 h3 body failed: {err:?}"
+                                ));
+                            }
+                        }
+                    },
+                    Ok((event_stream_id, quiche::h3::Event::Finished)) => {
+                        if Some(event_stream_id) != stream_id {
+                            anyhow::bail!(
+                                "quiche RFC 9220 finished unexpected stream {event_stream_id}"
+                            );
+                        }
+                        if echoed.as_slice() != payload.as_ref() {
+                            anyhow::bail!(
+                                "quiche RFC 9220 echo mismatch: expected {} bytes, got {} bytes",
+                                payload.len(),
+                                echoed.len()
+                            );
+                        }
+                        let total_ns = start.elapsed().as_nanos() as f64;
+                        return Ok(AdapterSample::new(total_ns, total_ns, echoed.len() as u64));
+                    }
+                    Ok((_, quiche::h3::Event::Reset(error_code))) => {
+                        anyhow::bail!("quiche RFC 9220 h3 stream reset: {error_code}");
+                    }
+                    Ok((_, quiche::h3::Event::PriorityUpdate | quiche::h3::Event::GoAway)) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "quiche RFC 9220 h3 poll failed: {err:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        flush_quiche_packets(&socket, &mut conn, &mut out)?;
+
+        if let Some(timeout) = conn.timeout() {
+            if timeout.is_zero() {
+                conn.on_timeout();
+            } else {
+                std::thread::sleep(timeout.min(Duration::from_millis(1)));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    anyhow::bail!("quiche RFC 9220 tunnel timed out after {:?}", ADAPTER_TIMEOUT)
+}
+
+async fn measure_tokio_quiche_rfc9220_tunnel(
+    url: &str,
+    warmups: usize,
+    samples: usize,
+) -> anyhow::Result<BenchmarkRow> {
+    for _ in 0..warmups {
+        let _ = measure_tokio_quiche_rfc9220_tunnel_once(url).await?;
+    }
+
+    let mut measured = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        measured.push(measure_tokio_quiche_rfc9220_tunnel_once(url).await?);
+    }
+
+    Ok(tokio_quiche_rfc9220_tunnel_row_from_samples(&measured))
+}
+
+async fn measure_tokio_quiche_rfc9220_tunnel_once(url: &str) -> anyhow::Result<AdapterSample> {
+    use tokio_quiche::http3::driver::{ClientH3Event, H3Event, NewClientRequest, OutboundFrame};
+
+    let url = url::Url::parse(url)?;
+    let peer_addr = url
+        .socket_addrs(|| Some(443))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("URL resolved to no socket addresses"))?;
+    let bind_addr = if peer_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let host = url.host_str();
+    let headers = tokio_quiche_rfc9220_tunnel_headers(&url)?;
+    let payload = rfc9220_tunnel_payload(b't');
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    socket.connect(peer_addr).await?;
+
+    let start = Instant::now();
+    let deadline = start + ADAPTER_TIMEOUT;
+    let (_, mut controller) = tokio_quiche::quic::connect(socket, host)
+        .await
+        .map_err(|error| anyhow::anyhow!("tokio_quiche RFC 9220 connect failed: {error}"))?;
+    let (body_writer_tx, body_writer_rx) = tokio::sync::oneshot::channel();
+    controller
+        .request_sender()
+        .send(NewClientRequest {
+            request_id: 0,
+            headers,
+            body_writer: Some(body_writer_tx),
+        })
+        .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 request driver is closed"))?;
+
+    let body_sender = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        body_writer_rx,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 body writer timed out"))?
+    .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 body writer dropped"))?;
+    let raw_sender = body_sender
+        .get_ref()
+        .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 body sender unavailable"))?
+        .clone();
+    raw_sender
+        .try_send(OutboundFrame::Body(payload.clone(), true))
+        .map_err(|error| {
+            anyhow::anyhow!("tokio_quiche RFC 9220 body send failed: {error:?}")
+        })?;
+
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            anyhow::bail!("tokio_quiche RFC 9220 timed out after {:?}", ADAPTER_TIMEOUT);
+        };
+        let event = tokio::time::timeout(remaining, controller.event_receiver_mut().recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 timed out after {:?}", ADAPTER_TIMEOUT))?
+            .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 event stream closed"))?;
+
+        match event {
+            ClientH3Event::Core(H3Event::IncomingHeaders(headers)) => {
+                return read_tokio_quiche_rfc9220_tunnel_echo(start, deadline, headers, payload)
+                    .await;
+            }
+            ClientH3Event::Core(H3Event::ResetStream { stream_id }) => {
+                anyhow::bail!("tokio_quiche RFC 9220 stream reset: {stream_id}");
+            }
+            ClientH3Event::Core(H3Event::ConnectionError(error)) => {
+                anyhow::bail!("tokio_quiche RFC 9220 connection error: {error:?}");
+            }
+            ClientH3Event::Core(H3Event::ConnectionShutdown(error)) => {
+                anyhow::bail!("tokio_quiche RFC 9220 connection shutdown: {error:?}");
+            }
+            ClientH3Event::Core(H3Event::GoAway { id }) => {
+                anyhow::bail!("tokio_quiche RFC 9220 received GOAWAY before response: {id}");
+            }
+            ClientH3Event::Core(H3Event::BodyBytesReceived { .. })
+            | ClientH3Event::Core(H3Event::IncomingSettings { .. })
+            | ClientH3Event::Core(H3Event::NewFlow { .. })
+            | ClientH3Event::Core(H3Event::StreamClosed { .. })
+            | ClientH3Event::NewOutboundRequest { .. } => {}
+        }
+    }
+}
+
+async fn read_tokio_quiche_rfc9220_tunnel_echo(
+    start: Instant,
+    deadline: Instant,
+    headers: tokio_quiche::http3::driver::IncomingH3Headers,
+    expected_payload: Bytes,
+) -> anyhow::Result<AdapterSample> {
+    let mut echoed = Vec::new();
+    if headers.read_fin {
+        anyhow::bail!("tokio_quiche RFC 9220 response ended before tunnel echo");
+    }
+
+    let mut recv = headers.recv;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            anyhow::bail!(
+                "tokio_quiche RFC 9220 body timed out after {:?}",
+                ADAPTER_TIMEOUT
+            );
+        };
+        let frame = tokio::time::timeout(remaining, recv.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "tokio_quiche RFC 9220 body timed out after {:?}",
+                    ADAPTER_TIMEOUT
+                )
+            })?
+            .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 body stream closed"))?;
+        match frame {
+            tokio_quiche::http3::driver::InboundFrame::Body(chunk, fin) => {
+                if !chunk.is_empty() {
+                    echoed.extend_from_slice(chunk.as_ref());
+                }
+                if fin {
+                    if echoed.as_slice() != expected_payload.as_ref() {
+                        anyhow::bail!(
+                            "tokio_quiche RFC 9220 echo mismatch: expected {} bytes, got {} bytes",
+                            expected_payload.len(),
+                            echoed.len()
+                        );
+                    }
+                    let total_ns = start.elapsed().as_nanos() as f64;
+                    return Ok(AdapterSample::new(total_ns, total_ns, echoed.len() as u64));
+                }
+            }
+            tokio_quiche::http3::driver::InboundFrame::Datagram(_) => {}
+        }
+    }
+}
+
+fn rfc9220_tunnel_payload(byte: u8) -> Bytes {
+    Bytes::from(vec![byte; LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE])
+}
+
+fn rfc9220_request_path(url: &url::Url) -> String {
+    let mut path = url.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    path
+}
+
+fn rfc9220_request_authority(url: &url::Url) -> anyhow::Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn quiche_rfc9220_tunnel_headers(url: &url::Url) -> anyhow::Result<Vec<quiche::h3::Header>> {
+    let authority = rfc9220_request_authority(url)?;
+    let path = rfc9220_request_path(url);
+    Ok(vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"websocket"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+        quiche::h3::Header::new(b"user-agent", b"quiche-direct-rfc9220"),
+    ])
+}
+
+fn tokio_quiche_rfc9220_tunnel_headers(
+    url: &url::Url,
+) -> anyhow::Result<Vec<tokio_quiche::quiche::h3::Header>> {
+    let authority = rfc9220_request_authority(url)?;
+    let path = rfc9220_request_path(url);
+    Ok(vec![
+        tokio_quiche::quiche::h3::Header::new(b":method", b"CONNECT"),
+        tokio_quiche::quiche::h3::Header::new(b":protocol", b"websocket"),
+        tokio_quiche::quiche::h3::Header::new(b":scheme", b"https"),
+        tokio_quiche::quiche::h3::Header::new(b":path", path.as_bytes()),
+        tokio_quiche::quiche::h3::Header::new(b":authority", authority.as_bytes()),
+        tokio_quiche::quiche::h3::Header::new(b"user-agent", b"tokio-quiche-rfc9220"),
+    ])
+}
+
 async fn measure_quinn_transport(
     url: &str,
     warmups: usize,
