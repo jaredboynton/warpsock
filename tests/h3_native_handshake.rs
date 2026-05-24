@@ -22,6 +22,7 @@ use specter::transport::h3::quic::{
 };
 use specter::transport::h3::tls::{QuicEncryptionLevel, QuicSecretDirection, QuicTlsSecret};
 use specter::{DnsConfig, H3Backend, H3Client};
+use std::time::{Duration, Instant};
 
 mod helpers;
 use helpers::mock_h3_server::{MockEvent, MockH3Server};
@@ -1748,6 +1749,51 @@ fn native_h3_handshake_packetizes_client_handshake_crypto_with_write_secret() {
     ));
 }
 
+#[test]
+fn native_h3_client_retransmits_unacked_handshake_crypto_after_pto() {
+    let write_secret = Bytes::from_static(&[0x76; 32]);
+    let keys = derive_packet_key_material_from_secret(write_secret.clone()).unwrap();
+    let mut handshake = NativeQuicHandshake::client(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        ConnectionId::from_static(b"server-dcid"),
+        ConnectionId::from_static(b"client-scid"),
+    )
+    .unwrap();
+    handshake
+        .install_tls_secrets(&[QuicTlsSecret {
+            direction: QuicSecretDirection::Write,
+            level: QuicEncryptionLevel::Handshake,
+            secret: write_secret,
+        }])
+        .unwrap();
+
+    let original = handshake
+        .build_client_handshake_crypto_packet(Bytes::from_static(b"client-finished"))
+        .unwrap()
+        .expect("non-empty handshake crypto should produce a packet");
+
+    let retransmits = handshake
+        .retransmit_pto_client_handshake_crypto_packets(Instant::now(), Duration::ZERO)
+        .unwrap();
+
+    assert_eq!(retransmits.len(), 1);
+    assert_eq!(retransmits[0].packet_number, original.packet_number + 1);
+    assert_eq!(retransmits[0].crypto_data, original.crypto_data);
+    let opened = open_long_header_packet(
+        &keys,
+        &retransmits[0].packet,
+        retransmits[0].packet_number_offset,
+        retransmits[0].packet_number,
+    )
+    .unwrap();
+    let frames = decode_frames(&opened.payload).unwrap();
+    assert!(matches!(
+        &frames[0],
+        QuicFrame::Crypto { offset: 0, data } if data == b"client-finished".as_slice()
+    ));
+}
+
 #[tokio::test]
 async fn native_h3_backend_sends_client_initial_datagram_before_timeout() {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2315,6 +2361,35 @@ fn native_h3_handshake_packetizes_client_connection_close() {
             reason: Bytes::from_static(b"Client shutdown"),
         }]
     );
+}
+
+#[test]
+fn native_h3_client_enters_close_draining_after_peer_connection_close() {
+    let (_, mut client, mut server) = completed_native_server_handshake();
+    let close = server
+        .build_server_connection_close_packet(0x0100, Bytes::from_static(b"done"))
+        .unwrap();
+
+    let events = client
+        .open_server_h3_event_packet(close.packet.as_ref())
+        .unwrap();
+
+    assert!(matches!(
+        events.as_slice(),
+        [ServerH3Event::ConnectionClose {
+            error_code: 0x0100,
+            reason,
+            ..
+        }] if reason == b"done".as_slice()
+    ));
+    assert!(client.is_close_draining());
+
+    let later = server.build_server_max_data_packet(4096).unwrap();
+
+    assert!(client
+        .open_server_h3_event_packet(later.packet.as_ref())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

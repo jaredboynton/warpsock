@@ -1,9 +1,11 @@
 use bytes::Bytes;
-use specter::fingerprint::{Http3Fingerprint, TlsFingerprint};
+use specter::fingerprint::{
+    CertCompression, Http3Fingerprint, RawQuicTransportParameter, TlsFingerprint,
+};
 use specter::transport::h3::quic::{
-    decode_frames, decode_long_header, derive_initial_key_material,
+    decode_frames, decode_long_header, decode_transport_parameters, derive_initial_key_material,
     derive_packet_key_material_from_secret, encode_transport_parameters, open_initial_packet,
-    ConnectionId, LongHeaderType, QuicFrame,
+    ConnectionId, LongHeaderType, QuicFrame, TransportParameter,
 };
 use specter::transport::h3::tls::{
     build_client_initial_packet, capture_client_initial_crypto, NativeQuicTlsSession,
@@ -11,6 +13,30 @@ use specter::transport::h3::tls::{
 };
 
 mod helpers;
+
+fn clienthello_extension_ids(crypto_data: &[u8]) -> Vec<u16> {
+    assert_eq!(crypto_data[0], 0x01);
+    let mut offset = 4 + 2 + 32;
+    let session_id_len = crypto_data[offset] as usize;
+    offset += 1 + session_id_len;
+    let cipher_suites_len = u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
+    offset += 2 + cipher_suites_len;
+    let compression_methods_len = crypto_data[offset] as usize;
+    offset += 1 + compression_methods_len;
+    let extensions_len = u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
+    offset += 2;
+
+    let extensions_end = offset + extensions_len;
+    let mut extensions = Vec::new();
+    while offset < extensions_end {
+        let extension_id = u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]);
+        let extension_len =
+            u16::from_be_bytes([crypto_data[offset + 2], crypto_data[offset + 3]]) as usize;
+        extensions.push(extension_id);
+        offset += 4 + extension_len;
+    }
+    extensions
+}
 
 #[test]
 fn native_tls_clienthello_capture_emits_initial_crypto_with_h3_alpn() {
@@ -38,6 +64,79 @@ fn native_tls_clienthello_capture_embeds_fingerprint_transport_parameters() {
         .crypto_data
         .windows(expected.len())
         .any(|window| window == expected.as_ref()));
+}
+
+#[test]
+fn native_tls_clienthello_capture_uses_raw_ordered_transport_parameter_fingerprint() {
+    let mut fingerprint = Http3Fingerprint::chrome();
+    fingerprint.transport.grease = false;
+    fingerprint.transport.raw_ordered_transport_parameters = Some(vec![
+        RawQuicTransportParameter {
+            id: 0x0b,
+            value: vec![0x19],
+        },
+        RawQuicTransportParameter {
+            id: 0x0c,
+            value: vec![],
+        },
+        RawQuicTransportParameter {
+            id: 0x01,
+            value: vec![0x1e],
+        },
+        RawQuicTransportParameter {
+            id: 0x04,
+            value: vec![0x3f],
+        },
+        RawQuicTransportParameter {
+            id: 0x4a6f,
+            value: b"raw".to_vec(),
+        },
+    ]);
+    let expected = encode_transport_parameters(&fingerprint.transport);
+
+    let captured = capture_client_initial_crypto("example.com", &fingerprint).unwrap();
+    let decoded = decode_transport_parameters(&captured.transport_parameters).unwrap();
+
+    assert_eq!(
+        decoded,
+        vec![
+            TransportParameter::MaxAckDelay(25),
+            TransportParameter::DisableActiveMigration,
+            TransportParameter::MaxIdleTimeout(30),
+            TransportParameter::InitialMaxData(63),
+            TransportParameter::Additional(0x4a6f, Bytes::from_static(b"raw")),
+        ]
+    );
+    assert_eq!(captured.transport_parameters, expected);
+    assert!(captured
+        .crypto_data
+        .windows(expected.len())
+        .any(|window| window == expected.as_ref()));
+}
+
+#[test]
+fn native_tls_clienthello_advertises_tls_fingerprint_cert_compression() {
+    let mut tls_fingerprint = TlsFingerprint::chrome();
+    tls_fingerprint.cert_compression = CertCompression::Brotli;
+    let mut session = NativeQuicTlsSession::client_with_tls_fingerprint(
+        "example.com",
+        &Http3Fingerprint::chrome(),
+        Some(&tls_fingerprint),
+        false,
+    )
+    .unwrap();
+
+    let initial = session.take_crypto(QuicEncryptionLevel::Initial);
+    let extensions = clienthello_extension_ids(&initial);
+
+    assert!(
+        extensions.contains(&16),
+        "test parser should find the ALPN extension in {extensions:?}"
+    );
+    assert!(
+        extensions.contains(&27),
+        "Brotli cert compression should advertise compress_certificate extension 27 in {extensions:?}"
+    );
 }
 
 #[test]

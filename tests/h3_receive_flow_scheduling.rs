@@ -71,6 +71,38 @@ fn native_h3_tunnel_backpressure_waits_for_all_tunnels_before_pausing_receive() 
 }
 
 #[test]
+fn native_h3_receive_backpressure_waits_for_all_active_receive_classes() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let receive_backpressure = driver
+        .split("fn receive_backpressured(&self) -> bool")
+        .nth(1)
+        .expect("driver must have receive_backpressured")
+        .split("async fn send_preface")
+        .next()
+        .expect("receive_backpressured section");
+
+    assert!(
+        receive_backpressure.contains("has_streaming_responses"),
+        "receive backpressure must account for whether streaming response queues are active"
+    );
+    assert!(
+        receive_backpressure.contains("has_tunnels"),
+        "receive backpressure must account for whether RFC9220 tunnel queues are active"
+    );
+    assert!(
+        receive_backpressure.contains("streaming_responses_backpressured && tunnels_backpressured"),
+        "native H3 receive should pause only when every active response/tunnel receive class is backpressured"
+    );
+    assert!(
+        !receive_backpressure
+            .trim()
+            .contains("self.streaming_response_body_backpressured() || self.tunnel_inbound_backpressured()"),
+        "one blocked receive class must not pause socket reads while another active class still has capacity"
+    );
+}
+
+#[test]
 fn native_h3_driver_flushes_receive_credit_from_consumed_body_bytes() {
     let driver =
         std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
@@ -171,6 +203,24 @@ fn native_h3_driver_schedules_timer_driven_delayed_application_acks() {
     assert!(
         driver.contains("ack_delay_exponent"),
         "native H3 delayed ACKs must encode ACK Delay using the configured ack_delay_exponent"
+    );
+}
+
+#[test]
+fn native_h3_driver_treats_pending_delayed_ack_as_pending_work() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let has_pending_work = driver
+        .split("fn has_pending_work")
+        .nth(1)
+        .expect("driver must have has_pending_work")
+        .split("fn streaming_response_body_backpressured")
+        .next()
+        .expect("has_pending_work section");
+
+    assert!(
+        has_pending_work.contains("client_application_ack_deadline().is_some()"),
+        "native H3 idle handling must not close while a delayed ACK is pending"
     );
 }
 

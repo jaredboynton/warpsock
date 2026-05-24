@@ -324,7 +324,6 @@ fn native_quic_transport_parameters_emit_grease_and_custom_unknowns() {
     );
 }
 
-#[test]
 fn native_quic_transport_parameters_emit_max_datagram_frame_size() {
     let params = QuicTransportParams {
         grease: false,
@@ -737,6 +736,31 @@ fn native_quic_loss_detector_applies_ack_ecn_frame_ranges() {
         .unwrap();
 
     assert_eq!(detector.lost_packets(), vec![1, 2, 3, 7]);
+}
+
+#[test]
+fn native_quic_loss_detector_reports_pto_expired_unacked_packets_by_send_time() {
+    let mut detector = QuicLossDetector::default();
+    let sent_at = Instant::now();
+
+    detector.on_packet_sent_at(1, sent_at);
+    detector.on_packet_sent_at(2, sent_at + Duration::from_millis(10));
+
+    assert_eq!(
+        detector.pto_expired_packets(sent_at + Duration::from_millis(49), Duration::from_millis(50)),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        detector.pto_expired_packets(sent_at + Duration::from_millis(50), Duration::from_millis(50)),
+        vec![1]
+    );
+
+    detector.on_ack_received(1);
+
+    assert_eq!(
+        detector.pto_expired_packets(sent_at + Duration::from_millis(60), Duration::from_millis(50)),
+        vec![2]
+    );
 }
 
 #[test]
