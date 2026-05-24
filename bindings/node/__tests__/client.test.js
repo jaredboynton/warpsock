@@ -245,15 +245,50 @@ describe('Timeouts', () => {
 
 describe('FingerprintProfile', () => {
   test('profiles exist', () => {
-    expect(FingerprintProfile.Chrome142).toBeDefined();
-    expect(FingerprintProfile.Chrome143).toBeDefined();
-    expect(FingerprintProfile.Chrome144).toBeDefined();
-    expect(FingerprintProfile.Chrome145).toBeDefined();
-    expect(FingerprintProfile.Chrome146).toBeDefined();
-    expect(FingerprintProfile.Chrome147).toBeDefined();
-    expect(FingerprintProfile.Chrome148).toBeDefined();
-    expect(FingerprintProfile.Firefox133).toBeDefined();
-    expect(FingerprintProfile.None).toBeDefined();
+    const profiles = [
+      'Chrome142',
+      'Chrome143',
+      'Chrome144',
+      'Chrome145',
+      'Chrome146',
+      'Chrome147',
+      'Chrome148',
+      'Firefox133',
+      'None',
+      'Firefox134',
+      'Firefox135',
+      'Firefox136',
+      'Firefox137',
+      'Firefox138',
+      'Firefox139',
+      'Firefox140',
+      'Firefox141',
+      'Firefox142',
+      'Firefox143',
+      'Firefox144',
+      'Firefox145',
+      'Firefox146',
+      'Firefox147',
+      'Firefox148',
+      'Firefox149',
+      'Firefox150',
+      'Firefox151',
+      'FirefoxEsr115',
+      'FirefoxEsr128',
+      'FirefoxEsr140',
+    ];
+
+    for (const profile of profiles) {
+      expect(FingerprintProfile[profile]).toBeDefined();
+      expect(clientBuilder().fingerprint(FingerprintProfile[profile]).build()).toBeDefined();
+    }
+  });
+
+  test('legacy numeric values remain stable', () => {
+    expect(FingerprintProfile.Chrome142).toBe(0);
+    expect(FingerprintProfile.Firefox133).toBe(7);
+    expect(FingerprintProfile.None).toBe(8);
+    expect(FingerprintProfile.Firefox140).not.toBe(FingerprintProfile.FirefoxEsr140);
   });
 });
 

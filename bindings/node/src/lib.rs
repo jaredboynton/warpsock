@@ -1039,3 +1039,64 @@ pub fn timeouts_streaming_defaults() -> Timeouts {
 pub(crate) fn to_napi_err(e: RustError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{to_rust_fingerprint_profile, FingerprintProfile};
+    use specter::FingerprintProfile as RustFingerprintProfile;
+
+    #[test]
+    fn fingerprint_profile_numeric_values_remain_compatible() {
+        assert_eq!(FingerprintProfile::Chrome142 as i32, 0);
+        assert_eq!(FingerprintProfile::Firefox133 as i32, 7);
+        assert_eq!(FingerprintProfile::None as i32, 8);
+    }
+
+    #[test]
+    fn fingerprint_profile_mapping_covers_firefox_versions_and_esr() {
+        let cases = [
+            (FingerprintProfile::Chrome142, RustFingerprintProfile::Chrome142),
+            (FingerprintProfile::Chrome148, RustFingerprintProfile::Chrome148),
+            (FingerprintProfile::Firefox133, RustFingerprintProfile::Firefox133),
+            (FingerprintProfile::None, RustFingerprintProfile::None),
+            (FingerprintProfile::Firefox134, RustFingerprintProfile::Firefox134),
+            (FingerprintProfile::Firefox135, RustFingerprintProfile::Firefox135),
+            (FingerprintProfile::Firefox136, RustFingerprintProfile::Firefox136),
+            (FingerprintProfile::Firefox137, RustFingerprintProfile::Firefox137),
+            (FingerprintProfile::Firefox138, RustFingerprintProfile::Firefox138),
+            (FingerprintProfile::Firefox139, RustFingerprintProfile::Firefox139),
+            (FingerprintProfile::Firefox140, RustFingerprintProfile::Firefox140),
+            (FingerprintProfile::Firefox141, RustFingerprintProfile::Firefox141),
+            (FingerprintProfile::Firefox142, RustFingerprintProfile::Firefox142),
+            (FingerprintProfile::Firefox143, RustFingerprintProfile::Firefox143),
+            (FingerprintProfile::Firefox144, RustFingerprintProfile::Firefox144),
+            (FingerprintProfile::Firefox145, RustFingerprintProfile::Firefox145),
+            (FingerprintProfile::Firefox146, RustFingerprintProfile::Firefox146),
+            (FingerprintProfile::Firefox147, RustFingerprintProfile::Firefox147),
+            (FingerprintProfile::Firefox148, RustFingerprintProfile::Firefox148),
+            (FingerprintProfile::Firefox149, RustFingerprintProfile::Firefox149),
+            (FingerprintProfile::Firefox150, RustFingerprintProfile::Firefox150),
+            (FingerprintProfile::Firefox151, RustFingerprintProfile::Firefox151),
+            (
+                FingerprintProfile::FirefoxEsr115,
+                RustFingerprintProfile::FirefoxEsr115,
+            ),
+            (
+                FingerprintProfile::FirefoxEsr128,
+                RustFingerprintProfile::FirefoxEsr128,
+            ),
+            (
+                FingerprintProfile::FirefoxEsr140,
+                RustFingerprintProfile::FirefoxEsr140,
+            ),
+        ];
+
+        for (node_profile, rust_profile) in cases {
+            assert_eq!(to_rust_fingerprint_profile(node_profile), rust_profile);
+        }
+        assert_ne!(
+            FingerprintProfile::Firefox140 as i32,
+            FingerprintProfile::FirefoxEsr140 as i32
+        );
+    }
+}
