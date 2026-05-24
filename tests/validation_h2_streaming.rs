@@ -87,7 +87,7 @@ async fn high_level_streaming_reuses_pooled_h2_connection() {
 
     // Stream 1
     let req_url = format!("{}/stream-1", url);
-    let (response1, mut rx1) = timeout(
+    let mut response1 = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -96,13 +96,20 @@ async fn high_level_streaming_reuses_pooled_h2_connection() {
     .unwrap();
 
     assert_eq!(response1.status().as_u16(), 200);
-    let chunk1 = rx1.recv().await.unwrap().unwrap();
+    let chunk1 = response1
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(chunk1, Bytes::from("chunk-data"));
-    assert!(rx1.recv().await.is_none()); // Clean end
+    assert!(response1.body_mut().frame().await.is_none()); // Clean end
 
     // Stream 2
     let req_url = format!("{}/stream-2", url);
-    let (response2, mut rx2) = timeout(
+    let mut response2 = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -111,9 +118,16 @@ async fn high_level_streaming_reuses_pooled_h2_connection() {
     .unwrap();
 
     assert_eq!(response2.status().as_u16(), 200);
-    let chunk2 = rx2.recv().await.unwrap().unwrap();
+    let chunk2 = response2
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(chunk2, Bytes::from("chunk-data"));
-    assert!(rx2.recv().await.is_none()); // Clean end
+    assert!(response2.body_mut().frame().await.is_none()); // Clean end
 
     let count = *conn_count.lock().await;
     assert_eq!(count, 1, "Should have reused exactly 1 H2 connection");
@@ -214,7 +228,7 @@ async fn response_headers_arrive_before_body_completion() {
 
     let req_url = format!("{}/headers-before-body", url);
     let start_time = system_time_now_ms();
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -226,9 +240,29 @@ async fn response_headers_arrive_before_body_completion() {
     assert_eq!(response.status().as_u16(), 200);
 
     // Consume body
-    assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from("chunk-1"));
-    assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from("chunk-2"));
-    assert!(rx.recv().await.is_none());
+    assert_eq!(
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk-1")
+    );
+    assert_eq!(
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk-2")
+    );
+    assert!(response.body_mut().frame().await.is_none());
 
     let body_complete_at = system_time_now_ms();
     let server_last_data_at = *server_sent_last_data_at.lock().await;
@@ -324,7 +358,7 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
         .unwrap();
 
     let req_url = format!("{}/incremental-streaming", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -336,14 +370,28 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
 
     // Read first chunk
     let start_read_chunk_1 = system_time_now_ms();
-    let chunk1 = rx.recv().await.unwrap().unwrap();
+    let chunk1 = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     let end_read_chunk_1 = system_time_now_ms();
     assert_eq!(chunk1, Bytes::from("incremental-chunk-1"));
 
     // Read second chunk
-    let chunk2 = rx.recv().await.unwrap().unwrap();
+    let chunk2 = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(chunk2, Bytes::from("incremental-chunk-2"));
-    assert!(rx.recv().await.is_none());
+    assert!(response.body_mut().frame().await.is_none());
 
     let server_last_chunk_send_at = *server_sent_last_chunk_at.lock().await;
 
@@ -422,7 +470,7 @@ async fn end_stream_closes_body_receiver_cleanly() {
         .unwrap();
 
     let req_url = format!("{}/clean-eos", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -431,9 +479,29 @@ async fn end_stream_closes_body_receiver_cleanly() {
     .unwrap();
 
     assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from("chunk-A"));
-    assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from("chunk-B"));
-    assert!(rx.recv().await.is_none()); // clean close
+    assert_eq!(
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk-A")
+    );
+    assert_eq!(
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk-B")
+    );
+    assert!(response.body_mut().frame().await.is_none()); // clean close
 
     let evidence = json!({
         "expected_chunk_count": 2,
@@ -504,7 +572,7 @@ async fn header_only_response_completes_without_body_chunks() {
         .unwrap();
 
     let req_url = format!("{}/header-only", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -513,7 +581,7 @@ async fn header_only_response_completes_without_body_chunks() {
     .unwrap();
 
     assert_eq!(response.status().as_u16(), 204);
-    assert!(rx.recv().await.is_none()); // Clean end-of-stream without chunks!
+    assert!(response.body_mut().frame().await.is_none()); // Clean end-of-stream without chunks!
 
     let evidence = json!({
         "fixture_header_only_frame_log": ["HEADERS flags:0x05 (END_STREAM | END_HEADERS)"],
@@ -613,7 +681,7 @@ async fn regular_h2_requests_coexist_with_streaming_on_one_connection() {
 
     // 1. Start streaming request first to establish and pool the connection
     let stream_url = format!("{}/stream", url);
-    let (stream_resp, mut stream_rx) = timeout(
+    let mut stream_resp = timeout(
         Duration::from_secs(5),
         client.get(&stream_url).send_streaming(),
     )
@@ -630,14 +698,28 @@ async fn regular_h2_requests_coexist_with_streaming_on_one_connection() {
 
     assert_eq!(stream_resp.status().as_u16(), 200);
     assert_eq!(
-        stream_rx.recv().await.unwrap().unwrap(),
+        stream_resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("streaming-chunk-A")
     );
     assert_eq!(
-        stream_rx.recv().await.unwrap().unwrap(),
+        stream_resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("streaming-chunk-B")
     );
-    assert!(stream_rx.recv().await.is_none());
+    assert!(stream_resp.body_mut().frame().await.is_none());
 
     let count = *conn_count.lock().await;
     assert_eq!(
@@ -734,7 +816,7 @@ async fn fragmented_headers_stream_correctly() {
         .unwrap();
 
     let req_url = format!("{}/fragmented-headers", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -747,10 +829,17 @@ async fn fragmented_headers_stream_correctly() {
     assert_eq!(response.headers().get("x-fragmented").unwrap(), "true");
 
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("fragmented-chunk")
     );
-    assert!(rx.recv().await.is_none());
+    assert!(response.body_mut().frame().await.is_none());
 
     let evidence = json!({
         "fragmented_frame_schedule": ["HEADERS(END_HEADERS=false)", "CONTINUATION(END_HEADERS=true)"],
@@ -846,7 +935,7 @@ async fn informational_headers_and_trailers_do_not_corrupt_streaming() {
         .unwrap();
 
     let req_url = format!("{}/early-hints-and-trailers", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         Duration::from_secs(5),
         client.get(&req_url).send_streaming(),
     )
@@ -865,11 +954,18 @@ async fn informational_headers_and_trailers_do_not_corrupt_streaming() {
     );
 
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("body-chunk-data")
     );
     assert!(
-        rx.recv().await.is_none(),
+        response.body_mut().frame().await.is_none(),
         "Body receiver should cleanly EOF after trailers HEADERS frame"
     );
 
@@ -965,11 +1061,12 @@ async fn concurrent_multiplexed_streams_keep_chunks_isolated() {
         let client_clone = client.clone();
         let req_url = format!("{}/stream-{}", url, i);
         futures.push(tokio::spawn(async move {
-            let (response, mut rx) = client_clone.get(&req_url).send_streaming().await.unwrap();
+            let mut response = client_clone.get(&req_url).send_streaming().await.unwrap();
             assert_eq!(response.status().as_u16(), 200);
             let mut chunks = Vec::new();
-            while let Some(chunk) = rx.recv().await {
-                chunks.push(String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+            while let Some(chunk) = response.body_mut().frame().await {
+                let data = chunk.unwrap().into_data().unwrap_or_default();
+                chunks.push(String::from_utf8(data.to_vec()).unwrap());
             }
             chunks
         }));
@@ -1086,14 +1183,14 @@ async fn rst_stream_error_is_scoped_to_reset_stream() {
     let res1 = client.get(&url1).send_streaming().await;
 
     // Now start Request 2: it will reuse the existing pooled connection, so its stream ID will be 3!
-    let (resp2, mut rx2) = client.get(&url2).send_streaming().await.unwrap();
+    let mut resp2 = client.get(&url2).send_streaming().await.unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
 
     // Request 1 should fail with reset stream error
     let mut err1_observed = false;
-    if let Ok((_resp, mut rx)) = res1 {
+    if let Ok(mut resp1) = res1 {
         // May get headers ok, but reading chunk should fail
-        if let Some(Err(e)) = rx.recv().await {
+        if let Some(Err(e)) = resp1.body_mut().frame().await {
             err1_observed = true;
             assert!(e.to_string().contains("reset") || e.to_string().contains("Stream reset"));
         }
@@ -1104,14 +1201,28 @@ async fn rst_stream_error_is_scoped_to_reset_stream() {
 
     // Request 2 (sibling) should complete successfully
     assert_eq!(
-        rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("sibling-chunk-1")
     );
     assert_eq!(
-        rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("sibling-chunk-2")
     );
-    assert!(rx2.recv().await.is_none());
+    assert!(resp2.body_mut().frame().await.is_none());
 
     let evidence = json!({
         "reset_stream_id": 1,
@@ -1203,7 +1314,7 @@ async fn goaway_refreshes_pool_without_data_loss() {
         .unwrap();
 
     // Stream 1
-    let (resp1, mut rx1) = client
+    let mut resp1 = client
         .get(format!("{}/stream-1", url))
         .send_streaming()
         .await
@@ -1211,7 +1322,7 @@ async fn goaway_refreshes_pool_without_data_loss() {
     assert_eq!(resp1.status().as_u16(), 200);
 
     // Stream 2 (will trigger GOAWAY after it's opened)
-    let (resp2, mut rx2) = client
+    let mut resp2 = client
         .get(format!("{}/stream-2", url))
         .send_streaming()
         .await
@@ -1220,29 +1331,50 @@ async fn goaway_refreshes_pool_without_data_loss() {
 
     // Both should receive their chunks successfully without silent truncation!
     assert_eq!(
-        rx1.recv().await.unwrap().unwrap(),
+        resp1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("goaway-chunk")
     );
-    assert!(rx1.recv().await.is_none());
+    assert!(resp1.body_mut().frame().await.is_none());
 
     assert_eq!(
-        rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("goaway-chunk")
     );
-    assert!(rx2.recv().await.is_none());
+    assert!(resp2.body_mut().frame().await.is_none());
 
     // Stream 3 - should trigger a new connection!
-    let (resp3, mut rx3) = client
+    let mut resp3 = client
         .get(format!("{}/stream-3", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp3.status().as_u16(), 200);
     assert_eq!(
-        rx3.recv().await.unwrap().unwrap(),
+        resp3
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("goaway-chunk")
     );
-    assert!(rx3.recv().await.is_none());
+    assert!(resp3.body_mut().frame().await.is_none());
 
     let count = *conn_count.lock().await;
     assert_eq!(
@@ -1333,7 +1465,7 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
         .build()
         .unwrap();
 
-    let (resp1, rx1) = client
+    let resp1 = client
         .get(format!("{}/dropped", url))
         .send_streaming()
         .await
@@ -1341,19 +1473,29 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
     assert_eq!(resp1.status().as_u16(), 200);
 
     // Drop rx1 immediately before consuming anything!
-    drop(rx1);
+    drop(resp1);
 
     // Wait for driver to process and send RST_STREAM
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Follow-up request should succeed on the same client!
-    let (resp2, mut rx2) = client
+    let mut resp2 = client
         .get(format!("{}/followup", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
-    assert_eq!(rx2.recv().await.unwrap().unwrap(), Bytes::from("chunk"));
+    assert_eq!(
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk")
+    );
 
     let rst_seen = *rst_received.lock().await;
 
@@ -1450,7 +1592,7 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
         .build()
         .unwrap();
 
-    let (resp1, rx1) = client
+    let resp1 = client
         .get(format!("{}/backpressured-drop", url))
         .send_streaming()
         .await
@@ -1461,7 +1603,7 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
         .await
         .expect("server should send enough chunks to fill the bounded body channel");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    drop(rx1);
+    drop(resp1);
 
     timeout(Duration::from_secs(1), async {
         loop {
@@ -1474,14 +1616,21 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
     .await
     .expect("driver should send RST_STREAM(CANCEL) after a full body channel receiver is dropped");
 
-    let (resp2, mut rx2) = client
+    let mut resp2 = client
         .get(format!("{}/followup-after-backpressure-drop", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
     assert_eq!(
-        rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("followup-ok")
     );
 
@@ -1573,7 +1722,7 @@ async fn flow_control_windows_advance_during_large_streams() {
         .build()
         .unwrap();
 
-    let (resp, mut rx) = client
+    let mut resp = client
         .get(format!("{}/large", url))
         .send_streaming()
         .await
@@ -1581,8 +1730,9 @@ async fn flow_control_windows_advance_during_large_streams() {
     assert_eq!(resp.status().as_u16(), 200);
 
     let mut total_bytes = 0;
-    while let Some(chunk) = rx.recv().await {
-        total_bytes += chunk.unwrap().len();
+    while let Some(chunk) = resp.body_mut().frame().await {
+        let data = chunk.unwrap().into_data().unwrap_or_default();
+        total_bytes += data.len();
     }
 
     assert_eq!(total_bytes, 102400);
@@ -1668,7 +1818,7 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
         .unwrap();
 
     // Start slow stream (stream 1)
-    let (resp1, mut rx1) = client
+    let mut resp1 = client
         .get(format!("{}/slow", url))
         .send_streaming()
         .await
@@ -1676,7 +1826,7 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
     assert_eq!(resp1.status().as_u16(), 200);
 
     // Start fast stream (stream 2)
-    let (resp2, mut rx2) = client
+    let mut resp2 = client
         .get(format!("{}/fast", url))
         .send_streaming()
         .await
@@ -1686,8 +1836,9 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
     // Fast stream consumer drains its chunks INSTANTLY
     let start_fast = tokio::time::Instant::now();
     let mut fast_bytes = 0;
-    while let Some(chunk) = rx2.recv().await {
-        fast_bytes += chunk.unwrap().len();
+    while let Some(chunk) = resp2.body_mut().frame().await {
+        let data = chunk.unwrap().into_data().unwrap_or_default();
+        fast_bytes += data.len();
     }
     let fast_elapsed = start_fast.elapsed();
     assert_eq!(fast_bytes, 40960);
@@ -1699,8 +1850,9 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
     // Slow stream consumer remains backpressured (waits 200ms before draining)
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut slow_bytes = 0;
-    while let Some(chunk) = rx1.recv().await {
-        slow_bytes += chunk.unwrap().len();
+    while let Some(chunk) = resp1.body_mut().frame().await {
+        let data = chunk.unwrap().into_data().unwrap_or_default();
+        slow_bytes += data.len();
     }
     assert_eq!(slow_bytes, 40960);
 
@@ -1816,14 +1968,24 @@ async fn streaming_timeouts_are_enforced_per_phase() {
         .build()
         .unwrap();
 
-    let (resp2, mut rx2) = client2
+    let mut resp2 = client2
         .get(format!("{}/read-delayed", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
-    assert_eq!(rx2.recv().await.unwrap().unwrap(), Bytes::from("chunk-1"));
-    let res2_chunk2 = rx2.recv().await;
+    assert_eq!(
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("chunk-1")
+    );
+    let res2_chunk2 = resp2.body_mut().frame().await;
     let read_idle_failed = matches!(res2_chunk2, Some(Err(specter::Error::ReadIdleTimeout(_))));
     assert!(read_idle_failed, "Should fail with ReadIdleTimeout");
 
@@ -1834,17 +1996,24 @@ async fn streaming_timeouts_are_enforced_per_phase() {
         .build()
         .unwrap();
 
-    let (resp3, mut rx3) = client3
+    let mut resp3 = client3
         .get(format!("{}/sibling", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp3.status().as_u16(), 200);
     assert_eq!(
-        rx3.recv().await.unwrap().unwrap(),
+        resp3
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("sibling-chunk")
     );
-    assert!(rx3.recv().await.is_none());
+    assert!(resp3.body_mut().frame().await.is_none());
 
     let evidence = json!({
         "configured_ttfb_timeout_ms": 150,
@@ -1941,7 +2110,7 @@ async fn request_body_flow_control_with_streaming_response() {
         .unwrap();
 
     let upload_body = vec![b'y'; 81920];
-    let (resp, mut rx) = client
+    let mut resp = client
         .post(&url)
         .body(upload_body)
         .send_streaming()
@@ -1950,10 +2119,16 @@ async fn request_body_flow_control_with_streaming_response() {
 
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        resp.body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("upload-response-chunk")
     );
-    assert!(rx.recv().await.is_none());
+    assert!(resp.body_mut().frame().await.is_none());
 
     let received = *server_received_body_bytes.lock().await;
     assert_eq!(received, 81920);
@@ -2050,27 +2225,34 @@ async fn stale_h2_pool_entries_are_evicted_before_reuse() {
         .build()
         .unwrap();
 
-    let (resp1, mut rx1) = client
+    let mut resp1 = client
         .get(format!("{}/kill-conn", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp1.status().as_u16(), 200);
-    let _ = rx1.recv().await;
+    let _ = resp1.body_mut().frame().await;
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let (resp2, mut rx2) = client
+    let mut resp2 = client
         .get(format!("{}/fresh-conn", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
     assert_eq!(
-        rx2.recv().await.unwrap().unwrap(),
+        resp2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("reusable-chunk")
     );
-    assert!(rx2.recv().await.is_none());
+    assert!(resp2.body_mut().frame().await.is_none());
 
     let count = *conn_count.lock().await;
     assert_eq!(
@@ -2190,7 +2372,7 @@ async fn stale_h2_pool_retry_response_is_finalized() {
         .unwrap();
 
     let prime_url = format!("{}/prime", url);
-    let (prime_resp, mut prime_rx) = timeout(
+    let mut prime_resp = timeout(
         Duration::from_secs(5),
         client.get(&prime_url).send_streaming(),
     )
@@ -2199,13 +2381,20 @@ async fn stale_h2_pool_retry_response_is_finalized() {
     .unwrap();
     assert_eq!(prime_resp.status().as_u16(), 200);
     assert_eq!(
-        prime_rx.recv().await.unwrap().unwrap(),
+        prime_resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("prime-chunk")
     );
-    assert!(prime_rx.recv().await.is_none());
+    assert!(prime_resp.body_mut().frame().await.is_none());
 
     let retry_url = format!("{}/retry", url);
-    let (retry_resp, mut retry_rx) = timeout(
+    let mut retry_resp = timeout(
         Duration::from_secs(5),
         client.get(&retry_url).send_streaming(),
     )
@@ -2218,10 +2407,17 @@ async fn stale_h2_pool_retry_response_is_finalized() {
         Some(retry_url.as_str())
     );
     assert_eq!(
-        retry_rx.recv().await.unwrap().unwrap(),
+        retry_resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("retried-chunk")
     );
-    assert!(retry_rx.recv().await.is_none());
+    assert!(retry_resp.body_mut().frame().await.is_none());
 
     let stored_cookie = jar.read().await.build_cookie_header(&retry_url);
     assert_eq!(stored_cookie.as_deref(), Some("retry_cookie=stored"));
@@ -2359,7 +2555,7 @@ async fn rfc8441_tunnel_coexists_with_streaming_on_one_connection() {
         .unwrap();
 
     // 2. Start streaming request
-    let (resp, mut rx) = timeout(
+    let mut resp = timeout(
         Duration::from_secs(5),
         client.get(&stream_url).send_streaming(),
     )
@@ -2379,14 +2575,26 @@ async fn rfc8441_tunnel_coexists_with_streaming_on_one_connection() {
 
     // 4. Consume stream chunks
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        resp.body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("stream-chunk-1")
     );
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        resp.body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("stream-chunk-2")
     );
-    assert!(rx.recv().await.is_none());
+    assert!(resp.body_mut().frame().await.is_none());
 
     let count = *conn_count.lock().await;
     assert_eq!(count, 1, "Should share exactly 1 connection");
@@ -2520,7 +2728,7 @@ async fn rfc8441_and_streaming_data_routing_remains_independent() {
         .unwrap();
 
     // 2. Open streaming request which triggers the interleaved sending
-    let (resp, mut rx) = timeout(
+    let mut resp = timeout(
         Duration::from_secs(5),
         client.get(&stream_url).send_streaming(),
     )
@@ -2537,11 +2745,25 @@ async fn rfc8441_and_streaming_data_routing_remains_independent() {
     assert_eq!(t2, Bytes::from("tunnel-interleaved-2"));
 
     // 4. Receive stream chunks
-    let s1 = rx.recv().await.unwrap().unwrap();
-    let s2 = rx.recv().await.unwrap().unwrap();
+    let s1 = resp
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let s2 = resp
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(s1, Bytes::from("stream-interleaved-1"));
     assert_eq!(s2, Bytes::from("stream-interleaved-2"));
-    assert!(rx.recv().await.is_none());
+    assert!(resp.body_mut().frame().await.is_none());
 
     let evidence = json!({
         "cross_delivery_count": 0,
@@ -2636,21 +2858,41 @@ async fn h2_pool_reuse_preserves_fingerprint_settings() {
         .build()
         .unwrap();
 
-    let (resp_ff1, mut rx_ff1) = client_firefox
+    let mut resp_ff1 = client_firefox
         .get(format!("{}/stream-ff-1", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp_ff1.status().as_u16(), 200);
-    assert_eq!(rx_ff1.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+    assert_eq!(
+        resp_ff1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("ok")
+    );
 
-    let (resp_ff2, mut rx_ff2) = client_firefox
+    let mut resp_ff2 = client_firefox
         .get(format!("{}/stream-ff-2", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp_ff2.status().as_u16(), 200);
-    assert_eq!(rx_ff2.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+    assert_eq!(
+        resp_ff2
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("ok")
+    );
 
     // 2. Client 2: Chrome142 (default settings)
     let client_chrome = Client::builder()
@@ -2660,13 +2902,23 @@ async fn h2_pool_reuse_preserves_fingerprint_settings() {
         .build()
         .unwrap();
 
-    let (resp_ch1, mut rx_ch1) = client_chrome
+    let mut resp_ch1 = client_chrome
         .get(format!("{}/stream-ch-1", url))
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(resp_ch1.status().as_u16(), 200);
-    assert_eq!(rx_ch1.recv().await.unwrap().unwrap(), Bytes::from("ok"));
+    assert_eq!(
+        resp_ch1
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("ok")
+    );
 
     let fingerprints = connection_fingerprints_clone.lock().await.clone();
 
@@ -2794,13 +3046,19 @@ async fn rfc8441_failures_are_isolated_from_streaming() {
     );
 
     // 2. Open normal streaming response (should succeed on the same pooled connection)
-    let (resp, mut rx) = client.get(&stream_url).send_streaming().await.unwrap();
+    let mut resp = client.get(&stream_url).send_streaming().await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        resp.body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from("post-failure-chunk")
     );
-    assert!(rx.recv().await.is_none());
+    assert!(resp.body_mut().frame().await.is_none());
 
     let count = *conn_count.lock().await;
     assert_eq!(

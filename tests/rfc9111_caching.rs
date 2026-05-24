@@ -49,7 +49,12 @@ fn test_cache_hit_rfc9111() {
 
     let cached = cache.get(&Method::GET, url);
     match cached {
-        CacheStatus::Fresh(resp) => assert_eq!(resp.body(), &b"data"[..]),
+        CacheStatus::Fresh(resp) => assert_eq!(
+            resp.buffered_bytes()
+                .expect("buffered cached body")
+                .as_ref(),
+            &b"data"[..]
+        ),
         _ => panic!("Response with max-age SHOULD be cached and fresh"),
     }
 }

@@ -273,7 +273,9 @@ async fn test_h2_fingerprint() -> Result<()> {
                             );
 
                             // Parse response to check fingerprint
-                            let body = String::from_utf8_lossy(response.body());
+                            let body = String::from_utf8_lossy(
+                                response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]),
+                            );
                             if body.contains("h2") {
                                 info!("      [PASS] Server confirmed HTTP/2 connection");
                             }
@@ -364,7 +366,9 @@ async fn test_h3_fingerprint() -> Result<()> {
             );
             info!("      [PASS] Protocol: {}", response.http_version());
 
-            let body = String::from_utf8_lossy(response.body());
+            let body = String::from_utf8_lossy(
+                response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]),
+            );
             info!("      [INFO] Cloudflare trace response:");
             for line in body.lines().take(10) {
                 info!("      {}", line);
@@ -569,7 +573,9 @@ async fn test_firefox_h2_fingerprint() -> Result<()> {
                             );
 
                             // Parse response to check fingerprint
-                            let body = String::from_utf8_lossy(response.body());
+                            let body = String::from_utf8_lossy(
+                                response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]),
+                            );
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(h2_fp) = json.get("http2") {
                                     info!("      Server-detected HTTP/2 fingerprint:");
@@ -714,7 +720,9 @@ async fn test_browserleaks() -> Result<()> {
                         Ok(response) => {
                             info!("      [PASS] Response: {}", response.status());
 
-                            let body = String::from_utf8_lossy(response.body());
+                            let body = String::from_utf8_lossy(
+                                response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]),
+                            );
 
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                                 info!("      Browserleaks TLS Fingerprint Results:");
@@ -816,7 +824,9 @@ async fn test_scrapfly() -> Result<()> {
                         Ok(response) => {
                             info!("      [PASS] Response: {}", response.status());
 
-                            let body = String::from_utf8_lossy(response.body());
+                            let body = String::from_utf8_lossy(
+                                response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]),
+                            );
 
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                                 info!("      ScrapFly Fingerprint Results:");

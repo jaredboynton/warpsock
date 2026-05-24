@@ -143,11 +143,11 @@ async fn test_connection_reset_partial_response() {
     match result {
         Ok(resp) => {
             // If we got a response, the body should be shorter than Content-Length claimed.
-            let body = resp.body();
+            let body_len = resp.buffered_bytes().map(|b| b.len()).unwrap_or(0);
             assert!(
-                body.len() < 1000,
+                body_len < 1000,
                 "Expected truncated body (got {} bytes)",
-                body.len()
+                body_len
             );
         }
         Err(e) => {

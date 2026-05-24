@@ -202,10 +202,11 @@ async fn handle_pool_connection(id: usize, mut stream: TcpStream, logs: Arc<Mute
     }
 }
 
-async fn drain(mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, specter::Error>>) -> Vec<u8> {
+async fn drain(mut response: specter::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk.unwrap());
+    while let Some(frame) = response.body_mut().frame().await {
+        let chunk = frame.unwrap().into_data().unwrap();
+        body.extend_from_slice(&chunk);
     }
     body
 }
@@ -215,13 +216,13 @@ async fn h1_reuses_connection_after_stream_drain() {
     let fixture = PoolFixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
-    let (_response, rx) = client
+    let response = client
         .get(fixture.endpoint("/chunked"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
-    assert_eq!(drain(rx).await, b"hello");
+    assert_eq!(drain(response).await, b"hello");
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let response = client
@@ -230,7 +231,7 @@ async fn h1_reuses_connection_after_stream_drain() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+    assert_eq!(response.bytes_raw().unwrap(), Bytes::from_static(b"ok"));
 
     let logs = fixture.logs().await;
     assert_eq!(logs[0].path, "/chunked");
@@ -243,15 +244,15 @@ async fn h1_discards_connection_after_malformed_stream() {
     let fixture = PoolFixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
-    let (_response, mut rx) = client
+    let mut response = client
         .get(fixture.endpoint("/malformed"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
-    let err = timeout(Duration::from_secs(1), async move {
-        while let Some(chunk) = rx.recv().await {
-            if chunk.is_err() {
+    let err = timeout(Duration::from_secs(1), async {
+        while let Some(frame) = response.body_mut().frame().await {
+            if frame.is_err() {
                 return true;
             }
         }
@@ -267,7 +268,7 @@ async fn h1_discards_connection_after_malformed_stream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+    assert_eq!(response.bytes_raw().unwrap(), Bytes::from_static(b"ok"));
     let logs = fixture.logs().await;
     assert_eq!(logs[0].path, "/malformed");
     assert_eq!(logs[1].path, "/ok");
@@ -279,17 +280,24 @@ async fn h1_discards_connection_after_aborted_stream() {
     let fixture = PoolFixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
-    let (_response, mut rx) = client
+    let mut response = client
         .get(fixture.endpoint("/abort"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(
-        rx.recv().await.unwrap().unwrap(),
+        response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
         Bytes::from_static(b"first")
     );
-    drop(rx);
+    drop(response);
 
     let response = client
         .get(fixture.endpoint("/ok"))
@@ -297,7 +305,7 @@ async fn h1_discards_connection_after_aborted_stream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.bytes_raw(), Bytes::from_static(b"ok"));
+    assert_eq!(response.bytes_raw().unwrap(), Bytes::from_static(b"ok"));
     let logs = fixture.logs().await;
     assert_eq!(logs[0].path, "/abort");
     assert_eq!(logs[1].path, "/ok");

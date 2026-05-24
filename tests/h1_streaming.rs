@@ -204,12 +204,18 @@ async fn write_fixed(stream: &mut TcpStream, chunks: &[&[u8]]) {
     }
 }
 
-async fn collect(mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, specter::Error>>) -> Vec<u8> {
+async fn collect(mut response: specter::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk.unwrap());
+    while let Some(frame) = response.body_mut().frame().await {
+        let data = frame.unwrap().into_data().unwrap();
+        body.extend_from_slice(&data);
     }
     body
+}
+
+async fn next_data(body: &mut specter::Body) -> Bytes {
+    let frame = body.frame().await.unwrap().unwrap();
+    frame.into_data().unwrap()
 }
 
 #[tokio::test]
@@ -218,7 +224,7 @@ async fn h1_high_level_send_streaming_dispatches_to_h1() {
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
     let started = Instant::now();
-    let (response, rx) = client
+    let response = client
         .get(fixture.endpoint("/dispatch"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
@@ -227,7 +233,7 @@ async fn h1_high_level_send_streaming_dispatches_to_h1() {
 
     assert_eq!(response.http_version(), "HTTP/1.1");
     assert!(started.elapsed() < Duration::from_millis(25));
-    assert_eq!(collect(rx).await, b"one-two-three");
+    assert_eq!(collect(response).await, b"one-two-three");
     assert_eq!(fixture.logs().await[0].path, "/dispatch");
 }
 
@@ -235,22 +241,25 @@ async fn h1_high_level_send_streaming_dispatches_to_h1() {
 async fn h1_streams_fixed_content_length_incrementally() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
-    let (_response, mut rx) = client
+    let mut response = client
         .get(fixture.endpoint("/fixed"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
 
-    let first = timeout(Duration::from_millis(80), rx.recv())
+    let first = timeout(Duration::from_millis(80), response.body_mut().frame())
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(first, Bytes::from_static(b"one-"));
     let mut body = first.to_vec();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk.unwrap());
+    while let Some(frame) = response.body_mut().frame().await {
+        let chunk = frame.unwrap().into_data().unwrap();
+        body.extend_from_slice(&chunk);
     }
     assert_eq!(body, b"one-two-three");
 }
@@ -259,22 +268,25 @@ async fn h1_streams_fixed_content_length_incrementally() {
 async fn h1_streams_chunked_transfer_incrementally() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
-    let (_response, mut rx) = client
+    let mut response = client
         .get(fixture.endpoint("/chunked"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
 
-    let first = timeout(Duration::from_millis(80), rx.recv())
+    let first = timeout(Duration::from_millis(80), response.body_mut().frame())
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(first, Bytes::from_static(b"alpha-"));
     let mut body = first.to_vec();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk.unwrap());
+    while let Some(frame) = response.body_mut().frame().await {
+        let chunk = frame.unwrap().into_data().unwrap();
+        body.extend_from_slice(&chunk);
     }
     assert_eq!(body, b"alpha-beta-gamma");
 
@@ -284,20 +296,23 @@ async fn h1_streams_chunked_transfer_incrementally() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.bytes_raw(), Bytes::from_static(b"one-two-three"));
+    assert_eq!(
+        response.bytes_raw().unwrap(),
+        Bytes::from_static(b"one-two-three")
+    );
 }
 
 #[tokio::test]
 async fn h1_streams_close_delimited_without_reuse() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
-    let (_response, rx) = client
+    let response = client
         .get(fixture.endpoint("/close"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
-    assert_eq!(collect(rx).await, b"close-delimited");
+    assert_eq!(collect(response).await, b"close-delimited");
 
     let response = client
         .get(fixture.endpoint("/fixed"))
@@ -305,7 +320,10 @@ async fn h1_streams_close_delimited_without_reuse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.bytes_raw(), Bytes::from_static(b"one-two-three"));
+    assert_eq!(
+        response.bytes_raw().unwrap(),
+        Bytes::from_static(b"one-two-three")
+    );
     let logs = fixture.logs().await;
     assert_ne!(logs[0].connection_id, logs[1].connection_id);
 }
@@ -314,23 +332,27 @@ async fn h1_streams_close_delimited_without_reuse() {
 async fn h1_does_not_buffer_unfinished_stream() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
-    let (_response, mut rx) = client
+    let mut response = client
         .get(fixture.endpoint("/unfinished"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
 
-    let first = timeout(Duration::from_millis(80), rx.recv())
+    let first = timeout(Duration::from_millis(80), response.body_mut().frame())
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(first, Bytes::from_static(b"early-1"));
-    let second = timeout(Duration::from_millis(80), rx.recv())
+    let second = timeout(Duration::from_millis(80), response.body_mut().frame())
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(second, Bytes::from_static(b"early-2"));
 }
@@ -347,7 +369,7 @@ async fn h1_streaming_preserves_timeouts_and_cookies() {
         .unwrap();
 
     // 1. Send streaming request to a path that sets a cookie
-    let (_response, rx) = client
+    let response = client
         .get(fixture.endpoint("/cookie"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
@@ -355,7 +377,7 @@ async fn h1_streaming_preserves_timeouts_and_cookies() {
         .unwrap();
 
     // Consume body to complete/drain
-    assert_eq!(collect(rx).await, b"ok");
+    assert_eq!(collect(response).await, b"ok");
 
     // 2. Send subsequent request to "/ok" and verify cookie is replayed
     let _response2 = client
@@ -405,7 +427,7 @@ async fn h1_streaming_preserves_timeouts_and_cookies() {
         .build()
         .unwrap();
 
-    let (_response3, mut rx3) = idle_client
+    let mut response3 = idle_client
         .get(fixture.endpoint("/delay-chunks"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
@@ -413,11 +435,11 @@ async fn h1_streaming_preserves_timeouts_and_cookies() {
         .unwrap();
 
     // First chunk should arrive fine
-    let first_chunk: Bytes = rx3.recv().await.unwrap().unwrap();
+    let first_chunk = next_data(response3.body_mut()).await;
     assert_eq!(first_chunk, Bytes::from_static(b"first"));
 
     // Second chunk should hit ReadIdleTimeout
-    let res_next = rx3.recv().await;
+    let res_next = response3.body_mut().frame().await;
     assert!(res_next.is_some());
     let err_next = res_next.unwrap();
     assert!(err_next.is_err());

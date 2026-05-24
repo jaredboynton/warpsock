@@ -25,8 +25,8 @@ use crate::fingerprint::{http2::Http2Settings, FingerprintProfile};
 use crate::headers::Headers;
 use crate::pool::alt_svc::AltSvcCache;
 use crate::pool::multiplexer::{ConnectionPool, PoolKey};
-use crate::request::{Body, IntoUrl, RedirectPolicy, Request};
-use crate::response::Response;
+use crate::request::{IntoUrl, RedirectPolicy, Request, RequestBody};
+use crate::response::{Body, Response};
 use crate::timeouts::Timeouts;
 use crate::transport::connector::{BoringConnector, MaybeHttpsStream};
 use crate::transport::dns::{DnsConfig, Resolve};
@@ -88,7 +88,7 @@ pub struct RequestBuilder<'a> {
     url: Option<Url>,
     method: Method,
     headers: Headers,
-    body: Body,
+    body: RequestBody,
     version: Option<HttpVersion>,
     timeout: Option<Duration>,
     error: Option<Error>,
@@ -456,7 +456,7 @@ impl<'a> RequestBuilder<'a> {
             url,
             method,
             headers: client.default_headers.clone(),
-            body: Body::Empty,
+            body: RequestBody::Empty,
             version: None,
             timeout: None,
             error,
@@ -493,9 +493,39 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    /// Set the request body.
-    pub fn body(mut self, body: impl Into<Body>) -> Self {
+    /// Set the request body. Materialized variants are accepted via
+    /// `Into<RequestBody>`. For non-materialized streaming producers, prefer
+    /// [`RequestBuilder::body_stream`] or [`RequestBuilder::body_stream_sized`].
+    pub fn body(mut self, body: impl Into<RequestBody>) -> Self {
         self.body = body.into();
+        self
+    }
+
+    /// Send a request body from a streaming producer with unknown length.
+    /// HTTP/1.1 will frame this with `Transfer-Encoding: chunked`; HTTP/2 and
+    /// HTTP/3 will write DATA frames as they become flow-control eligible.
+    pub fn body_stream<S>(mut self, stream: S) -> Self
+    where
+        S: futures_core::Stream<Item = std::result::Result<Bytes, Error>> + Send + 'static,
+    {
+        self.body = RequestBody::Stream {
+            stream: Box::pin(stream),
+            content_length: None,
+        };
+        self
+    }
+
+    /// Send a request body from a streaming producer with a known length.
+    /// HTTP/1.1 emits this with `Content-Length: len` and raw bytes (no
+    /// chunked framing); HTTP/2/3 attach `:content-length` and stream DATA.
+    pub fn body_stream_sized<S>(mut self, stream: S, content_length: u64) -> Self
+    where
+        S: futures_core::Stream<Item = std::result::Result<Bytes, Error>> + Send + 'static,
+    {
+        self.body = RequestBody::Stream {
+            stream: Box::pin(stream),
+            content_length: Some(content_length),
+        };
         self
     }
 
@@ -536,7 +566,7 @@ impl<'a> RequestBuilder<'a> {
 
         match serde_json::to_vec(json) {
             Ok(bytes) => {
-                self.body = Body::Json(bytes);
+                self.body = RequestBody::Json(bytes);
                 self.ensure_content_type("application/json");
             }
             Err(err) => self.set_error(err.into()),
@@ -553,7 +583,7 @@ impl<'a> RequestBuilder<'a> {
 
         match serde_urlencoded::to_string(form) {
             Ok(encoded) => {
-                self.body = Body::Form(encoded);
+                self.body = RequestBody::Form(encoded);
                 self.ensure_content_type("application/x-www-form-urlencoded");
             }
             Err(err) => self.set_error(err.into()),
@@ -622,15 +652,10 @@ impl<'a> RequestBuilder<'a> {
         client.execute(request).await
     }
 
-    /// Send the request and return the response with streaming body.
-    /// Returns (Response, Receiver for body chunks).
-    /// The response body is empty - chunks arrive via the receiver.
-    pub async fn send_streaming(
-        self,
-    ) -> Result<(
-        Response,
-        tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
-    )> {
+    /// Send the request and return the response with a poll-based streaming
+    /// [`Body`]. The response carries an empty buffered preview; chunks must
+    /// be drained via [`Response::body_mut`]/[`Response::into_body`].
+    pub async fn send_streaming(self) -> Result<Response> {
         let policy = self.client.redirect_policy.clone();
         if matches!(policy, RedirectPolicy::None) {
             return self.send_streaming_once().await;
@@ -652,15 +677,15 @@ impl<'a> RequestBuilder<'a> {
                 error: None,
             };
 
-            let (response, rx) = builder.send_streaming_once().await?;
+            let mut response = builder.send_streaming_once().await?;
 
             if !response.is_redirect() {
-                return Ok((response, rx));
+                return Ok(response);
             }
 
             let location = match response.redirect_url() {
                 Some(value) => value.to_string(),
-                None => return Ok((response, rx)),
+                None => return Ok(response),
             };
 
             if let RedirectPolicy::Limited(limit) = policy {
@@ -669,7 +694,7 @@ impl<'a> RequestBuilder<'a> {
                 }
             }
 
-            drain_streaming_receiver(rx).await?;
+            drain_streaming_body(response.body_mut()).await?;
 
             let next_url = request.url.join(&location).map_err(Error::from)?;
             request = client.redirect_request(&request, &response, next_url);
@@ -677,12 +702,7 @@ impl<'a> RequestBuilder<'a> {
         }
     }
 
-    async fn send_streaming_once(
-        self,
-    ) -> Result<(
-        Response,
-        tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
-    )> {
+    async fn send_streaming_once(self) -> Result<Response> {
         let client = self.client.clone();
         let mut request = self.build()?;
         let mut timeouts = client.timeouts.clone();
@@ -750,44 +770,8 @@ impl<'a> RequestBuilder<'a> {
                 }
             }
 
-            let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(32);
-            let read_idle_timeout = timeouts.read_idle;
-            let total_timeout = timeouts.total;
-            let start_time = tokio::time::Instant::now();
-            let mut mut_rx = rx;
-
-            tokio::spawn(async move {
-                loop {
-                    let item = if let Some(rt) = read_idle_timeout {
-                        match tokio::time::timeout(rt, mut_rx.recv()).await {
-                            Ok(Some(val)) => val,
-                            Ok(None) => break,
-                            Err(_) => {
-                                let _ = wrapped_tx.send(Err(Error::ReadIdleTimeout(rt))).await;
-                                break;
-                            }
-                        }
-                    } else {
-                        match mut_rx.recv().await {
-                            Some(val) => val,
-                            None => break,
-                        }
-                    };
-
-                    if let Some(tt) = total_timeout {
-                        if start_time.elapsed() >= tt {
-                            let _ = wrapped_tx.send(Err(Error::TotalTimeout(tt))).await;
-                            break;
-                        }
-                    }
-
-                    if wrapped_tx.send(item).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            return Ok((response, wrapped_rx));
+            let body = wrap_streaming_receiver(rx, &timeouts);
+            return Ok(attach_streaming_body(response, body));
         }
 
         // Parse URI
@@ -1062,58 +1046,76 @@ impl<'a> RequestBuilder<'a> {
             }
         }
 
-        if timeouts.read_idle.is_none() && timeouts.total.is_none() {
-            return Ok((response, rx));
-        }
-
-        // Wrap the raw receiver with timeout enforcement (read_idle and total timeout)
-        let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(32);
-        let read_idle_timeout = timeouts.read_idle;
-        let total_timeout = timeouts.total;
-        let start_time = tokio::time::Instant::now();
-        let mut mut_rx = rx;
-
-        tokio::spawn(async move {
-            loop {
-                let item = if let Some(rt) = read_idle_timeout {
-                    match tokio::time::timeout(rt, mut_rx.recv()).await {
-                        Ok(Some(val)) => val,
-                        Ok(None) => break,
-                        Err(_) => {
-                            let _ = wrapped_tx.send(Err(Error::ReadIdleTimeout(rt))).await;
-                            break;
-                        }
-                    }
-                } else {
-                    match mut_rx.recv().await {
-                        Some(val) => val,
-                        None => break,
-                    }
-                };
-
-                // Check total timeout
-                if let Some(tt) = total_timeout {
-                    if start_time.elapsed() >= tt {
-                        let _ = wrapped_tx.send(Err(Error::TotalTimeout(tt))).await;
-                        break;
-                    }
-                }
-
-                if wrapped_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok((response, wrapped_rx))
+        let body = wrap_streaming_receiver(rx, &timeouts);
+        Ok(attach_streaming_body(response, body))
     }
 }
 
-async fn drain_streaming_receiver(
-    mut rx: tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
-) -> Result<()> {
-    while let Some(chunk) = rx.recv().await {
-        let _ = chunk?;
+fn attach_streaming_body(response: Response, body: Body) -> Response {
+    let url = response.url().cloned();
+    let mut response = Response::with_body(
+        response.status_code(),
+        response.headers().clone(),
+        body,
+        response.http_version().to_string(),
+    );
+    if let Some(url) = url {
+        response = response.with_url(url);
+    }
+    response
+}
+
+fn wrap_streaming_receiver(
+    rx: tokio::sync::mpsc::Receiver<std::result::Result<Bytes, Error>>,
+    timeouts: &Timeouts,
+) -> Body {
+    if timeouts.read_idle.is_none() && timeouts.total.is_none() {
+        return Body::from_channel(rx);
+    }
+
+    let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(32);
+    let read_idle_timeout = timeouts.read_idle;
+    let total_timeout = timeouts.total;
+    let start_time = tokio::time::Instant::now();
+    let mut mut_rx = rx;
+
+    tokio::spawn(async move {
+        loop {
+            let item = if let Some(rt) = read_idle_timeout {
+                match tokio::time::timeout(rt, mut_rx.recv()).await {
+                    Ok(Some(val)) => val,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = wrapped_tx.send(Err(Error::ReadIdleTimeout(rt))).await;
+                        break;
+                    }
+                }
+            } else {
+                match mut_rx.recv().await {
+                    Some(val) => val,
+                    None => break,
+                }
+            };
+
+            if let Some(tt) = total_timeout {
+                if start_time.elapsed() >= tt {
+                    let _ = wrapped_tx.send(Err(Error::TotalTimeout(tt))).await;
+                    break;
+                }
+            }
+
+            if wrapped_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Body::from_channel(wrapped_rx)
+}
+
+async fn drain_streaming_body(body: &mut Body) -> Result<()> {
+    while let Some(frame) = body.frame().await {
+        let _ = frame?;
     }
     Ok(())
 }
@@ -1556,7 +1558,7 @@ impl Client {
 
         if should_switch {
             method = Method::GET;
-            body = Body::Empty;
+            body = RequestBody::Empty;
             headers.remove("content-length");
             headers.remove("content-type");
         }

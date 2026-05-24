@@ -1,24 +1,261 @@
-//! HTTP response handling with explicit decompression.
+//! HTTP response handling, decompression, and the public poll-based [`Body`].
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::StatusCode;
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use std::fmt;
+use std::future::Future;
 use std::io::Read;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 use url::Url;
 
-/// HTTP response with explicit decompression.
+/// Public response body implementing [`http_body::Body`].
+///
+/// The cutover replaced the legacy `mpsc::Receiver<Result<Bytes>>` response
+/// surface with this poll-based body. Buffered responses (returned by
+/// `RequestBuilder::send`) carry their bytes inline and emit them as a single
+/// data frame. Streaming responses (returned by
+/// `RequestBuilder::send_streaming`) wrap the transport-internal channel and
+/// surface frames as the transport produces them.
+///
+/// Cloning a streaming body is rejected at runtime because the underlying
+/// channel has a single consumer; only [`Body::Empty`]/buffered bodies clone
+/// cheaply.
+pub struct Body {
+    inner: BodyInner,
+}
+
+enum BodyInner {
+    Empty,
+    Buffered(Option<Bytes>),
+    Channel(mpsc::Receiver<std::result::Result<Bytes, Error>>),
+}
+
+impl Body {
+    /// Construct an empty body that completes without yielding any frames.
+    pub fn empty() -> Self {
+        Self {
+            inner: BodyInner::Empty,
+        }
+    }
+
+    /// Construct a buffered body that yields the given bytes once and then
+    /// signals end-of-stream. Cheap to clone and to query for length.
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            Self::empty()
+        } else {
+            Self {
+                inner: BodyInner::Buffered(Some(bytes)),
+            }
+        }
+    }
+
+    /// Wrap a transport-internal chunk channel as a streaming body.
+    pub(crate) fn from_channel(rx: mpsc::Receiver<std::result::Result<Bytes, Error>>) -> Self {
+        Self {
+            inner: BodyInner::Channel(rx),
+        }
+    }
+
+    /// `true` for an empty buffered body. Streaming bodies report `false`
+    /// because the buffered length is unknown until the body is drained.
+    pub fn is_empty(&self) -> bool {
+        match &self.inner {
+            BodyInner::Empty => true,
+            BodyInner::Buffered(Some(b)) => b.is_empty(),
+            BodyInner::Buffered(None) => true,
+            BodyInner::Channel(_) => false,
+        }
+    }
+
+    /// `true` if the body was created from a streaming transport channel.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.inner, BodyInner::Channel(_))
+    }
+
+    /// Return a reference to the buffered bytes when the body is fully
+    /// materialized, or `None` if the body is streaming or already drained.
+    pub fn as_bytes(&self) -> Option<&Bytes> {
+        match &self.inner {
+            BodyInner::Buffered(Some(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Buffered length when known, `None` for streaming bodies.
+    pub fn buffered_len(&self) -> Option<usize> {
+        match &self.inner {
+            BodyInner::Empty => Some(0),
+            BodyInner::Buffered(Some(b)) => Some(b.len()),
+            BodyInner::Buffered(None) => Some(0),
+            BodyInner::Channel(_) => None,
+        }
+    }
+
+    /// Convenience accessor for buffered bodies. Returns `0` for streaming
+    /// bodies; callers wanting to detect streaming should use
+    /// [`Body::buffered_len`] or [`Body::is_streaming`].
+    pub fn len(&self) -> usize {
+        self.buffered_len().unwrap_or(0)
+    }
+
+    /// Poll the next frame asynchronously. Returns `None` after end-of-stream.
+    pub fn frame(&mut self) -> FrameFuture<'_> {
+        FrameFuture { body: self }
+    }
+
+    /// Drain the body into a contiguous [`Bytes`] buffer.
+    ///
+    /// For buffered bodies this is essentially a clone of the underlying
+    /// bytes. For streaming bodies it polls the body to completion, so callers
+    /// must opt in explicitly.
+    pub async fn collect_to_bytes(&mut self) -> Result<Bytes> {
+        let mut buf = BytesMut::new();
+        while let Some(frame) = self.frame().await {
+            let frame = frame?;
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+        }
+        Ok(buf.freeze())
+    }
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Debug for Body {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.inner {
+            BodyInner::Empty => f.debug_struct("Body::Empty").finish(),
+            BodyInner::Buffered(Some(b)) => f
+                .debug_struct("Body::Buffered")
+                .field("len", &b.len())
+                .finish(),
+            BodyInner::Buffered(None) => f.debug_struct("Body::Buffered").field("len", &0).finish(),
+            BodyInner::Channel(_) => f.debug_struct("Body::Streaming").finish(),
+        }
+    }
+}
+
+impl Clone for Body {
+    fn clone(&self) -> Self {
+        match &self.inner {
+            BodyInner::Empty => Self::empty(),
+            BodyInner::Buffered(Some(b)) => Self {
+                inner: BodyInner::Buffered(Some(b.clone())),
+            },
+            BodyInner::Buffered(None) => Self {
+                inner: BodyInner::Buffered(None),
+            },
+            BodyInner::Channel(_) => {
+                panic!("specter::Body::clone is not supported for streaming bodies")
+            }
+        }
+    }
+}
+
+impl From<Bytes> for Body {
+    fn from(value: Bytes) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
+impl HttpBody for Body {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut self.inner {
+            BodyInner::Empty => Poll::Ready(None),
+            BodyInner::Buffered(slot) => match slot.take() {
+                Some(bytes) if !bytes.is_empty() => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                _ => Poll::Ready(None),
+            },
+            BodyInner::Channel(rx) => match rx.poll_recv(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.inner {
+            BodyInner::Empty => true,
+            BodyInner::Buffered(None) => true,
+            BodyInner::Buffered(Some(b)) => b.is_empty(),
+            BodyInner::Channel(_) => false,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.inner {
+            BodyInner::Empty => SizeHint::with_exact(0),
+            BodyInner::Buffered(Some(b)) => SizeHint::with_exact(b.len() as u64),
+            BodyInner::Buffered(None) => SizeHint::with_exact(0),
+            BodyInner::Channel(_) => SizeHint::default(),
+        }
+    }
+}
+
+/// Future returned by [`Body::frame`].
+pub struct FrameFuture<'a> {
+    body: &'a mut Body,
+}
+
+impl<'a> Future for FrameFuture<'a> {
+    type Output = Option<std::result::Result<Frame<Bytes>, Error>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let body = &mut *self.get_mut().body;
+        match Pin::new(body).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(value) => Poll::Ready(value),
+        }
+    }
+}
+
+/// HTTP response with explicit decompression and a poll-based [`Body`].
 #[derive(Debug, Clone)]
 pub struct Response {
     pub(crate) status: u16,
     headers: Headers,
-    body: Bytes,
+    body: Body,
     http_version: String,
     effective_url: Option<Url>,
 }
 
 impl Response {
+    /// Construct a buffered response. Used by the non-streaming transport
+    /// paths and by tests/cache code that already have the full body in
+    /// memory.
     pub fn new(status: u16, headers: Headers, body: Bytes, http_version: String) -> Self {
+        Self {
+            status,
+            headers,
+            body: Body::from_bytes(body),
+            http_version,
+            effective_url: None,
+        }
+    }
+
+    /// Construct a response that wraps an explicit [`Body`]. Used by the
+    /// streaming transport paths to publish the poll-based body to callers.
+    pub fn with_body(status: u16, headers: Headers, body: Body, http_version: String) -> Self {
         Self {
             status,
             headers,
@@ -29,7 +266,6 @@ impl Response {
     }
 
     /// Set the effective URL (the URL that was actually requested).
-    /// This is used by the redirect engine to track the current URL.
     pub fn with_url(mut self, url: Url) -> Self {
         self.effective_url = Some(url);
         self
@@ -55,16 +291,34 @@ impl Response {
         self.effective_url.as_ref()
     }
 
-    pub fn body(&self) -> &Bytes {
+    /// Reference to the public poll-based body.
+    pub fn body(&self) -> &Body {
         &self.body
     }
 
-    pub fn bytes_raw(&self) -> Bytes {
-        self.body.clone()
+    /// Mutable reference to the public poll-based body, used to drive
+    /// [`Body::frame`] without consuming the response.
+    pub fn body_mut(&mut self) -> &mut Body {
+        &mut self.body
     }
 
-    pub fn into_body(self) -> Bytes {
+    /// Consume the response and return the body for poll-based draining.
+    pub fn into_body(self) -> Body {
         self.body
+    }
+
+    /// Borrow the buffered body bytes, when the body is fully materialized.
+    /// Returns `None` for streaming bodies; use [`Body::frame`] or
+    /// [`Body::collect_to_bytes`] in that case.
+    pub fn buffered_bytes(&self) -> Option<&Bytes> {
+        self.body.as_bytes()
+    }
+
+    pub fn bytes_raw(&self) -> Result<Bytes> {
+        self.body
+            .as_bytes()
+            .cloned()
+            .ok_or_else(|| Error::HttpProtocol("response body is streaming, not buffered".into()))
     }
 
     pub fn bytes(&self) -> Result<Bytes> {
@@ -98,16 +352,20 @@ impl Response {
 
     /// Decode body based on Content-Encoding (gzip, deflate, br, zstd).
     /// Supports chained encodings (e.g., "gzip, deflate") by applying decodings in reverse order.
+    /// Returns an error for streaming bodies; the caller must consume the
+    /// streaming body via [`Body::frame`] before applying decompression.
     pub fn decoded_body(&self) -> Result<Bytes> {
+        let body = self.body.as_bytes().ok_or_else(|| {
+            Error::HttpProtocol("response body is streaming, not buffered".into())
+        })?;
+
         let encodings: Vec<&str> = self
             .content_encoding()
             .map(|s| s.split(',').map(str::trim).collect())
             .unwrap_or_default();
 
-        // If Content-Encoding header is present, process encodings in reverse order
-        // (last encoding applied first during decode)
         if !encodings.is_empty() {
-            let mut data = self.body.clone();
+            let mut data = body.clone();
             for encoding in encodings.iter().rev() {
                 data = match encoding.to_lowercase().as_str() {
                     "gzip" | "x-gzip" => decode_gzip(&data)?,
@@ -115,34 +373,25 @@ impl Response {
                     "br" => decode_brotli(&data)?,
                     "zstd" => decode_zstd(&data)?,
                     "identity" => data,
-                    _ => {
-                        // Unknown encoding, pass through
-                        data
-                    }
+                    _ => data,
                 };
             }
             return Ok(data);
         }
 
-        // No Content-Encoding header: check magic bytes
-        if self.body.len() >= 4 {
-            // zstd magic: 0x28 0xB5 0x2F 0xFD
-            if self.body[0] == 0x28
-                && self.body[1] == 0xB5
-                && self.body[2] == 0x2F
-                && self.body[3] == 0xFD
-            {
-                return decode_zstd(&self.body);
-            }
+        if body.len() >= 4
+            && body[0] == 0x28
+            && body[1] == 0xB5
+            && body[2] == 0x2F
+            && body[3] == 0xFD
+        {
+            return decode_zstd(body);
         }
-        if self.body.len() >= 2 {
-            // gzip magic: 0x1f 0x8b
-            if self.body[0] == 0x1f && self.body[1] == 0x8b {
-                return decode_gzip(&self.body);
-            }
+        if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+            return decode_gzip(body);
         }
 
-        Ok(self.body.clone())
+        Ok(body.clone())
     }
 
     pub fn text(&self) -> Result<String> {

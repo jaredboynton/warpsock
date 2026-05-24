@@ -139,12 +139,13 @@ async fn test_h1_streaming_local() {
     let req = client
         .get("http://127.0.0.1:3201/stream")
         .version(HttpVersion::Http1_1);
-    let (response, mut rx) = req.send_streaming().await.unwrap();
+    let mut response = req.send_streaming().await.unwrap();
     assert_eq!(response.status().as_u16(), 200);
 
     let mut body = Vec::new();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk.unwrap());
+    while let Some(frame) = response.body_mut().frame().await {
+        let chunk = frame.unwrap().into_data().unwrap();
+        body.extend_from_slice(&chunk);
     }
     assert_eq!(body, b"chunk1\nchunk2\n");
 

@@ -1090,7 +1090,7 @@ async fn measure_specter_streaming(
     if protocol == "h3" {
         request = request.version(specter::HttpVersion::Http3Only);
     }
-    let (_response, mut rx) = request.send_streaming().await?;
+    let mut response = request.send_streaming().await?;
 
     let mut first_chunk_time = None;
     let mut last_chunk_time = None;
@@ -1098,16 +1098,18 @@ async fn measure_specter_streaming(
     let mut chunk_count = 0;
     let mut chunk_offsets_ns: Vec<f64> = Vec::with_capacity(BENCH_CHUNK_COUNT);
 
-    while let Some(chunk_res) = rx.recv().await {
+    while let Some(frame_res) = response.body_mut().frame().await {
         let elapsed = start.elapsed();
         if first_chunk_time.is_none() {
             first_chunk_time = Some(elapsed);
         }
-        if let Ok(chunk) = chunk_res {
-            bytes_received += chunk.len();
-            chunk_count += 1;
-            last_chunk_time = Some(elapsed);
-            chunk_offsets_ns.push(elapsed.as_nanos() as f64);
+        if let Ok(frame) = frame_res {
+            if let Ok(chunk) = frame.into_data() {
+                bytes_received += chunk.len();
+                chunk_count += 1;
+                last_chunk_time = Some(elapsed);
+                chunk_offsets_ns.push(elapsed.as_nanos() as f64);
+            }
         }
     }
 
@@ -1613,7 +1615,7 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     // 2. Open streaming response concurrently
-    let (_resp, mut rx) = client_coexist
+    let mut response = client_coexist
         .get(&stream_url)
         .send_streaming()
         .await
@@ -1633,9 +1635,11 @@ async fn build_artifact(preflight: PortCheck, options: &BenchmarkOptions) -> io:
 
     // 4. Consume stream chunks
     let mut chunks = Vec::new();
-    while let Some(chunk_res) = rx.recv().await {
-        let chunk = chunk_res.map_err(|e| io::Error::other(e.to_string()))?;
-        chunks.push(String::from_utf8(chunk.to_vec()).unwrap_or_default());
+    while let Some(frame_res) = response.body_mut().frame().await {
+        let frame = frame_res.map_err(|e| io::Error::other(e.to_string()))?;
+        if let Ok(chunk) = frame.into_data() {
+            chunks.push(String::from_utf8(chunk.to_vec()).unwrap_or_default());
+        }
     }
 
     let contamination =

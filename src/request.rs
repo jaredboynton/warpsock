@@ -4,7 +4,10 @@ use crate::error::{Error, Result};
 use crate::headers::Headers;
 use crate::version::HttpVersion;
 use bytes::Bytes;
+use futures_core::Stream;
 use http::Method;
+use std::fmt;
+use std::pin::Pin;
 use std::time::Duration;
 use url::Url;
 
@@ -55,66 +58,144 @@ impl IntoUrl for &http::Uri {
     }
 }
 
-/// Request body variants.
-#[derive(Clone, Debug, Default)]
-pub enum Body {
+/// Boxed streaming producer of request body chunks.
+pub type RequestBodyStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<Bytes, Error>> + Send + 'static>>;
+
+/// Public request body model.
+///
+/// Streaming variants are non-cloneable: the redirect/retry path that
+/// previously cloned `Body` for retry now treats a streaming body as
+/// already consumed and replaces it with [`RequestBody::Empty`] on clone.
+/// Cloning of in-memory variants remains cheap.
+#[derive(Default)]
+pub enum RequestBody {
     #[default]
     Empty,
     Bytes(Bytes),
     Text(String),
     Json(Vec<u8>),
     Form(String),
-    Raw(Vec<u8>),
+    Stream {
+        stream: RequestBodyStream,
+        content_length: Option<u64>,
+    },
 }
 
-impl Body {
+impl RequestBody {
     pub fn empty() -> Self {
-        Body::Empty
+        RequestBody::Empty
     }
 
     pub fn is_empty(&self) -> bool {
-        matches!(self, Body::Empty)
+        matches!(self, RequestBody::Empty)
     }
 
+    /// `true` when the body is a non-materialized streaming producer.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, RequestBody::Stream { .. })
+    }
+
+    /// Advertised `Content-Length` for sized streams (and trivially the
+    /// in-memory length for materialized variants).
+    pub fn content_length(&self) -> Option<u64> {
+        match self {
+            RequestBody::Empty => Some(0),
+            RequestBody::Bytes(b) => Some(b.len() as u64),
+            RequestBody::Text(t) => Some(t.len() as u64),
+            RequestBody::Json(b) => Some(b.len() as u64),
+            RequestBody::Form(t) => Some(t.len() as u64),
+            RequestBody::Stream { content_length, .. } => *content_length,
+        }
+    }
+
+    /// Materialize an in-memory body to [`Bytes`]. Streaming bodies fail
+    /// closed with a clear error rather than being silently buffered.
     pub fn into_bytes(self) -> Result<Bytes> {
         Ok(match self {
-            Body::Empty => Bytes::new(),
-            Body::Bytes(bytes) => bytes,
-            Body::Text(text) => Bytes::from(text.into_bytes()),
-            Body::Json(bytes) => Bytes::from(bytes),
-            Body::Form(text) => Bytes::from(text.into_bytes()),
-            Body::Raw(bytes) => Bytes::from(bytes),
+            RequestBody::Empty => Bytes::new(),
+            RequestBody::Bytes(bytes) => bytes,
+            RequestBody::Text(text) => Bytes::from(text.into_bytes()),
+            RequestBody::Json(bytes) => Bytes::from(bytes),
+            RequestBody::Form(text) => Bytes::from(text.into_bytes()),
+            RequestBody::Stream { .. } => {
+                return Err(Error::HttpProtocol(
+                    "streaming RequestBody cannot be materialized; use the streaming send path"
+                        .into(),
+                ));
+            }
         })
     }
 }
 
-impl From<Bytes> for Body {
+impl fmt::Debug for RequestBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestBody::Empty => f.debug_struct("RequestBody::Empty").finish(),
+            RequestBody::Bytes(b) => f
+                .debug_struct("RequestBody::Bytes")
+                .field("len", &b.len())
+                .finish(),
+            RequestBody::Text(t) => f
+                .debug_struct("RequestBody::Text")
+                .field("len", &t.len())
+                .finish(),
+            RequestBody::Json(b) => f
+                .debug_struct("RequestBody::Json")
+                .field("len", &b.len())
+                .finish(),
+            RequestBody::Form(t) => f
+                .debug_struct("RequestBody::Form")
+                .field("len", &t.len())
+                .finish(),
+            RequestBody::Stream { content_length, .. } => f
+                .debug_struct("RequestBody::Stream")
+                .field("content_length", content_length)
+                .finish(),
+        }
+    }
+}
+
+impl Clone for RequestBody {
+    fn clone(&self) -> Self {
+        match self {
+            RequestBody::Empty => RequestBody::Empty,
+            RequestBody::Bytes(b) => RequestBody::Bytes(b.clone()),
+            RequestBody::Text(t) => RequestBody::Text(t.clone()),
+            RequestBody::Json(b) => RequestBody::Json(b.clone()),
+            RequestBody::Form(t) => RequestBody::Form(t.clone()),
+            RequestBody::Stream { .. } => RequestBody::Empty,
+        }
+    }
+}
+
+impl From<Bytes> for RequestBody {
     fn from(value: Bytes) -> Self {
-        Body::Bytes(value)
+        RequestBody::Bytes(value)
     }
 }
 
-impl From<Vec<u8>> for Body {
+impl From<Vec<u8>> for RequestBody {
     fn from(value: Vec<u8>) -> Self {
-        Body::Raw(value)
+        RequestBody::Bytes(Bytes::from(value))
     }
 }
 
-impl From<&[u8]> for Body {
+impl From<&[u8]> for RequestBody {
     fn from(value: &[u8]) -> Self {
-        Body::Raw(value.to_vec())
+        RequestBody::Bytes(Bytes::copy_from_slice(value))
     }
 }
 
-impl From<String> for Body {
+impl From<String> for RequestBody {
     fn from(value: String) -> Self {
-        Body::Text(value)
+        RequestBody::Text(value)
     }
 }
 
-impl From<&str> for Body {
+impl From<&str> for RequestBody {
     fn from(value: &str) -> Self {
-        Body::Text(value.to_string())
+        RequestBody::Text(value.to_string())
     }
 }
 
@@ -124,7 +205,7 @@ pub struct Request {
     pub(crate) method: Method,
     pub(crate) url: Url,
     pub(crate) headers: Headers,
-    pub(crate) body: Body,
+    pub(crate) body: RequestBody,
     pub(crate) version: Option<HttpVersion>,
     pub(crate) timeout: Option<Duration>,
 }
@@ -135,7 +216,7 @@ impl Request {
             method,
             url,
             headers: Headers::new(),
-            body: Body::Empty,
+            body: RequestBody::Empty,
             version: None,
             timeout: None,
         }
@@ -153,7 +234,7 @@ impl Request {
         &self.headers
     }
 
-    pub fn body(&self) -> &Body {
+    pub fn body(&self) -> &RequestBody {
         &self.body
     }
 

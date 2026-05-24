@@ -35,6 +35,11 @@ httparse = "1"
 # HTTP/2 (custom implementation for full fingerprint control)
 http = "1"
 
+# Poll-based body model for the public streaming API
+http-body = "1"
+futures-core = "0.3"
+pin-project-lite = "0.2"
+
 # HTTP/3 + QUIC (includes BoringSSL internally)
 quiche = { version = "0.24", default-features = false, features = ["boringssl-boring-crate"] }
 

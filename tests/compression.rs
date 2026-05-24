@@ -232,7 +232,7 @@ async fn test_raw_bytes_vs_decoded() {
         .expect("Request failed");
 
     // Raw bytes should be the compressed form.
-    let raw = resp.bytes_raw();
+    let raw = resp.bytes_raw().expect("Buffered raw bytes");
     assert_eq!(
         raw.len(),
         compressed_len,

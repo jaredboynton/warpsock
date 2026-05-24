@@ -3,6 +3,7 @@
 //! These tests intentionally target the public API that the RFC 8441 lane is
 //! expected to add. They should fail to compile until that API exists.
 
+use bytes::Bytes;
 use specter::Client;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,7 +122,10 @@ async fn rfc8441_tunnel_and_normal_h2_request_share_one_connection() {
     .expect("normal H2 request should complete while tunnel is open");
 
     assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(response.body().as_ref(), b"ok");
+    assert_eq!(
+        response.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"ok"
+    );
     drop(tunnel);
 
     let observed = observed.lock().await;

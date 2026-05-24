@@ -108,15 +108,25 @@ async fn inline_path_streams_two_sequential_requests_on_one_connection() {
 
     for i in 0..2 {
         let req_url = format!("{}/inline-{}", url, i);
-        let (response, mut rx) = timeout(DEFAULT_TIMEOUT, client.get(&req_url).send_streaming())
+        let mut response = timeout(DEFAULT_TIMEOUT, client.get(&req_url).send_streaming())
             .await
             .expect("send_streaming did not complete in time")
             .expect("send_streaming returned error");
 
         assert_eq!(response.status().as_u16(), 200);
-        let chunk = rx.recv().await.unwrap().unwrap();
+        let chunk = response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
         assert_eq!(chunk, Bytes::from("inline-chunk"));
-        assert!(rx.recv().await.is_none(), "expected clean EOF");
+        assert!(
+            response.body_mut().frame().await.is_none(),
+            "expected clean EOF"
+        );
     }
 
     let count = *conn_count.lock().await;
@@ -196,7 +206,7 @@ async fn inline_path_falls_back_when_request_body_present() {
 
     let body = b"upload-body".to_vec();
     let req_url = format!("{}/with-body", url);
-    let (response, mut rx) = timeout(
+    let mut response = timeout(
         DEFAULT_TIMEOUT,
         client.post(&req_url).body(body.clone()).send_streaming(),
     )
@@ -205,9 +215,16 @@ async fn inline_path_falls_back_when_request_body_present() {
     .expect("send_streaming returned error");
 
     assert_eq!(response.status().as_u16(), 200);
-    let chunk = rx.recv().await.unwrap().unwrap();
+    let chunk = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(chunk, Bytes::from("echoed"));
-    assert!(rx.recv().await.is_none());
+    assert!(response.body_mut().frame().await.is_none());
 
     let received = received_body_bytes.lock().await.clone();
     assert_eq!(
@@ -273,13 +290,22 @@ async fn concurrent_inline_attempts_serialize_with_fallback() {
         .unwrap();
 
     let warmup_url = format!("{}/warmup", url);
-    let (resp, mut rx) = timeout(DEFAULT_TIMEOUT, client.get(&warmup_url).send_streaming())
+    let mut resp = timeout(DEFAULT_TIMEOUT, client.get(&warmup_url).send_streaming())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(rx.recv().await.unwrap().unwrap(), Bytes::from("ok"));
-    assert!(rx.recv().await.is_none());
+    assert_eq!(
+        resp.body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        Bytes::from("ok")
+    );
+    assert!(resp.body_mut().frame().await.is_none());
 
     let url1 = format!("{}/concurrent-1", url);
     let url2 = format!("{}/concurrent-2", url);
@@ -287,25 +313,39 @@ async fn concurrent_inline_attempts_serialize_with_fallback() {
     let client2 = client.clone();
 
     let task1 = tokio::spawn(async move {
-        let (resp, mut rx) = timeout(DEFAULT_TIMEOUT, client1.get(&url1).send_streaming())
+        let mut resp = timeout(DEFAULT_TIMEOUT, client1.get(&url1).send_streaming())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
-        let body = rx.recv().await.unwrap().unwrap();
+        let body = resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
         assert_eq!(body, Bytes::from("ok"));
-        assert!(rx.recv().await.is_none());
+        assert!(resp.body_mut().frame().await.is_none());
     });
 
     let task2 = tokio::spawn(async move {
-        let (resp, mut rx) = timeout(DEFAULT_TIMEOUT, client2.get(&url2).send_streaming())
+        let mut resp = timeout(DEFAULT_TIMEOUT, client2.get(&url2).send_streaming())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
-        let body = rx.recv().await.unwrap().unwrap();
+        let body = resp
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
         assert_eq!(body, Bytes::from("ok"));
-        assert!(rx.recv().await.is_none());
+        assert!(resp.body_mut().frame().await.is_none());
     });
 
     timeout(Duration::from_secs(10), task1)
@@ -394,20 +434,20 @@ async fn inline_path_handles_dropped_receiver() {
         .unwrap();
 
     let req_url = format!("{}/dropped", url);
-    let (response, rx) = timeout(DEFAULT_TIMEOUT, client.get(&req_url).send_streaming())
+    let response = timeout(DEFAULT_TIMEOUT, client.get(&req_url).send_streaming())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
 
-    drop(rx);
+    drop(response);
 
     timeout(Duration::from_secs(3), rst_seen.notified())
         .await
         .expect("Server should have observed RST_STREAM after receiver drop");
 
     let req_url2 = format!("{}/after-drop", url);
-    let (resp2, _rx2) = timeout(DEFAULT_TIMEOUT, client.get(&req_url2).send_streaming())
+    let resp2 = timeout(DEFAULT_TIMEOUT, client.get(&req_url2).send_streaming())
         .await
         .unwrap()
         .unwrap();

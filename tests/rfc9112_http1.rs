@@ -104,7 +104,13 @@ async fn test_request_framing_chunked() {
 
     assert_eq!(response.status().as_u16(), 200);
     // Verify body content
-    assert_eq!(&response.body()[..], b"Hello");
+    assert_eq!(
+        response
+            .buffered_bytes()
+            .map(|b| b.as_ref())
+            .unwrap_or_default(),
+        b"Hello"
+    );
 }
 
 #[tokio::test]

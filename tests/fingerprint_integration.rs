@@ -87,7 +87,8 @@ async fn test_http2_fingerprint_matches_chrome() {
     assert_eq!(response.status().as_u16(), 200, "Should get 200 OK");
 
     // Parse response JSON
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("Response should be valid JSON");
 
@@ -254,7 +255,8 @@ async fn test_browserleaks_passes() {
     );
 
     // Parse and validate response
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("Response should be valid JSON");
 
@@ -300,7 +302,8 @@ async fn test_http3_fingerprint_works() {
     assert_eq!(response.http_version(), "HTTP/3");
 
     // Verify trace shows http/3
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     assert!(
         body.contains("http=http/3"),
         "Cloudflare trace should confirm HTTP/3"
@@ -413,7 +416,8 @@ async fn test_firefox_http2_fingerprint_matches() {
     assert_eq!(response.status().as_u16(), 200, "Should get 200 OK");
 
     // Parse response JSON
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("Response should be valid JSON");
 
@@ -552,7 +556,8 @@ async fn test_firefox_browserleaks_passes() {
     );
 
     // Parse and validate response
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("Response should be valid JSON");
 
@@ -601,7 +606,8 @@ async fn test_priority_frames_in_akamai() {
     assert_eq!(response.status().as_u16(), 200);
 
     // Parse response JSON
-    let body = String::from_utf8_lossy(response.body());
+    let body =
+        String::from_utf8_lossy(response.buffered_bytes().map(|b| b.as_ref()).unwrap_or(&[]));
     let json: serde_json::Value =
         serde_json::from_str(&body).expect("Response should be valid JSON");
 

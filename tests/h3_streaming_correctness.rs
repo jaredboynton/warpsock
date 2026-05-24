@@ -202,7 +202,7 @@ async fn h3_streaming_supports_request_bodies() {
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
-    let (response, mut body_rx) = client
+    let mut response = client
         .post(&url)
         .version(HttpVersion::Http3Only)
         .body("upload-body")
@@ -211,11 +211,16 @@ async fn h3_streaming_supports_request_bodies() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    assert_eq!(
-        body_rx.recv().await.unwrap().unwrap(),
-        Bytes::from_static(b"accepted")
-    );
-    assert!(body_rx.recv().await.is_none());
+    let chunk = response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(chunk, Bytes::from_static(b"accepted"));
+    assert!(response.body_mut().frame().await.is_none());
 }
 
 #[tokio::test]
@@ -307,44 +312,55 @@ async fn h3_streaming_preserves_timeouts_and_cookies() {
         .build()
         .unwrap();
 
-    let (set_response, mut set_rx) = client
+    let mut set_response = client
         .get(format!("{url}/set"))
         .version(HttpVersion::Http3Only)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(set_response.status(), 200);
-    assert_eq!(
-        set_rx.recv().await.unwrap().unwrap(),
-        Bytes::from_static(b"stored")
-    );
-    assert!(set_rx.recv().await.is_none());
+    let chunk = set_response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(chunk, Bytes::from_static(b"stored"));
+    assert!(set_response.body_mut().frame().await.is_none());
 
-    let (echo_response, mut echo_rx) = client
+    let mut echo_response = client
         .get(format!("{url}/echo"))
         .version(HttpVersion::Http3Only)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(echo_response.status(), 200);
-    assert_eq!(
-        echo_rx.recv().await.unwrap().unwrap(),
-        Bytes::from_static(b"cookie-ok")
-    );
-    assert!(echo_rx.recv().await.is_none());
+    let chunk = echo_response
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(chunk, Bytes::from_static(b"cookie-ok"));
+    assert!(echo_response.body_mut().frame().await.is_none());
 
-    let (timeout_response, mut timeout_rx) = client
+    let mut timeout_response = client
         .get(format!("{url}/timeout"))
         .version(HttpVersion::Http3Only)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(timeout_response.status(), 200);
-    let timeout_err = tokio::time::timeout(Duration::from_secs(1), timeout_rx.recv())
-        .await
-        .expect("read timeout should be bounded")
-        .expect("read timeout should yield an error")
-        .expect_err("read timeout should not be clean EOF");
+    let timeout_err =
+        tokio::time::timeout(Duration::from_secs(1), timeout_response.body_mut().frame())
+            .await
+            .expect("read timeout should be bounded")
+            .expect("read timeout should yield an error")
+            .expect_err("read timeout should not be clean EOF");
     assert!(matches!(timeout_err, Error::ReadIdleTimeout(_)));
 }
 
@@ -394,28 +410,30 @@ async fn h3_flow_control_and_slow_consumers_do_not_starve_siblings() {
         .build()
         .unwrap();
 
-    let (_slow_response, mut slow_rx) = client
+    let mut slow_response = client
         .get(format!("{url}/slow"))
         .version(HttpVersion::Http3Only)
         .send_streaming()
         .await
         .unwrap();
 
-    let (_fast_response, mut fast_rx) = client
+    let mut fast_response = client
         .get(format!("{url}/fast"))
         .version(HttpVersion::Http3Only)
         .send_streaming()
         .await
         .unwrap();
 
-    let fast = tokio::time::timeout(Duration::from_secs(2), fast_rx.recv())
+    let fast = tokio::time::timeout(Duration::from_secs(2), fast_response.body_mut().frame())
         .await
         .expect("fast sibling stream must not starve behind slow receiver")
         .unwrap()
+        .unwrap()
+        .into_data()
         .unwrap();
     assert_eq!(fast, Bytes::from_static(b"fast-complete"));
-    assert!(fast_rx.recv().await.is_none());
+    assert!(fast_response.body_mut().frame().await.is_none());
 
-    assert!(slow_rx.recv().await.is_some());
-    drop(slow_rx);
+    assert!(slow_response.body_mut().frame().await.is_some());
+    drop(slow_response);
 }

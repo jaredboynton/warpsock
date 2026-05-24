@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use specter::transport::h3::H3Client;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -43,8 +44,14 @@ async fn h3_client_reuses_pooled_connection_for_same_authority() {
 
     assert_eq!(first.status(), 200);
     assert_eq!(second.status(), 200);
-    assert_eq!(first.body().as_ref(), b"ok");
-    assert_eq!(second.body().as_ref(), b"ok");
+    assert_eq!(
+        first.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"ok"
+    );
+    assert_eq!(
+        second.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"ok"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(connection_count.load(Ordering::SeqCst), 1);

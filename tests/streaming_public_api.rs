@@ -217,12 +217,11 @@ async fn handle_h1_connection(mut stream: TcpStream, logs: Arc<Mutex<Vec<H1Log>>
     }
 }
 
-async fn collect_body(
-    mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, Error>>,
-) -> Result<Vec<u8>, Error> {
+async fn collect_body(mut response: specter::Response) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
-    while let Some(chunk) = rx.recv().await {
-        body.extend_from_slice(&chunk?);
+    while let Some(frame) = response.body_mut().frame().await {
+        let chunk = frame?.into_data().unwrap_or_else(|_| bytes::Bytes::new());
+        body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
@@ -236,7 +235,7 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
     {
         let fixture = H1Fixture::start().await;
         let client = Client::builder().prefer_http2(false).build().unwrap();
-        let (response, rx) = client
+        let response = client
             .get(fixture.endpoint("/baseline"))
             .version(HttpVersion::Http1_1)
             .send_streaming()
@@ -244,11 +243,11 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
             .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         assert!(
-            response.body().is_empty(),
-            "streaming response carries empty body"
+            response.body().is_streaming(),
+            "streaming response carries a poll-based Body"
         );
         assert_eq!(response.http_version(), "HTTP/1.1");
-        let body = collect_body(rx).await.unwrap();
+        let body = collect_body(response).await.unwrap();
         assert_eq!(body, b"hello-h1-stream");
         artifact["protocols"]["h1"] = json!({
             "status": 200,
@@ -305,7 +304,7 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
             .prefer_http2(true)
             .build()
             .unwrap();
-        let (response, rx) = timeout(
+        let response = timeout(
             Duration::from_secs(5),
             client.get(format!("{}/baseline", url)).send_streaming(),
         )
@@ -313,8 +312,8 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
         .unwrap()
         .unwrap();
         assert_eq!(response.status().as_u16(), 200);
-        assert!(response.body().is_empty());
-        let body = collect_body(rx).await.unwrap();
+        assert!(response.body().is_streaming());
+        let body = collect_body(response).await.unwrap();
         assert_eq!(body, b"hello-h2-stream");
         artifact["protocols"]["h2"] = json!({
             "status": 200,
@@ -345,7 +344,7 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
-        let (response, rx) = timeout(
+        let response = timeout(
             Duration::from_secs(5),
             client
                 .get(&url)
@@ -356,8 +355,8 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
         .unwrap()
         .unwrap();
         assert_eq!(response.status().as_u16(), 200);
-        assert!(response.body().is_empty());
-        let body = collect_body(rx).await.unwrap();
+        assert!(response.body().is_streaming());
+        let body = collect_body(response).await.unwrap();
         assert_eq!(body, b"hello-h3-stream");
         artifact["protocols"]["h3"] = json!({
             "status": 200,
@@ -388,27 +387,27 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .build()
         .unwrap();
 
-    let (set_resp, set_rx) = client
+    let set_resp = client
         .get(fixture.endpoint("/cookie-set"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(set_resp.status().as_u16(), 200);
-    assert_eq!(collect_body(set_rx).await.unwrap(), b"ok");
+    assert_eq!(collect_body(set_resp).await.unwrap(), b"ok");
 
-    let (echo_resp, echo_rx) = client
+    let echo_resp = client
         .get(fixture.endpoint("/cookie-echo"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(echo_resp.status().as_u16(), 200);
-    assert_eq!(collect_body(echo_rx).await.unwrap(), b"echoed");
+    assert_eq!(collect_body(echo_resp).await.unwrap(), b"echoed");
 
     // 2. Explicit Authorization headers passed via the public RequestBuilder
     //    must reach the wire on the streaming path identically to non-streaming.
-    let (auth_resp, auth_rx) = client
+    let auth_resp = client
         .get(fixture.endpoint("/authcheck"))
         .header("Authorization", "Bearer streaming-token")
         .version(HttpVersion::Http1_1)
@@ -416,10 +415,10 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .await
         .unwrap();
     assert_eq!(auth_resp.status().as_u16(), 200);
-    let _ = collect_body(auth_rx).await.unwrap();
+    let _ = collect_body(auth_resp).await.unwrap();
 
     // 3. Non-empty request bodies are transmitted by the streaming POST.
-    let (post_resp, post_rx) = client
+    let post_resp = client
         .post(fixture.endpoint("/upload"))
         .body(b"streamed-upload-body".to_vec())
         .version(HttpVersion::Http1_1)
@@ -427,7 +426,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .await
         .unwrap();
     assert_eq!(post_resp.status().as_u16(), 200);
-    assert_eq!(collect_body(post_rx).await.unwrap(), b"uploaded");
+    assert_eq!(collect_body(post_resp).await.unwrap(), b"uploaded");
 
     // 4. Redirect policy is honored before returning the final streaming
     //    response, while preserving the same high-level caller shape.
@@ -436,7 +435,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .redirect_policy(RedirectPolicy::Limited(3))
         .build()
         .unwrap();
-    let (redirect_resp, redirect_rx) = redirect_client
+    let redirect_resp = redirect_client
         .get(fixture.endpoint("/redirect-start"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
@@ -448,7 +447,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         Some("/redirect-final")
     );
     assert_eq!(
-        collect_body(redirect_rx).await.unwrap(),
+        collect_body(redirect_resp).await.unwrap(),
         b"redirected-final"
     );
 
@@ -518,7 +517,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
             .default_header("X-Default-Semantic", "default-h2")
             .build()
             .unwrap();
-        let (h2_resp, h2_rx) = client
+        let h2_resp = client
             .post(format!("{}/upload", url))
             .header("Authorization", "Bearer h2-streaming-token")
             .body("h2-streaming-body")
@@ -526,7 +525,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
             .await
             .unwrap();
         assert_eq!(h2_resp.status().as_u16(), 200);
-        assert_eq!(collect_body(h2_rx).await.unwrap(), b"h2-semantics-ok");
+        assert_eq!(collect_body(h2_resp).await.unwrap(), b"h2-semantics-ok");
     }
 
     let h2_headers = h2_headers_seen.lock().await.clone();
@@ -590,7 +589,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
             .default_header("X-Default-Semantic", "default-h3")
             .build()
             .unwrap();
-        let (h3_resp, h3_rx) = client
+        let h3_resp = client
             .post(&url)
             .version(HttpVersion::Http3Only)
             .header("Authorization", "Bearer h3-streaming-token")
@@ -599,7 +598,7 @@ async fn public_streaming_preserves_high_level_request_semantics() {
             .await
             .unwrap();
         assert_eq!(h3_resp.status().as_u16(), 200);
-        assert_eq!(collect_body(h3_rx).await.unwrap(), b"h3-semantics-ok");
+        assert_eq!(collect_body(h3_resp).await.unwrap(), b"h3-semantics-ok");
     }
 
     let h3_headers = h3_headers_seen.lock().await.clone();
@@ -626,18 +625,28 @@ async fn public_streaming_preserves_high_level_request_semantics() {
         .read_timeout(Duration::from_millis(150))
         .build()
         .unwrap();
-    let (idle_resp, mut idle_rx) = timeout_client
+    let mut idle_resp = timeout_client
         .get(fixture.endpoint("/idle-stall"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
         .await
         .unwrap();
     assert_eq!(idle_resp.status().as_u16(), 200);
-    let first = idle_rx.recv().await.unwrap().unwrap();
+    let first = idle_resp
+        .body_mut()
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
     assert_eq!(first, Bytes::from_static(b"first"));
-    let stalled_err = match idle_rx.recv().await {
+    let stalled_err = match idle_resp.body_mut().frame().await {
         Some(Err(e)) => e,
-        Some(Ok(b)) => panic!("expected idle timeout, got chunk: {b:?}"),
+        Some(Ok(frame)) => match frame.into_data() {
+            Ok(b) => panic!("expected idle timeout, got chunk: {b:?}"),
+            Err(_) => panic!("expected idle timeout, got non-data frame"),
+        },
         None => panic!("expected idle timeout, got clean EOF"),
     };
     assert!(
@@ -712,4 +721,97 @@ async fn public_streaming_preserves_high_level_request_semantics() {
     let jar_inspect = jar.read().await;
     let _ = jar_inspect;
     let _ = AtomicUsize::new(0).load(Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn public_response_body_is_http_body() {
+    let fixture = H1Fixture::start().await;
+    let client = Client::builder().prefer_http2(false).build().unwrap();
+
+    let response = client
+        .get(fixture.endpoint("/baseline"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+
+    assert!(
+        response.body().is_streaming(),
+        "send_streaming must return a poll-based streaming Body"
+    );
+
+    let mut body: specter::Body = response.into_body();
+
+    fn assert_http_body_impl<B: http_body::Body<Data = bytes::Bytes, Error = specter::Error>>(
+        _: &B,
+    ) {
+    }
+    assert_http_body_impl(&body);
+
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("frame should not error for healthy stream");
+        if let Ok(data) = frame.into_data() {
+            bytes.extend_from_slice(&data);
+        }
+    }
+    assert_eq!(bytes, b"hello-h1-stream");
+}
+
+#[tokio::test]
+async fn poll_body_hard_cutover_has_no_legacy_shim() {
+    use std::path::PathBuf;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // Public surface check: send_streaming and Response::body must NOT
+    // expose the old mpsc receiver tuple.
+    let h1_h2 = fs::read_to_string(manifest_dir.join("src/transport/h1_h2.rs")).unwrap();
+    assert!(
+        !h1_h2.contains("pub async fn send_streaming(\n        self,\n    ) -> Result<("),
+        "send_streaming must no longer return a tuple containing the old mpsc::Receiver"
+    );
+    assert!(
+        h1_h2.contains("pub async fn send_streaming(self) -> Result<Response>"),
+        "send_streaming must return Result<Response> with embedded Body"
+    );
+
+    let response_rs = fs::read_to_string(manifest_dir.join("src/response.rs")).unwrap();
+    assert!(
+        response_rs.contains("pub fn body(&self) -> &Body"),
+        "Response::body() must return a reference to the public Body type"
+    );
+    assert!(
+        response_rs.contains("impl HttpBody for Body"),
+        "specter::Body must implement http_body::Body for the public response surface"
+    );
+
+    // No public legacy compatibility flag is allowed.
+    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+    for forbidden in [
+        "legacy-mpsc-body",
+        "compat-mpsc-body",
+        "compat_mpsc_body",
+        "specter-legacy-body",
+    ] {
+        assert!(
+            !manifest.contains(forbidden),
+            "Cargo.toml must not declare a `{forbidden}` feature flag for the poll-body cutover"
+        );
+    }
+
+    // Examples must consume the new poll-based body API.
+    let example_files: Vec<_> = fs::read_dir(manifest_dir.join("examples"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rs"))
+        .collect();
+    for path in example_files {
+        let contents = fs::read_to_string(&path).expect("example source readable");
+        assert!(
+            !contents.contains("rx.recv().await"),
+            "example {} still uses the removed rx.recv().await receiver pattern",
+            path.display()
+        );
+    }
 }

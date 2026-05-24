@@ -9,6 +9,7 @@
 
 mod helpers;
 
+use bytes::Bytes;
 use helpers::mock_server::MockHttpServer;
 use specter::Client;
 use std::time::Duration;
@@ -31,7 +32,10 @@ async fn test_http11_basic_request() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"Hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"Hello"
+    );
 }
 
 #[tokio::test]
@@ -134,7 +138,10 @@ async fn test_chunked_transfer_encoding() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello"
+    );
 
     let _ = server_task.await;
 }
@@ -162,7 +169,10 @@ async fn test_chunked_case_insensitive() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello"
+    );
 
     let _ = server_task.await;
 }
@@ -191,7 +201,10 @@ async fn test_transfer_encoding_overrides_content_length() {
 
     assert_eq!(resp.status().as_u16(), 200);
     // Should use chunked encoding, not Content-Length
-    assert_eq!(resp.body().as_ref(), b"hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello"
+    );
 
     let _ = server_task.await;
 }
@@ -218,7 +231,10 @@ async fn test_chunked_with_trailers() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello"
+    );
 
     let _ = server_task.await;
 }
@@ -244,7 +260,10 @@ async fn test_chunked_multiple_chunks() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello world");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello world"
+    );
 
     let _ = server_task.await;
 }
@@ -271,7 +290,10 @@ async fn test_content_length_exact() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello world");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello world"
+    );
 
     let _ = server_task.await;
 }
@@ -326,7 +348,10 @@ async fn test_1xx_responses_skipped() {
 
     // Should skip 100 Continue and return 200
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"hello");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"hello"
+    );
 
     let _ = server_task.await;
 }
@@ -355,7 +380,10 @@ async fn test_close_delimited_body() {
     let resp = client.get(url.as_str()).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.body().as_ref(), b"This body is close-delimited");
+    assert_eq!(
+        resp.buffered_bytes().unwrap_or(&Bytes::new()).as_ref(),
+        b"This body is close-delimited"
+    );
 
     let _ = server_task.await;
 }
