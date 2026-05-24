@@ -256,7 +256,7 @@ Specter's native HTTP/3 path also has a local same-fixture comparator matrix aga
 | quiche direct | HTTP/3 client | 2.72 ms | 2.80 ms | 7.87 MB/s |
 | tokio-quiche | HTTP/3 client | 3.32 ms | 3.52 ms | 6.81 MB/s |
 
-That same artifact includes Specter RFC 9220 WebSocket-over-H3 tunnel echo, close/FIN, and mixed slow-consumer rows. Third-party RFC 9220 tunnel comparator adapters are tracked as pending or unsupported capability rows, so the published H3 win is for HTTP/3 request/response workloads, not a cross-client RFC 9220 tunnel superiority claim. Native QUIC production hardening remains active work for PTO/recovery, Retry/VN handshake integration, key update, close drain, and full path validation.
+That gate is explicitly for HTTP/3 request/response workloads. The same artifact includes Specter RFC 9220 WebSocket-over-H3 tunnel echo, close/FIN, and mixed slow-consumer rows, but third-party RFC 9220 tunnel comparator adapters are tracked as pending or unsupported capability rows, so this is not a cross-client RFC 9220 tunnel superiority claim. `quinn_transport` and `s2n_quic_transport` are separate QUIC transport-only evidence, not H3 HTTP comparator rows. Native QUIC production hardening remains active work for PTO/recovery, Retry/VN handshake integration, key update, RFC-grade close-drain timing, and full path validation.
 
 ### Local WebSocket echo vs fastwebsockets and tokio-tungstenite
 
