@@ -19,6 +19,12 @@ const AES_128_GCM_KEY_LEN: usize = 16;
 const AES_128_GCM_IV_LEN: usize = 12;
 const AES_GCM_TAG_LEN: usize = 16;
 const RETRY_INTEGRITY_TAG_LEN: usize = 16;
+const RETRY_INTEGRITY_KEY_V1: [u8; AES_128_GCM_KEY_LEN] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+];
+const RETRY_INTEGRITY_NONCE_V1: [u8; AES_128_GCM_IV_LEN] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
 const HEADER_PROTECTION_SAMPLE_LEN: usize = 16;
 const HEADER_PROTECTION_MASK_LEN: usize = 5;
 const MAX_PACKET_NUMBER: u64 = (1u64 << 62) - 1;
@@ -147,6 +153,35 @@ pub struct RetryPacket {
     pub source_cid: ConnectionId,
     pub token: Bytes,
     pub integrity_tag: [u8; RETRY_INTEGRITY_TAG_LEN],
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QuicPathValidator {
+    pending: BTreeSet<[u8; 8]>,
+    validated: BTreeSet<[u8; 8]>,
+}
+
+impl QuicPathValidator {
+    pub fn path_challenge(&mut self, data: [u8; 8]) -> QuicFrame {
+        self.pending.insert(data);
+        QuicFrame::PathChallenge(data)
+    }
+
+    pub fn on_path_response(&mut self, data: [u8; 8]) -> bool {
+        if !self.pending.remove(&data) {
+            return false;
+        }
+        self.validated.insert(data);
+        true
+    }
+
+    pub fn is_validated(&self, data: &[u8; 8]) -> bool {
+        self.validated.contains(data)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1634,9 +1669,10 @@ pub fn split_long_header_datagram(datagram: &[u8]) -> Result<Vec<LongHeaderDatag
         let destination_cid = read_cid_at(datagram, &mut offset)?;
         let source_cid = read_cid_at(datagram, &mut offset)?;
         if packet_type == LongHeaderType::Retry {
-            let declared_remaining_len = datagram.len().checked_sub(offset).ok_or_else(|| {
-                Error::HttpProtocol("QUIC Retry packet length underflow".into())
-            })?;
+            let declared_remaining_len = datagram
+                .len()
+                .checked_sub(offset)
+                .ok_or_else(|| Error::HttpProtocol("QUIC Retry packet length underflow".into()))?;
             if declared_remaining_len < RETRY_INTEGRITY_TAG_LEN {
                 return Err(Error::HttpProtocol(
                     "truncated QUIC Retry integrity tag".into(),
@@ -1793,7 +1829,7 @@ pub fn decode_version_negotiation_packet(bytes: &[u8]) -> Result<VersionNegotiat
     }
     if input.remaining() % 4 != 0 {
         return Err(Error::HttpProtocol(
-            "truncated QUIC Version Negotiation version list".into(),
+            "truncated QUIC Version Negotiation supported version list".into(),
         ));
     }
 
@@ -1851,6 +1887,57 @@ pub fn decode_retry_packet(bytes: &[u8]) -> Result<RetryPacket> {
         token,
         integrity_tag: tag,
     })
+}
+
+pub fn retry_integrity_tag_v1(
+    original_destination_cid: &ConnectionId,
+    retry_without_integrity_tag: &[u8],
+) -> Result<[u8; RETRY_INTEGRITY_TAG_LEN]> {
+    let mut pseudo_packet =
+        Vec::with_capacity(1 + original_destination_cid.len() + retry_without_integrity_tag.len());
+    pseudo_packet.push(original_destination_cid.len() as u8);
+    pseudo_packet.extend_from_slice(original_destination_cid.as_bytes());
+    pseudo_packet.extend_from_slice(retry_without_integrity_tag);
+
+    let mut tag = [0u8; RETRY_INTEGRITY_TAG_LEN];
+    let ciphertext = encrypt_aead(
+        Cipher::aes_128_gcm(),
+        &RETRY_INTEGRITY_KEY_V1,
+        Some(&RETRY_INTEGRITY_NONCE_V1),
+        &pseudo_packet,
+        &[],
+        &mut tag,
+    )
+    .map_err(|err| Error::Quic(format!("QUIC Retry integrity tag failed: {err}")))?;
+    if !ciphertext.is_empty() {
+        return Err(Error::Quic(
+            "QUIC Retry integrity tag produced ciphertext".into(),
+        ));
+    }
+    Ok(tag)
+}
+
+pub fn validate_retry_integrity_tag_v1(
+    original_destination_cid: &ConnectionId,
+    retry_packet: &[u8],
+) -> Result<RetryPacket> {
+    let decoded = decode_retry_packet(retry_packet)?;
+    if decoded.version != 1 {
+        return Err(Error::HttpProtocol(
+            "QUIC Retry integrity validation only supports version 1".into(),
+        ));
+    }
+    let tag_offset = retry_packet
+        .len()
+        .checked_sub(RETRY_INTEGRITY_TAG_LEN)
+        .ok_or_else(|| Error::HttpProtocol("truncated QUIC Retry packet".into()))?;
+    let expected = retry_integrity_tag_v1(original_destination_cid, &retry_packet[..tag_offset])?;
+    if expected != decoded.integrity_tag {
+        return Err(Error::HttpProtocol(
+            "invalid QUIC Retry integrity tag".into(),
+        ));
+    }
+    Ok(decoded)
 }
 
 fn merge_crypto_segment(

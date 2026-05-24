@@ -1672,11 +1672,13 @@ impl NativeQuicHandshake {
             if sent.packet_type != LongHeaderType::Handshake {
                 continue;
             }
-            retransmits.push(self.build_client_handshake_crypto_packet_at_offset_with_sent_at(
-                sent.crypto_offset,
-                sent.crypto_data,
-                now,
-            )?);
+            retransmits.push(
+                self.build_client_handshake_crypto_packet_at_offset_with_sent_at(
+                    sent.crypto_offset,
+                    sent.crypto_data,
+                    now,
+                )?,
+            );
         }
         Ok(retransmits)
     }
@@ -2288,7 +2290,9 @@ impl NativeQuicHandshake {
                     self.next_server_handshake_packet_number = opened.packet_number + 1;
 
                     for frame in decode_frames(&opened.payload)? {
-                        for packet_number in self.client_handshake_loss_detector.on_ack_frame(&frame)? {
+                        for packet_number in
+                            self.client_handshake_loss_detector.on_ack_frame(&frame)?
+                        {
                             self.client_handshake_sent_crypto.remove(&packet_number);
                         }
                         if let QuicFrame::Crypto { offset, data } = frame {

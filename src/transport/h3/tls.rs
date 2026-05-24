@@ -504,12 +504,7 @@ fn apply_tls_cert_compression(
     };
 
     unsafe {
-        if ffi::SSL_CTX_add_cert_compression_alg(
-            builder.as_ptr(),
-            algorithm,
-            None,
-            decompress,
-        ) != 1
+        if ffi::SSL_CTX_add_cert_compression_alg(builder.as_ptr(), algorithm, None, decompress) != 1
         {
             return Err(Error::Tls(
                 "failed to configure QUIC TLS certificate compression".into(),
@@ -530,7 +525,12 @@ unsafe extern "C" fn decompress_brotli_cert(
     let compressed = std::slice::from_raw_parts(input, input_len);
     let mut decompressed = Vec::with_capacity(uncompressed_len);
     let mut decoder = brotli::Decompressor::new(compressed, uncompressed_len);
-    write_decompressed_cert(out, uncompressed_len, decoder.read_to_end(&mut decompressed), &decompressed)
+    write_decompressed_cert(
+        out,
+        uncompressed_len,
+        decoder.read_to_end(&mut decompressed),
+        &decompressed,
+    )
 }
 
 unsafe extern "C" fn decompress_zlib_cert(
@@ -543,7 +543,12 @@ unsafe extern "C" fn decompress_zlib_cert(
     let compressed = std::slice::from_raw_parts(input, input_len);
     let mut decoder = flate2::read::DeflateDecoder::new(compressed);
     let mut decompressed = Vec::with_capacity(uncompressed_len);
-    write_decompressed_cert(out, uncompressed_len, decoder.read_to_end(&mut decompressed), &decompressed)
+    write_decompressed_cert(
+        out,
+        uncompressed_len,
+        decoder.read_to_end(&mut decompressed),
+        &decompressed,
+    )
 }
 
 unsafe fn write_decompressed_cert(

@@ -105,7 +105,9 @@ impl H3SendScheduler {
     }
 
     fn data_budget(&self, available: usize) -> usize {
-        available.min(self.data_budget).max((available > 0) as usize)
+        available
+            .min(self.data_budget)
+            .max((available > 0) as usize)
     }
 
     fn record_data_sent(&mut self, sent: usize) {
@@ -579,6 +581,7 @@ pub fn spawn_native_h3_driver(
         pending_streaming_responses: HashMap::new(),
         pending_tunnels: HashMap::new(),
         pending_commands: VecDeque::new(),
+        send_scheduler: H3SendScheduler::default(),
         is_draining: is_draining.clone(),
         body_progress_notify: body_progress_notify.clone(),
         transport_config: transport_config.normalized(),
@@ -613,6 +616,7 @@ struct NativeH3Driver {
     pending_streaming_responses: HashMap<u64, NativeDriverStreamingResponseState>,
     pending_tunnels: HashMap<u64, NativeDriverTunnelState>,
     pending_commands: VecDeque<DriverCommand>,
+    send_scheduler: H3SendScheduler,
     is_draining: Arc<std::sync::atomic::AtomicBool>,
     body_progress_notify: Arc<Notify>,
     transport_config: H3TransportConfig,
@@ -848,14 +852,18 @@ impl NativeH3Driver {
                 .max(1200)
         ];
         loop {
-            self.flush_request_stream_bodies().await?;
-            self.flush_pending_tunnel_data().await?;
+            let sent_scheduled_data = self.flush_scheduled_send_work().await?;
             self.flush_tunnel_inbound();
             self.flush_streaming_responses();
-            let released_body_credit = self.apply_released_body_credits().await?;
-            let released_tunnel_credit = self.apply_released_tunnel_credits();
-            if (released_body_credit || released_tunnel_credit) && !self.receive_backpressured() {
+            let released_credit = H3ReleasedReceiveCredit::new(
+                self.apply_released_body_credits().await?,
+                self.apply_released_tunnel_credits(),
+            );
+            if released_credit.has_credit() && !self.receive_backpressured() {
                 self.send_receive_flow_control_updates().await?;
+            }
+            if sent_scheduled_data && self.has_outbound_send_work() {
+                continue;
             }
             let has_pending_work = self.has_pending_work();
             if self.last_activity.elapsed() > self.max_idle_timeout && !has_pending_work {
@@ -904,12 +912,14 @@ impl NativeH3Driver {
                 }
                 _ = self.body_progress_notify.notified() => {
                     self.cancel_closed_streaming_bodies().await?;
-                    self.flush_request_stream_bodies().await?;
+                    self.flush_scheduled_send_work().await?;
                     self.flush_tunnel_inbound();
                     self.flush_streaming_responses();
-                    let released_body_credit = self.apply_released_body_credits().await?;
-                    let released_tunnel_credit = self.apply_released_tunnel_credits();
-                    if (released_body_credit || released_tunnel_credit) && !self.receive_backpressured() {
+                    let released_credit = H3ReleasedReceiveCredit::new(
+                        self.apply_released_body_credits().await?,
+                        self.apply_released_tunnel_credits(),
+                    );
+                    if released_credit.has_credit() && !self.receive_backpressured() {
                         self.send_receive_flow_control_updates().await?;
                     }
                 }
@@ -923,6 +933,22 @@ impl NativeH3Driver {
             || !self.pending_tunnels.is_empty()
             || !self.pending_commands.is_empty()
             || self.client_application_ack_deadline().is_some()
+    }
+
+    fn has_outbound_send_work(&self) -> bool {
+        self.has_request_body_work() || self.has_tunnel_data_work()
+    }
+
+    fn has_request_body_work(&self) -> bool {
+        self.pending_streaming_responses
+            .values()
+            .any(|stream| stream.request_stream.is_some())
+    }
+
+    fn has_tunnel_data_work(&self) -> bool {
+        self.pending_tunnels
+            .values()
+            .any(|tunnel| !tunnel.pending_outbound.is_empty())
     }
 
     fn streaming_response_body_backpressured(&self) -> bool {
@@ -1156,7 +1182,7 @@ impl NativeH3Driver {
                     .send_to(packet.packet.as_ref(), self.peer_addr)
                     .await
                     .map_err(Error::Io)?;
-                self.flush_request_stream_bodies().await?;
+                self.flush_scheduled_send_work().await?;
             }
             DriverCommand::OpenWebSocketTunnel {
                 uri,
@@ -1259,72 +1285,121 @@ impl NativeH3Driver {
             return Ok(());
         };
         tunnel.pending_outbound.push_back(outbound);
-        self.flush_tunnel_data(stream_id).await
+        self.flush_scheduled_send_work().await?;
+        Ok(())
     }
 
-    async fn flush_pending_tunnel_data(&mut self) -> Result<()> {
-        let stream_ids = self
+    async fn flush_scheduled_send_work(&mut self) -> Result<bool> {
+        let classes = self
+            .send_scheduler
+            .next_classes(self.has_request_body_work(), self.has_tunnel_data_work());
+
+        for class in classes {
+            let progressed_stream = match class {
+                H3SendClass::RequestBody => self.flush_request_stream_bodies_once().await?,
+                H3SendClass::TunnelData => self.flush_pending_tunnel_data_once().await?,
+            };
+            if let Some(stream_id) = progressed_stream {
+                self.send_scheduler.record_stream_progress(class, stream_id);
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn flush_pending_tunnel_data_once(&mut self) -> Result<Option<u64>> {
+        let stream_ids = self.send_scheduler.ordered_streams(
+            H3SendClass::TunnelData,
+            self.pending_tunnels
+                .iter()
+                .filter_map(|(stream_id, tunnel)| {
+                    (!tunnel.pending_outbound.is_empty()).then_some(*stream_id)
+                })
+                .collect(),
+        );
+        for stream_id in stream_ids {
+            if self.flush_tunnel_data_once(stream_id).await? {
+                return Ok(Some(stream_id));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn flush_tunnel_data_once(&mut self, stream_id: u64) -> Result<bool> {
+        let Some(outbound) = self
             .pending_tunnels
-            .iter()
-            .filter_map(|(stream_id, tunnel)| {
-                (!tunnel.pending_outbound.is_empty()).then_some(*stream_id)
-            })
-            .collect::<Vec<_>>();
-        for stream_id in stream_ids {
-            self.flush_tunnel_data(stream_id).await?;
-        }
-        Ok(())
-    }
+            .get(&stream_id)
+            .and_then(|tunnel| tunnel.pending_outbound.front().cloned())
+        else {
+            return Ok(false);
+        };
 
-    async fn flush_tunnel_data(&mut self, stream_id: u64) -> Result<()> {
-        loop {
-            let Some(outbound) = self
-                .pending_tunnels
-                .get(&stream_id)
-                .and_then(|tunnel| tunnel.pending_outbound.front().cloned())
-            else {
-                return Ok(());
-            };
+        let (bytes, fin, remaining) = if outbound.bytes.is_empty() {
+            (Bytes::new(), outbound.fin, None)
+        } else {
+            let send_len = self.send_scheduler.data_budget(outbound.bytes.len());
+            let bytes = outbound.bytes.slice(..send_len);
+            let remaining = (send_len < outbound.bytes.len()).then(|| H3TunnelOutbound {
+                bytes: outbound.bytes.slice(send_len..),
+                fin: outbound.fin,
+            });
+            let fin = outbound.fin && remaining.is_none();
+            (bytes, fin, remaining)
+        };
 
-            let packet = match self.handshake.build_client_h3_data_packet(
-                stream_id,
-                outbound.bytes.clone(),
-                outbound.fin,
-            ) {
-                Ok(packet) => packet,
-                Err(error) if is_flow_control_blocked_error(&error) => {
-                    self.send_flow_control_blocked_packet().await?;
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-
-            if let Some(packet) = packet {
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+        let packet = match self
+            .handshake
+            .build_client_h3_data_packet(stream_id, bytes.clone(), fin)
+        {
+            Ok(packet) => packet,
+            Err(error) if is_flow_control_blocked_error(&error) => {
+                self.send_flow_control_blocked_packet().await?;
+                return Ok(false);
             }
+            Err(error) => return Err(error),
+        };
 
-            if let Some(tunnel) = self.pending_tunnels.get_mut(&stream_id) {
-                tunnel.pending_outbound.pop_front();
+        if let Some(packet) = packet {
+            self.socket
+                .send_to(packet.packet.as_ref(), self.peer_addr)
+                .await
+                .map_err(Error::Io)?;
+        }
+
+        if !bytes.is_empty() {
+            self.send_scheduler.record_data_sent(bytes.len());
+        }
+
+        if let Some(tunnel) = self.pending_tunnels.get_mut(&stream_id) {
+            tunnel.pending_outbound.pop_front();
+            if let Some(remaining) = remaining {
+                tunnel.pending_outbound.push_front(remaining);
             }
         }
+
+        Ok(true)
     }
 
-    async fn flush_request_stream_bodies(&mut self) -> Result<()> {
-        let stream_ids = self
-            .pending_streaming_responses
-            .iter()
-            .filter_map(|(stream_id, stream)| stream.request_stream.is_some().then_some(*stream_id))
-            .collect::<Vec<_>>();
+    async fn flush_request_stream_bodies_once(&mut self) -> Result<Option<u64>> {
+        let stream_ids = self.send_scheduler.ordered_streams(
+            H3SendClass::RequestBody,
+            self.pending_streaming_responses
+                .iter()
+                .filter_map(|(stream_id, stream)| {
+                    stream.request_stream.is_some().then_some(*stream_id)
+                })
+                .collect(),
+        );
         for stream_id in stream_ids {
-            self.flush_request_stream_body(stream_id).await?;
+            if self.flush_request_stream_body_once(stream_id).await? {
+                return Ok(Some(stream_id));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
-    async fn flush_request_stream_body(&mut self, stream_id: u64) -> Result<()> {
+    async fn flush_request_stream_body_once(&mut self, stream_id: u64) -> Result<bool> {
         loop {
             if self
                 .pending_streaming_responses
@@ -1332,7 +1407,7 @@ impl NativeH3Driver {
                 .and_then(|stream| stream.request_stream.as_ref())
                 .is_none()
             {
-                return Ok(());
+                return Ok(false);
             }
 
             let has_current_chunk = self
@@ -1363,7 +1438,7 @@ impl NativeH3Driver {
                 };
 
                 match poll_result {
-                    Poll::Pending => return Ok(()),
+                    Poll::Pending => return Ok(false),
                     Poll::Ready(Some(Ok(chunk))) => {
                         if chunk.is_empty() {
                             continue;
@@ -1384,7 +1459,7 @@ impl NativeH3Driver {
                             stream_id,
                             Error::HttpProtocol(format!("request body stream error: {error}")),
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
                     Poll::Ready(None) => {
                         let (valid_len, sent, expected, already_sent_end) = {
@@ -1415,10 +1490,10 @@ impl NativeH3Driver {
                                     expected.unwrap_or_default()
                                 )),
                             );
-                            return Ok(());
+                            return Ok(false);
                         }
                         if already_sent_end {
-                            return Ok(());
+                            return Ok(false);
                         }
                         let packet = match self.handshake.build_client_h3_data_packet(
                             stream_id,
@@ -1428,7 +1503,7 @@ impl NativeH3Driver {
                             Ok(packet) => packet,
                             Err(error) if is_flow_control_blocked_error(&error) => {
                                 self.send_flow_control_blocked_packet().await?;
-                                return Ok(());
+                                return Ok(false);
                             }
                             Err(error) => return Err(error),
                         };
@@ -1444,7 +1519,7 @@ impl NativeH3Driver {
                             }
                             stream.request_stream = None;
                         }
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
             }
@@ -1464,15 +1539,17 @@ impl NativeH3Driver {
                 )
             };
             let remaining = chunk.slice(offset..);
+            let send_len = self.send_scheduler.data_budget(remaining.len());
+            let data = remaining.slice(..send_len);
             let packet = match self.handshake.build_client_h3_data_packet(
                 stream_id,
-                remaining.clone(),
+                data.clone(),
                 false,
             ) {
                 Ok(packet) => packet,
                 Err(error) if is_flow_control_blocked_error(&error) => {
                     self.send_flow_control_blocked_packet().await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             };
@@ -1483,18 +1560,20 @@ impl NativeH3Driver {
                     .map_err(Error::Io)?;
             }
 
+            self.send_scheduler.record_data_sent(data.len());
             if let Some(stream) = self.pending_streaming_responses.get_mut(&stream_id) {
                 let body = stream
                     .request_stream
                     .as_mut()
                     .expect("request stream exists");
-                body.current_offset += remaining.len();
-                body.sent += remaining.len() as u64;
+                body.current_offset += data.len();
+                body.sent += data.len() as u64;
                 if body.current_offset >= chunk.len() {
                     body.current_chunk = None;
                     body.current_offset = 0;
                 }
             }
+            return Ok(true);
         }
     }
 
@@ -1558,13 +1637,14 @@ impl NativeH3Driver {
         self.cancel_closed_streaming_bodies().await?;
         self.flush_tunnel_inbound();
         self.flush_streaming_responses();
-        let released_body_credit = self.apply_released_body_credits().await?;
-        let released_tunnel_credit = self.apply_released_tunnel_credits();
+        let released_credit = H3ReleasedReceiveCredit::new(
+            self.apply_released_body_credits().await?,
+            self.apply_released_tunnel_credits(),
+        );
         let has_streaming_responses = !self.pending_streaming_responses.is_empty();
         let has_tunnels = !self.pending_tunnels.is_empty();
         if ((!has_streaming_responses && !has_tunnels)
-            || released_body_credit
-            || released_tunnel_credit)
+            || released_credit.has_credit())
             && !self.receive_backpressured()
         {
             self.send_receive_flow_control_updates().await?;
@@ -1736,13 +1816,13 @@ impl NativeH3Driver {
         }
     }
 
-    async fn apply_released_body_credits(&mut self) -> Result<bool> {
+    async fn apply_released_body_credits(&mut self) -> Result<usize> {
         let stream_ids = self
             .pending_streaming_responses
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        let mut released_body_credit = false;
+        let mut released_body_credit = 0usize;
 
         for stream_id in stream_ids {
             let (released, closed) = self
@@ -1763,16 +1843,16 @@ impl NativeH3Driver {
             }
 
             if released > 0 {
-                released_body_credit = true;
+                released_body_credit = released_body_credit.saturating_add(released);
             }
         }
 
         Ok(released_body_credit)
     }
 
-    fn apply_released_tunnel_credits(&mut self) -> bool {
+    fn apply_released_tunnel_credits(&mut self) -> usize {
         let stream_ids = self.pending_tunnels.keys().copied().collect::<Vec<_>>();
-        let mut released_tunnel_credit = false;
+        let mut released_tunnel_credit = 0usize;
 
         for stream_id in stream_ids {
             let (released, closed) = self
@@ -1792,7 +1872,7 @@ impl NativeH3Driver {
             }
 
             if released > 0 {
-                released_tunnel_credit = true;
+                released_tunnel_credit = released_tunnel_credit.saturating_add(released);
             }
         }
 
@@ -2243,6 +2323,7 @@ mod tests {
             pending_commands: VecDeque::new(),
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             body_progress_notify: Arc::new(Notify::new()),
+            send_scheduler: H3SendScheduler::default(),
             transport_config: H3TransportConfig::default(),
             max_idle_timeout: Duration::from_secs(1),
             last_activity: Instant::now(),
