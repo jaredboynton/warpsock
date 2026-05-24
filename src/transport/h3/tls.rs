@@ -549,6 +549,9 @@ impl NativeQuicTlsSession {
         ssl.set_hostname(server_name)
             .map_err(|err| Error::Tls(format!("failed to set QUIC SNI: {err}")))?;
         ssl.replace_ex_data(capture_index(), state.clone());
+        unsafe {
+            SSL_set_early_data_enabled(ssl.as_ptr(), 1);
+        }
 
         let transport_parameters =
             if let Some(initial_source_connection_id) = initial_source_connection_id {

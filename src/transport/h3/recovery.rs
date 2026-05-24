@@ -1146,11 +1146,11 @@ mod tests {
             0,
             meta(now - Duration::from_millis(50), 1200),
         );
-        let ack_frame = ack_frame(0, 0);
+        let seed_ack = ack_frame(0, 0);
         let _ = recovery
             .on_ack_received(
                 PacketNumberSpace::Application,
-                &ack_frame,
+                &seed_ack,
                 3,
                 now - Duration::from_millis(40),
             )
