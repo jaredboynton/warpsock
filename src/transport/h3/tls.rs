@@ -48,7 +48,26 @@ unsafe extern "C" {
     fn SSL_get_early_data_reason(ssl: *const ffi::SSL) -> u32;
     fn SSL_process_quic_post_handshake(ssl: *mut ffi::SSL) -> c_int;
     fn SSL_SESSION_early_data_capable(session: *const ffi::SSL_SESSION) -> c_int;
+    fn SSL_SESSION_copy_without_early_data(session: *mut ffi::SSL_SESSION) -> *mut ffi::SSL_SESSION;
+    fn SSL_CTX_set_tlsext_ticket_keys(
+        ctx: *mut ffi::SSL_CTX,
+        keys: *const c_void,
+        keys_len: usize,
+    ) -> c_int;
 }
+
+/// Length in bytes of a TLS session-ticket key (a.k.a. STEK) accepted by
+/// BoringSSL's `SSL_CTX_set_tlsext_ticket_keys` (a 16-byte key name plus a
+/// 16-byte HMAC key plus a 16-byte AES key). BoringSSL uses this for the
+/// TLS 1.3 NewSessionTicket path too, so two `SslContext` instances that
+/// share the same 48-byte STEK can decrypt each other's tickets.
+///
+/// Production native H3 servers should keep a single long-lived
+/// `SslContext` (which derives a per-process STEK internally) instead of
+/// installing a fixed STEK; this constant exists primarily for in-process
+/// test fixtures that want to prove resumption across two
+/// `NativeQuicTlsSession::server*` instances.
+pub const NATIVE_H3_TICKET_KEY_LEN: usize = 48;
 
 const QUIC_VERSION_1: u32 = 1;
 const CLIENT_INITIAL_PACKET_NUMBER: u64 = 0;
@@ -203,7 +222,35 @@ impl NativeQuicTlsSession {
     }
 
     pub fn server(fingerprint: &Http3Fingerprint, cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
-        let mut session = Self::new_server(fingerprint, cert_pem, key_pem, None, None, None)?;
+        let mut session = Self::new_server(fingerprint, cert_pem, key_pem, None, None, None, None)?;
+        session.drive_handshake("QUIC server handshake")?;
+        Ok(session)
+    }
+
+    /// Variant of [`Self::server`] that installs a fixed `NATIVE_H3_TICKET_KEY_LEN`-byte
+    /// TLS session-ticket key (a.k.a. STEK) on the underlying `SslContext`.
+    ///
+    /// Two server sessions constructed with the same `ticket_keys` will be
+    /// able to decrypt one another's TLS 1.3 NewSessionTicket frames, which
+    /// is what test fixtures need to prove RFC 8446 section 4.6.1
+    /// resumption end to end across two independent server instances.
+    /// Production native H3 servers should instead keep a single
+    /// long-lived `SslContext` so BoringSSL can manage the STEK internally.
+    pub fn server_with_ticket_keys(
+        fingerprint: &Http3Fingerprint,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        ticket_keys: &[u8; NATIVE_H3_TICKET_KEY_LEN],
+    ) -> Result<Self> {
+        let mut session = Self::new_server(
+            fingerprint,
+            cert_pem,
+            key_pem,
+            None,
+            None,
+            None,
+            Some(ticket_keys),
+        )?;
         session.drive_handshake("QUIC server handshake")?;
         Ok(session)
     }
@@ -221,6 +268,7 @@ impl NativeQuicTlsSession {
             key_pem,
             Some(original_destination_connection_id),
             Some(initial_source_connection_id),
+            None,
             None,
         )?;
         session.drive_handshake("QUIC server handshake")?;
@@ -242,6 +290,7 @@ impl NativeQuicTlsSession {
             Some(original_destination_connection_id),
             Some(initial_source_connection_id),
             retry_source_connection_id,
+            None,
         )?;
         session.drive_handshake("QUIC server handshake")?;
         Ok(session)
@@ -598,19 +647,8 @@ impl NativeQuicTlsSession {
         ssl.set_hostname(server_name)
             .map_err(|err| Error::Tls(format!("failed to set QUIC SNI: {err}")))?;
         ssl.replace_ex_data(capture_index(), state.clone());
-        // BoringSSL's `SSL_CTX_set_early_data_enabled(ctx, 1)` on the
-        // context makes any captured SSL_SESSION early-data capable so the
-        // next connect can opt in to 0-RTT (RFC 9001 section 4.6). On this
-        // particular SSL we only want to *offer* early data when the
-        // caller explicitly opted in via `zero_rtt_early_data` and
-        // installed a replayable ticket - otherwise BoringSSL would emit
-        // a ClientHello with `early_data` advertised but no PSK binder
-        // that the server can map to early data, which the server then
-        // rejects with `SSL_ERROR_EARLY_DATA_REJECTED`.
-        let wants_zero_rtt_offer = zero_rtt_early_data.is_some_and(|data| !data.is_empty())
-            && replayed_session_ticket.is_some();
         unsafe {
-            SSL_set_early_data_enabled(ssl.as_ptr(), i32::from(wants_zero_rtt_offer));
+            SSL_set_early_data_enabled(ssl.as_ptr(), 1);
         }
 
         let transport_parameters =
@@ -628,6 +666,11 @@ impl NativeQuicTlsSession {
                     "failed to parse native H3 replayed session ticket: {err}"
                 ))
             })?;
+            let session = if zero_rtt_early_data.is_some_and(|data| !data.is_empty()) {
+                session
+            } else {
+                copy_session_without_early_data(&session)?
+            };
             unsafe {
                 ssl.set_session(&session).map_err(|err| {
                     Error::Tls(format!(
@@ -689,12 +732,26 @@ impl NativeQuicTlsSession {
         original_destination_connection_id: Option<&ConnectionId>,
         initial_source_connection_id: Option<&ConnectionId>,
         retry_source_connection_id: Option<&ConnectionId>,
+        ticket_keys: Option<&[u8; NATIVE_H3_TICKET_KEY_LEN]>,
     ) -> Result<Self> {
         let mut builder = SslContext::builder(SslMethod::tls_server()).map_err(|err| {
             Error::Tls(format!("failed to create QUIC TLS server context: {err}"))
         })?;
         unsafe {
             SSL_CTX_set_early_data_enabled(builder.as_ptr(), 1);
+            if let Some(keys) = ticket_keys {
+                if SSL_CTX_set_tlsext_ticket_keys(
+                    builder.as_ptr(),
+                    keys.as_ptr().cast(),
+                    keys.len(),
+                ) != 1
+                {
+                    return Err(Error::Tls(
+                        "failed to install fixed TLS session-ticket keys on QUIC server context"
+                            .into(),
+                    ));
+                }
+            }
         }
         builder
             .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -815,6 +872,16 @@ impl NativeQuicTlsSession {
             QuicEncryptionLevel::Application => state.application_crypto.len(),
         }
     }
+}
+
+fn copy_session_without_early_data(session: &SslSession) -> Result<SslSession> {
+    let session = unsafe { SSL_SESSION_copy_without_early_data(session.as_ptr()) };
+    if session.is_null() {
+        return Err(Error::Tls(
+            "failed to copy native H3 session without early data".into(),
+        ));
+    }
+    Ok(unsafe { SslSession::from_ptr(session) })
 }
 
 fn native_h3_early_data_context(
