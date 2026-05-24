@@ -9,6 +9,7 @@ Repo: `/Users/jaredboynton/__devlocal/specter`
 - The isolated benchmark crate covers the required widely used Rust H3 clients: direct `quiche`, `tokio-quiche`, `h3` + `h3-quinn`, and `reqwest` HTTP/3.
 - `reqwest_h3` now works against the local native fixture by using a preconfigured rustls/quinn config pinned to `TLS13_AES_128_GCM_SHA256` and `h3` ALPN.
 - Native QUIC ACK state now clears pending ACKs after send without forgetting ACK ranges, preventing the ACK storm that caused repeated streaming requests to hang.
+- Native QUIC frame codec now round-trips RFC9000 ACK_ECN frames (`0x03`) with ECN counters, and loss detection applies ACK_ECN ranges like ordinary ACK ranges.
 - Native H3 now exposes a reusable `H3Handle` path for low-overhead repeated requests and a same-URL hot handle cache for the higher-level `H3Client` path.
 - The local benchmark fixture now starts a fresh native H3 server fixture per client in the full matrix, avoiding cross-client fixture state/noise.
 - Same-fixture measured proof is live again: `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-smoke.json` passed `--require-superiority` with real measured rows for `specter_native`, `quiche_direct`, `tokio_quiche`, `h3_quinn`, `reqwest_h3`, `quinn_transport`, and `specter_native_rfc9220_tunnel`.
@@ -95,13 +96,14 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - Routed opened RFC9220 tunnel stream resets through the same queued inbound path so reset delivery is not dropped when the public tunnel channel is full.
 - Added pending-ACK deadline tracking and native client delayed application ACK scheduling so ACKs flush on `max_ack_delay_ms` even when `ack_eliciting_threshold` is not reached.
 - Wired the native mock H3 server and same-fixture benchmark H3 server to use the same threshold-or-`max_ack_delay_ms` ACK timer path instead of immediate application ACKs.
+- Added ACK_ECN frame encode/decode support and made ACK_ECN ranges feed the native QUIC loss detector.
 - Fixed native server QUIC transport parameters for required connection-ID fields and fixed server/client CID handling for 1-RTT packet routing.
 - Added a same-fixture `specter_native_rfc9220_tunnel` benchmark row that opens RFC9220/WebSocket-over-H3 against the native fixture, echoes H3 DATA, and records TTFT/throughput separately from the H3 streaming superiority gate.
 - Added transport-only `quinn_transport` and optional `s2n_quic_transport` same-fixture comparator adapters that open a raw QUIC bidirectional stream, echo payload bytes, and record measured TTFT/throughput outside the H3 superiority gate.
 
 ## Remaining gaps
 
-- Native QUIC still needs production-grade PTO/timer-driven retransmission, CRYPTO retransmission, close drain semantics, key update handling, version negotiation, Retry, ACK_ECN, and full path validation.
+- Native QUIC still needs production-grade PTO/timer-driven retransmission, CRYPTO retransmission, close drain semantics, key update handling, version negotiation, Retry, ECN socket/counter plumbing beyond ACK_ECN frame parsing, and full path validation.
 - Client/server same-fixture ACK decimation now has a `max_ack_delay_ms` timer path; capture-derived browser timing parity remains a production gap.
 - The tuned benchmark proof uses `ack_eliciting_threshold = 128`; browser-capture parity still needs per-browser/version ACK behavior measurements.
 - The latest full same-fixture proof emits no fixture packet-error events; keep the fixture event classification/audit path as a regression guard if third-party clients reintroduce late packet-open noise.
@@ -135,6 +137,8 @@ Gate result: `pass` / `specter_native_is_faster_than_required_h3_competitors`.
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml quinn_transport -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo test --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features s2n-quic-transport -- --nocapture`
+- `CARGO_TARGET_DIR=/tmp/specter-ack-ecn-target cargo test --test h3_native_quic ack_ecn -- --nocapture`
+- `CARGO_TARGET_DIR=/tmp/specter-ack-ecn-target cargo test --test h3_native_quic -- --nocapture`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml -- --measure-local-native-fixture --measure-local-native-fixture-client quinn_transport --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-quinn-transport-local.json`
 - `CARGO_TARGET_DIR=/tmp/specter-h3-test-target cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features s2n-quic-transport -- --measure-local-native-fixture --measure-local-native-fixture-client s2n_quic_transport --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-s2n-quic-transport-local.json`
 - `RUSTFLAGS='--cfg reqwest_unstable' CARGO_TARGET_DIR=/tmp/specter-h3-test-target timeout 180 cargo run --manifest-path benches/native_h3_vs_rust_clients/Cargo.toml --features reqwest-h3 -- --measure-local-native-fixture --warmups 1 --samples 2 --json docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-smoke.json --require-superiority`

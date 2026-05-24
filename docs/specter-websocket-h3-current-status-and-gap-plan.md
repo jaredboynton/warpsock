@@ -13,7 +13,7 @@ Specter now has credible proof for the H1/H2, RFC6455, and local same-fixture na
 - **Live Codex WSS vs tokio-tungstenite:** persisted n=50 artifact passes all samples and shows better Specter p95 tail, but median TTFT remains within/noisy against tungstenite.
 - **Native H3 HTTP comparator:** isolated comparator crate now has persisted same-fixture artifacts under `docs/benchmarks/native-h3-vs-rust-clients/`; `2026-05-24-full-local-with-s2n-smoke.json` passes `--require-superiority` with real rows for `quiche`, `tokio-quiche`, `h3-quinn`, `reqwest_h3`, `quinn_transport`, and `s2n_quic_transport`, and emits no fixture packet-error events.
 - **RFC9220 WebSocket-over-H3:** correctness/API exists as a raw byte tunnel, and the full same-fixture proof includes a Specter local echo latency/throughput row; third-party tunnel comparator rows, close/FIN timing, and slow-consumer rows remain pending.
-- **Native QUIC production readiness:** still not production-complete; PTO/timer recovery, CRYPTO retransmission, Retry, version negotiation, close drain, key update, ACK_ECN, and full path validation remain gaps.
+- **Native QUIC production readiness:** still not production-complete; PTO/timer recovery, CRYPTO retransmission, Retry, version negotiation, close drain, key update, ECN socket plumbing beyond ACK_ECN frame parsing, and full path validation remain gaps.
 
 ## Direct answers captured during audit
 
@@ -128,7 +128,7 @@ Specter status:
 
 ### P2
 
-1. **ACK_ECN:** ACK_ECN frame support and ECN socket plumbing missing.
+1. **ACK_ECN / ECN plumbing:** ACK_ECN frame encode/decode and loss-detector range handling exist; ECN socket/counter plumbing is still missing.
 2. **Path validation/migration:** PATH_CHALLENGE response exists, but CID inventory, path candidate validation, migration, anti-amplification, and PATH_RESPONSE validation are incomplete.
 3. **Fingerprinting gaps:** cert compression, resumption, 0-RTT, raw ordered transport-parameter list capture/replay.
 
@@ -139,7 +139,7 @@ Specter status:
    - Compare captured ACK delays/thresholds against the tuned `ack_eliciting_threshold = 128` and `max_ack_delay_ms` defaults.
 
 2. **Publish consolidated docs**
-   - Keep this file as `/tmp/specter-websocket-h3-current-status-and-gap-plan.md`.
+   - Keep this file as `docs/specter-websocket-h3-current-status-and-gap-plan.md`.
    - Keep agent reports as supporting appendices:
      - `/tmp/specter-quic-production-gap-agent1.md`
      - `/tmp/specter-ack-delay-gap-agent2.md`
@@ -164,7 +164,7 @@ Specter status:
 6. **Close native QUIC production gaps**
    - Implement packet-space recovery/PTO and CRYPTO retransmission first.
    - Then Retry/version negotiation/close drain/key update/path validation.
-   - Finish ACK_ECN and browser capture parity after the recovery/state-machine core is stable.
+   - Finish ECN socket/counter plumbing and browser capture parity after the recovery/state-machine core is stable.
 
 ## Current proof artifacts
 
