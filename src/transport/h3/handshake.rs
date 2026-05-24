@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::fingerprint::{Http3Fingerprint, QuicTransportParams, TlsFingerprint};
 use crate::transport::h3::native;
 use crate::transport::h3::quic::{
-    build_initial_crypto_packet, decode_frames, decode_transport_parameters,
+    build_initial_crypto_packet, decode_frames, decode_long_header, decode_transport_parameters,
     decode_version_negotiation_packet, derive_initial_key_material,
     derive_next_packet_key_material, encode_frame, encode_long_header, open_long_header_packet,
     open_short_header_packet, protect_long_header_packet, protect_short_header_packet,
@@ -17,7 +17,9 @@ use crate::transport::h3::quic::{
     LongHeaderType, OpenedShortHeaderPacket, QuicAckTracker, QuicCloseState, QuicCryptoAssembler,
     QuicFrame, QuicLossDetector, QuicPacketKeyMaterial, QuicPathValidator, TransportParameter,
 };
-use crate::transport::h3::recovery::RecoveryState;
+use crate::transport::h3::recovery::{
+    LossDetectionOutcome, PacketNumberSpace, RecoveryState, SentPacketInfo,
+};
 use crate::transport::h3::tls::{
     build_client_initial_packet_from_capture_with_size,
     build_client_initial_packet_from_capture_with_version_and_size, ClientInitialPacket,
@@ -708,6 +710,7 @@ pub struct NativeQuicHandshake {
     server_initial_or_handshake_seen: bool,
     original_destination_cid: ConnectionId,
     retry_source_cid: Option<ConnectionId>,
+    client_initial_token: Bytes,
     destination_cid: ConnectionId,
     source_cid: ConnectionId,
     client_initial_keys: QuicPacketKeyMaterial,
@@ -2066,6 +2069,7 @@ impl NativeQuicHandshake {
             server_initial_or_handshake_seen: false,
             original_destination_cid: destination_cid.clone(),
             retry_source_cid: None,
+            client_initial_token: Bytes::new(),
             destination_cid,
             source_cid,
             client_initial_keys: initial_keys.client,
@@ -2550,6 +2554,138 @@ impl NativeQuicHandshake {
             );
         }
         Ok(retransmits)
+    }
+
+    /// Record that the initial client Initial datagram (or its Retry/VN
+    /// rebuild) has been handed to the socket. RFC9002 § 6.1 OnPacketSent for
+    /// the Initial packet number space: tracks the packet for loss/PTO
+    /// detection and seeds `recovery` so the loss detection timer can arm.
+    pub fn record_client_initial_sent_at(&mut self, sent_at: Instant) {
+        let packet_number = self.next_client_initial_packet_number.saturating_sub(1);
+        if self.client_initial_sent_crypto.contains_key(&packet_number) {
+            return;
+        }
+        let packet_size = self.client_initial.packet.len();
+        let crypto_data = self.client_initial.crypto_data.clone();
+        self.client_initial_loss_detector
+            .on_packet_sent_at(packet_number, sent_at);
+        self.client_initial_sent_crypto.insert(
+            packet_number,
+            SentCryptoPacket {
+                packet_type: LongHeaderType::Initial,
+                crypto_offset: 0,
+                crypto_data,
+            },
+        );
+        self.recovery.on_packet_sent(
+            PacketNumberSpace::Initial,
+            packet_number,
+            SentPacketInfo::new(sent_at, packet_size, true, true),
+        );
+    }
+
+    /// Retransmit Initial CRYPTO whose PTO has expired. RFC9002 § 6.2.4
+    /// triggers a probe by resending the unacknowledged CRYPTO bytes with a
+    /// fresh Initial packet number, preserving CRYPTO offsets so the peer
+    /// reassembler accepts the duplicate.
+    pub fn retransmit_pto_client_initial_crypto_packets(
+        &mut self,
+        now: Instant,
+        pto: Duration,
+    ) -> Result<Vec<ClientInitialPacket>> {
+        let expired_packets = self
+            .client_initial_loss_detector
+            .pto_expired_packets(now, pto);
+        let mut retransmits = Vec::new();
+        for packet_number in expired_packets {
+            self.client_initial_loss_detector
+                .retire_packet(packet_number);
+            let Some(sent) = self.client_initial_sent_crypto.remove(&packet_number) else {
+                continue;
+            };
+            if sent.packet_type != LongHeaderType::Initial {
+                continue;
+            }
+            retransmits.push(self.build_client_initial_crypto_pto_packet(sent.crypto_data, now)?);
+        }
+        Ok(retransmits)
+    }
+
+    fn build_client_initial_crypto_pto_packet(
+        &mut self,
+        crypto_data: Bytes,
+        sent_at: Instant,
+    ) -> Result<ClientInitialPacket> {
+        let packet_number = self.next_client_initial_packet_number;
+        let token = decode_long_header(&self.client_initial.header)?.token;
+        let packet = build_client_initial_packet_with_token_and_version(
+            &self.fingerprint,
+            crypto_data.clone(),
+            self.client_initial.transport_parameters.clone(),
+            self.client_initial.secrets.clone(),
+            self.destination_cid.clone(),
+            self.source_cid.clone(),
+            token,
+            packet_number,
+            self.client_initial_version,
+        )?;
+        let packet_size = packet.packet.len();
+        self.next_client_initial_packet_number = packet_number + 1;
+        self.client_initial_loss_detector
+            .on_packet_sent_at(packet_number, sent_at);
+        self.client_initial_sent_crypto.insert(
+            packet_number,
+            SentCryptoPacket {
+                packet_type: LongHeaderType::Initial,
+                crypto_offset: 0,
+                crypto_data,
+            },
+        );
+        self.recovery.on_packet_sent(
+            PacketNumberSpace::Initial,
+            packet_number,
+            SentPacketInfo::new(sent_at, packet_size, true, true),
+        );
+        Ok(packet)
+    }
+
+    /// Read-only access to the RFC9002 packet-space recovery state for tests
+    /// and the H3 driver loss-detection timer wakeup.
+    pub fn recovery(&self) -> &RecoveryState {
+        &self.recovery
+    }
+
+    /// Driver hook: when the loss detection timer fires, call this to either
+    /// declare time-threshold losses (RFC9002 § 6.1.2) or schedule a PTO probe
+    /// in the earliest in-flight space.
+    pub fn on_loss_detection_timeout(&mut self, now: Instant) -> LossDetectionOutcome {
+        self.recovery.on_loss_detection_timeout(now)
+    }
+
+    /// Convenience for the driver: where to schedule the next loss detection
+    /// timer wakeup, if any.
+    pub fn loss_detection_timer(&self) -> Option<Instant> {
+        self.recovery.loss_detection_timer()
+    }
+
+    /// Current PTO duration (`smoothed_rtt + max(4*rttvar, kGranularity)`)
+    /// applied to the Application space after handshake confirmation.
+    pub fn application_pto(&self) -> Duration {
+        self.recovery.current_pto()
+    }
+
+    /// Marks Handshake confirmation so Application PTO includes `max_ack_delay`
+    /// and the loss detection timer is rearmed. Idempotent.
+    pub fn mark_handshake_confirmed(&mut self) {
+        self.recovery.mark_handshake_complete();
+    }
+
+    /// Discards an entire packet-number space per RFC9002 § 6.4 (e.g. when
+    /// Handshake keys install or HANDSHAKE_DONE is received). Resets
+    /// `pto_count` and returns bytes_in_flight credit to the congestion
+    /// controller.
+    pub fn discard_packet_space(&mut self, space: PacketNumberSpace) {
+        self.recovery.discard_space(space);
     }
 
     fn build_client_handshake_crypto_packet_at_offset(
@@ -3311,6 +3447,7 @@ impl NativeQuicHandshake {
 
         let retry_keys = derive_initial_key_material(retry.source_cid.as_bytes())?;
         let packet_number = self.next_client_initial_packet_number;
+        let retry_token = retry.token.clone();
         let retry_initial = build_client_initial_packet_with_token_and_version(
             &self.fingerprint,
             self.client_initial.crypto_data.clone(),
@@ -3318,13 +3455,14 @@ impl NativeQuicHandshake {
             self.client_initial.secrets.clone(),
             retry.source_cid.clone(),
             self.source_cid.clone(),
-            retry.token,
+            retry_token.clone(),
             packet_number,
             self.client_initial_version,
         )?;
 
         self.destination_cid = retry.source_cid.clone();
         self.retry_source_cid = Some(retry.source_cid);
+        self.client_initial_token = retry_token;
         self.retry_received = true;
         self.client_initial_keys = retry_keys.client;
         self.server_initial_keys = retry_keys.server;
@@ -3362,6 +3500,7 @@ impl NativeQuicHandshake {
         self.vn_received = true;
         self.retry_received = false;
         self.retry_source_cid = None;
+        self.client_initial_token = Bytes::new();
         self.server_initial_or_handshake_seen = false;
         self.server_transport_parameters_validated = false;
         self.close_draining = false;
