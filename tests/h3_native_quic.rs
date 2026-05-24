@@ -354,7 +354,7 @@ fn native_quic_derive_next_application_secret_matches_rfc9001_regression_vector(
     assert_eq!(next.len(), 32);
     assert_eq!(
         hex::encode(&next),
-        "QUIC_KU_NEXT_SECRET_PLACEHOLDER",
+        "4428ffa195ad665b9ebf9456945b99e8ff848512cab93d0426436409047d666c",
         "RFC9001 § 6.1 HKDF-Expand-Label(secret=client_initial_secret(0x8394c8f03e515708), label='quic ku', length=32) regression vector"
     );
 }
