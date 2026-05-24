@@ -1,6 +1,7 @@
 //! Native QUIC packet primitives for Specter's HTTP/3 transport.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use boring::hash::hmac_sha256;
 use boring::symm::{decrypt_aead, encrypt_aead, Cipher, Crypter, Mode};
@@ -321,11 +322,19 @@ pub struct QuicAckTracker {
     received: BTreeSet<u64>,
     pending_ack: bool,
     pending_ack_count: usize,
+    first_pending_ack_at: Option<Instant>,
 }
 
 impl QuicAckTracker {
     pub fn observe(&mut self, packet_number: u64) {
+        self.observe_at(packet_number, Instant::now());
+    }
+
+    pub fn observe_at(&mut self, packet_number: u64, now: Instant) {
         if packet_number <= MAX_PACKET_NUMBER && self.received.insert(packet_number) {
+            if !self.pending_ack {
+                self.first_pending_ack_at = Some(now);
+            }
             self.pending_ack = true;
             self.pending_ack_count = self.pending_ack_count.saturating_add(1);
         }
@@ -339,9 +348,28 @@ impl QuicAckTracker {
         self.pending_ack && self.pending_ack_count >= threshold.max(1)
     }
 
+    pub fn should_ack_after_or_delay(
+        &self,
+        threshold: usize,
+        max_ack_delay: Duration,
+        now: Instant,
+    ) -> bool {
+        self.should_ack_after(threshold)
+            || self
+                .pending_ack_elapsed(now)
+                .is_some_and(|elapsed| elapsed >= max_ack_delay)
+    }
+
+    pub fn pending_ack_deadline(&self, max_ack_delay: Duration) -> Option<Instant> {
+        self.pending_ack
+            .then(|| self.first_pending_ack_at.map(|first| first + max_ack_delay))
+            .flatten()
+    }
+
     pub fn mark_ack_sent(&mut self) {
         self.pending_ack = false;
         self.pending_ack_count = 0;
+        self.first_pending_ack_at = None;
     }
 
     pub fn to_ack_frame(&self, ack_delay: u64) -> Result<QuicFrame> {
@@ -404,6 +432,12 @@ impl QuicAckTracker {
         }
 
         ranges
+    }
+
+    fn pending_ack_elapsed(&self, now: Instant) -> Option<Duration> {
+        self.pending_ack
+            .then(|| self.first_pending_ack_at.map(|first| now.saturating_duration_since(first)))
+            .flatten()
     }
 }
 
