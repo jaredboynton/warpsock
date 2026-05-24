@@ -849,8 +849,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 now_iso_compact()
             ))
         });
-    let specter_fingerprint = option_value(&args, "--specter-fingerprint")
-        .unwrap_or_else(|| "chrome146".to_string());
+    let specter_fingerprint =
+        option_value(&args, "--specter-fingerprint").unwrap_or_else(|| "chrome146".to_string());
 
     if sample_count < MIN_SAMPLES {
         eprintln!("--samples must be >= {MIN_SAMPLES}");
@@ -886,9 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     println!("specter_fingerprint={specter_fingerprint}");
-    let specter_client = specter::Client::builder()
-        .fingerprint(specter_fp)
-        .build()?;
+    let specter_client = specter::Client::builder().fingerprint(specter_fp).build()?;
 
     let mut rows: Vec<Row> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
