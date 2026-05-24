@@ -831,6 +831,31 @@ fn native_quic_loss_detector_applies_ack_frame_ranges() {
 }
 
 #[test]
+fn native_quic_loss_detector_samples_rtt_from_newly_acked_largest_packet() {
+    let mut detector = QuicLossDetector::default()
+        .with_peer_ack_delay_exponent(3)
+        .with_max_ack_delay(Duration::from_millis(25));
+    let sent_at = Instant::now() - Duration::from_millis(40);
+    detector.on_packet_sent_at(7, sent_at);
+
+    detector
+        .on_ack_frame(&QuicFrame::Ack {
+            largest_acknowledged: 7,
+            ack_delay: 3125,
+            first_ack_range: 0,
+            ranges: Vec::new(),
+        })
+        .unwrap();
+
+    assert_eq!(detector.lost_packets(), Vec::<u64>::new());
+    assert!(detector.latest_rtt().is_some());
+    assert!(detector.min_rtt().is_some());
+    assert!(detector.smoothed_rtt().is_some());
+    assert!(detector.rttvar() > Duration::ZERO);
+    assert!(detector.current_pto() < Duration::from_millis(333 * 3));
+}
+
+#[test]
 fn native_quic_loss_detector_applies_ack_ecn_frame_ranges() {
     let mut detector = QuicLossDetector::default();
     for packet_number in 1..=10 {
