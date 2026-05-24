@@ -53,10 +53,12 @@ else:
 checksum() {
     local checksums="$1"
     local asset="$2"
+    local expected="$checksums.$asset"
+    grep "  $asset$" "$checksums" > "$expected" || error "Missing checksum for $asset"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -c --ignore-missing "$checksums"
+        sha256sum -c "$expected"
     else
-        grep "  $asset$" "$checksums" | shasum -a 256 -c -
+        shasum -a 256 -c "$expected"
     fi
 }
 

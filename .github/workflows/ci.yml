@@ -96,7 +96,7 @@ jobs:
       - name: Install prebuilt BoringSSL
         run: |
           chmod +x scripts/install-boringssl-prebuilt.sh
-          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml ${{ matrix.target }}
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml "${{ matrix.target }}"
 
       - name: Build
         run: |
@@ -132,7 +132,7 @@ jobs:
       - name: Install prebuilt BoringSSL
         run: |
           chmod +x scripts/install-boringssl-prebuilt.sh
-          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml ${{ matrix.target }}
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml "${{ matrix.target }}"
 
       - name: Build
         run: cargo xwin build --release --target ${{ matrix.target }} --lib

@@ -100,6 +100,7 @@ struct Environment {
     os: &'static str,
     arch: &'static str,
     specter_version: &'static str,
+    specter_fingerprint: String,
     tokio_tungstenite_version: &'static str,
 }
 
@@ -848,6 +849,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 now_iso_compact()
             ))
         });
+    let specter_fingerprint = option_value(&args, "--specter-fingerprint")
+        .unwrap_or_else(|| "chrome146".to_string());
 
     if sample_count < MIN_SAMPLES {
         eprintln!("--samples must be >= {MIN_SAMPLES}");
@@ -870,8 +873,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Codex WS streaming bench: endpoint={ENDPOINT}, model={MODEL}, samples={sample_count}, warmup={warmup_count}"
     );
 
+    let specter_fp = match specter_fingerprint.as_str() {
+        "none" => specter::FingerprintProfile::None,
+        "chrome142" => specter::FingerprintProfile::Chrome142,
+        "chrome143" => specter::FingerprintProfile::Chrome143,
+        "chrome144" => specter::FingerprintProfile::Chrome144,
+        "chrome145" => specter::FingerprintProfile::Chrome145,
+        "chrome146" => specter::FingerprintProfile::Chrome146,
+        other => {
+            eprintln!("--specter-fingerprint must be one of: none, chrome142..146 (got {other})");
+            std::process::exit(1);
+        }
+    };
+    println!("specter_fingerprint={specter_fingerprint}");
     let specter_client = specter::Client::builder()
-        .fingerprint(specter::FingerprintProfile::Chrome146)
+        .fingerprint(specter_fp)
         .build()?;
 
     let mut rows: Vec<Row> = Vec::new();
@@ -1058,6 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             specter_version: env!("CARGO_PKG_VERSION"),
+            specter_fingerprint: specter_fingerprint.clone(),
             tokio_tungstenite_version: "0.24",
         },
         rows,
