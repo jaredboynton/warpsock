@@ -21,6 +21,7 @@ use specter::transport::h3::quic::{
     retry_integrity_tag_v1, split_long_header_datagram, ConnectionId, LongHeaderPacket,
     LongHeaderType, QuicFrame,
 };
+use specter::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use specter::transport::h3::tls::{QuicEncryptionLevel, QuicSecretDirection, QuicTlsSecret};
 use specter::{DnsConfig, H3Backend, H3Client};
 use std::time::{Duration, Instant};
@@ -1094,6 +1095,74 @@ fn native_h3_client_retransmits_lost_application_stream_packet() {
 
     assert_eq!(retransmits.len(), 1);
     assert_eq!(retransmits[0].packet_number, third_data.packet_number + 1);
+    assert_eq!(retransmits[0].stream_id, request.stream_id);
+    let events = server
+        .open_client_h3_stream_packet(retransmits[0].packet.as_ref())
+        .unwrap();
+    assert_eq!(events[0].stream_id, request.stream_id);
+    assert!(matches!(&events[0].frames[0], H3Frame::Headers(_)));
+}
+
+#[test]
+fn native_h3_client_application_ack_updates_packet_space_recovery() {
+    let (_, mut client, mut server) = completed_native_server_handshake();
+    let uri: http::Uri = "https://localhost/native".parse().unwrap();
+    let request = client
+        .build_client_h3_request_packet(&http::Method::GET, &uri, &[], None)
+        .unwrap();
+
+    assert!(client.recovery().handshake_complete());
+    assert!(client
+        .recovery()
+        .space(PacketNumberSpace::Application)
+        .sent_packets()
+        .contains_key(&request.packet_number));
+
+    server
+        .open_client_application_packet(request.packet.as_ref())
+        .unwrap();
+    let ack = server
+        .build_server_application_ack_packet()
+        .unwrap()
+        .expect("server should ACK observed client application packet");
+    client
+        .open_server_application_packet(ack.packet.as_ref())
+        .unwrap();
+
+    assert!(client
+        .recovery()
+        .space(PacketNumberSpace::Application)
+        .sent_packets()
+        .is_empty());
+}
+
+#[test]
+fn native_h3_client_retransmits_application_stream_packet_on_pto() {
+    let (_, mut client, mut server) = completed_native_server_handshake();
+    let uri: http::Uri = "https://localhost/native".parse().unwrap();
+    let request = client
+        .build_client_h3_request_packet(&http::Method::GET, &uri, &[], None)
+        .unwrap();
+    let timer = client
+        .loss_detection_timer()
+        .expect("application packet should arm loss detection timer");
+    let now = timer + Duration::from_millis(1);
+    let pto = client.application_pto();
+
+    let outcome = client.on_loss_detection_timeout(now);
+    assert_eq!(
+        outcome,
+        LossDetectionOutcome::Pto {
+            space: PacketNumberSpace::Application,
+        }
+    );
+
+    let retransmits = client
+        .retransmit_pto_client_application_stream_packets(now, pto)
+        .unwrap();
+
+    assert_eq!(retransmits.len(), 1);
+    assert_eq!(retransmits[0].packet_number, request.packet_number + 1);
     assert_eq!(retransmits[0].stream_id, request.stream_id);
     let events = server
         .open_client_h3_stream_packet(retransmits[0].packet.as_ref())

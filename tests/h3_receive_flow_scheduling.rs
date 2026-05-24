@@ -433,6 +433,45 @@ fn native_h3_driver_treats_pending_delayed_ack_as_pending_work() {
 }
 
 #[test]
+fn native_h3_driver_schedules_application_loss_detection_timer() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let drive_loop = driver
+        .split("async fn drive_loop")
+        .nth(1)
+        .expect("driver must have drive_loop")
+        .split("fn has_pending_work")
+        .next()
+        .expect("drive_loop section");
+    let has_pending_work = driver
+        .split("fn has_pending_work")
+        .nth(1)
+        .expect("driver must have has_pending_work")
+        .split("fn has_outbound_send_work")
+        .next()
+        .expect("has_pending_work section");
+
+    assert!(
+        drive_loop.contains("client_loss_detection_deadline"),
+        "native H3 driver must derive a post-handshake QUIC loss-detection deadline"
+    );
+    assert!(
+        drive_loop.contains("handle_loss_detection_timeout().await?"),
+        "native H3 driver must wake on the QUIC loss-detection timer"
+    );
+    assert!(
+        has_pending_work.contains("client_loss_detection_deadline().is_some()"),
+        "native H3 idle handling must not close while application PTO/recovery work is pending"
+    );
+    assert!(
+        driver.contains("LossDetectionOutcome::Pto {")
+            && driver.contains("PacketNumberSpace::Application")
+            && driver.contains("retransmit_pto_client_application_stream_packets"),
+        "native H3 driver must retransmit application STREAM data on application-space PTO"
+    );
+}
+
+#[test]
 fn native_mock_h3_server_schedules_timer_driven_delayed_application_acks() {
     let mock_server = std::fs::read_to_string("tests/helpers/mock_h3_server.rs")
         .expect("native mock H3 server source");
