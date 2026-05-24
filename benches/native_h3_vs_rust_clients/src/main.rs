@@ -810,7 +810,16 @@ struct LocalNativeH3Connection {
 impl LocalNativeH3Connection {
     async fn run(mut self) {
         loop {
+            let server_application_ack_deadline = self.server_application_ack_deadline();
+            let server_application_ack_delay = server_application_ack_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::ZERO);
             tokio::select! {
+                _ = tokio::time::sleep(server_application_ack_delay), if server_application_ack_deadline.is_some() => {
+                    if let Err(error) = self.send_delayed_application_ack().await {
+                        eprintln!("local native H3 fixture delayed ACK error: {error}");
+                    }
+                }
                 packet = self.rx.recv() => {
                     let Some(packet) = packet else { break };
                     if let Err(error) = self.process_datagram(&packet).await {
@@ -862,7 +871,14 @@ impl LocalNativeH3Connection {
         }
 
         let events = self.handshake.open_client_h3_event_packet(packet)?;
-        if let Some(packet) = self.handshake.build_server_application_ack_packet()? {
+        if let Some(packet) = self
+            .handshake
+            .build_server_application_ack_packet_after_or_delay(
+                self.fingerprint.transport.ack_eliciting_threshold,
+                Duration::from_millis(self.fingerprint.transport.max_ack_delay_ms),
+                Instant::now(),
+            )?
+        {
             self.send_packet(packet.packet).await?;
         }
         for packet in self
@@ -879,6 +895,20 @@ impl LocalNativeH3Connection {
         }
         for event in events {
             self.apply_client_event(event).await?;
+        }
+        Ok(())
+    }
+
+    fn server_application_ack_deadline(&self) -> Option<Instant> {
+        self.handshake
+            .server_application_ack_deadline(Duration::from_millis(
+                self.fingerprint.transport.max_ack_delay_ms,
+            ))
+    }
+
+    async fn send_delayed_application_ack(&mut self) -> anyhow::Result<()> {
+        if let Some(packet) = self.handshake.build_server_application_ack_packet()? {
+            self.send_packet(packet.packet).await?;
         }
         Ok(())
     }
