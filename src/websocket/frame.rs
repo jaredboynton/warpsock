@@ -28,8 +28,7 @@ impl MaskRng {
     #[inline]
     pub(crate) fn next_mask(&mut self) -> [u8; 4] {
         if self.pos + 4 > self.cache.len() {
-            getrandom::fill(&mut self.cache)
-                .expect("getrandom refill for WebSocket mask rng");
+            getrandom::fill(&mut self.cache).expect("getrandom refill for WebSocket mask rng");
             self.pos = 0;
         }
         let mask = [

@@ -31,7 +31,8 @@ const MIN_SAMPLES: usize = 5;
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-const SEC_CH_UA: &str = "\"Chromium\";v=\"146\", \"Not.A/Brand\";v=\"99\", \"Google Chrome\";v=\"146\"";
+const SEC_CH_UA: &str =
+    "\"Chromium\";v=\"146\", \"Not.A/Brand\";v=\"99\", \"Google Chrome\";v=\"146\"";
 
 fn primary_claim_threshold(sample_count: usize) -> usize {
     let scaled = (sample_count * 4).div_ceil(5);
@@ -523,7 +524,9 @@ async fn run_specter_sample(
                         break;
                     }
                 }
-                Ok(Some(Message::Binary(_))) | Ok(Some(Message::Ping(_))) | Ok(Some(Message::Pong(_))) => {
+                Ok(Some(Message::Binary(_)))
+                | Ok(Some(Message::Ping(_)))
+                | Ok(Some(Message::Pong(_))) => {
                     obs.frame_count += 1;
                 }
                 Ok(Some(Message::Close(_))) => break,
@@ -701,7 +704,12 @@ fn finalize_sample(
             } else if obs.delta_count > 0 {
                 ("error", Some("no response.completed received".into()))
             } else {
-                ("error", obs.error_msg.clone().or_else(|| Some("no deltas received".into())))
+                (
+                    "error",
+                    obs.error_msg
+                        .clone()
+                        .or_else(|| Some("no deltas received".into())),
+                )
             }
         }
     };
@@ -755,7 +763,12 @@ fn row_from_sample(
     }
 }
 
-fn paired_diffs(rows: &[Row], client_a: &str, client_b: &str, field: impl Fn(&Row) -> f64) -> Vec<f64> {
+fn paired_diffs(
+    rows: &[Row],
+    client_a: &str,
+    client_b: &str,
+    field: impl Fn(&Row) -> f64,
+) -> Vec<f64> {
     let mut by_pair_a: std::collections::BTreeMap<usize, f64> = Default::default();
     let mut by_pair_b: std::collections::BTreeMap<usize, f64> = Default::default();
     for r in rows.iter().filter(|r| !r.warmup && r.status == "ok") {
@@ -771,7 +784,12 @@ fn paired_diffs(rows: &[Row], client_a: &str, client_b: &str, field: impl Fn(&Ro
         .collect()
 }
 
-fn paired_values(rows: &[Row], client: &str, pair_count: usize, field: impl Fn(&Row) -> f64) -> Vec<f64> {
+fn paired_values(
+    rows: &[Row],
+    client: &str,
+    pair_count: usize,
+    field: impl Fn(&Row) -> f64,
+) -> Vec<f64> {
     (0..pair_count)
         .filter_map(|p| {
             rows.iter()
@@ -822,12 +840,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warmup_count = option_value(&args, "--warmup")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_WARMUP);
-    let json_path = option_value(&args, "--json").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "docs/benchmarks/codex-ws-streaming/{}.json",
-            now_iso_compact()
-        ))
-    });
+    let json_path = option_value(&args, "--json")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "docs/benchmarks/codex-ws-streaming/{}.json",
+                now_iso_compact()
+            ))
+        });
 
     if sample_count < MIN_SAMPLES {
         eprintln!("--samples must be >= {MIN_SAMPLES}");
@@ -895,9 +915,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             run_tungstenite_sample(&token, account_id.as_deref()).await?
         };
-        rows.push(row_from_sample(
-            sample1, order.0, false, p * 2, p, true,
-        ));
+        rows.push(row_from_sample(sample1, order.0, false, p * 2, p, true));
         tokio::time::sleep(INTER_REQUEST_DELAY).await;
 
         let sample2 = if order.1 == "specter" {
@@ -906,7 +924,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_tungstenite_sample(&token, account_id.as_deref()).await?
         };
         rows.push(row_from_sample(
-            sample2, order.1, false, p * 2 + 1, p, false,
+            sample2,
+            order.1,
+            false,
+            p * 2 + 1,
+            p,
+            false,
         ));
         if p < pair_count - 1 {
             tokio::time::sleep(INTER_REQUEST_DELAY).await;
@@ -1053,7 +1076,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pair_count * 2,
         passed_pairs
     );
-    println!("interpretation: {}", artifact.summary.comparison.interpretation);
+    println!(
+        "interpretation: {}",
+        artifact.summary.comparison.interpretation
+    );
 
     Ok(())
 }

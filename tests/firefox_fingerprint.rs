@@ -68,7 +68,10 @@ fn test_all_firefox_profiles_use_shared_firefox_transport_invariants() {
         let tls = profile.tls_fingerprint();
         assert_eq!(tls, TlsFingerprint::firefox(), "{profile:?} TLS");
         assert!(!tls.grease, "{profile:?} should not use GREASE");
-        assert_eq!(tls.cert_compression, specter::fingerprint::tls::CertCompression::None);
+        assert_eq!(
+            tls.cert_compression,
+            specter::fingerprint::tls::CertCompression::None
+        );
         assert!(!tls.enable_kyber, "{profile:?} should not enable Kyber");
 
         let h2 = profile.http2_settings();

@@ -8,7 +8,9 @@ use url::Url;
 
 use crate::transport::connector::MaybeHttpsStream;
 use crate::websocket::error::{WebSocketError, WebSocketResult};
-use crate::websocket::frame::{decode_frame, encode_frame, FrameConfig, FrameDecoder, MaskRng, OpCode};
+use crate::websocket::frame::{
+    decode_frame, encode_frame, FrameConfig, FrameDecoder, MaskRng, OpCode,
+};
 use crate::websocket::message::{CloseFrame, Message};
 use crate::websocket::WebSocketConfig;
 

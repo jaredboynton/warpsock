@@ -29,7 +29,8 @@ const MIN_SAMPLES: usize = 5;
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-const SEC_CH_UA: &str = "\"Chromium\";v=\"146\", \"Not.A/Brand\";v=\"99\", \"Google Chrome\";v=\"146\"";
+const SEC_CH_UA: &str =
+    "\"Chromium\";v=\"146\", \"Not.A/Brand\";v=\"99\", \"Google Chrome\";v=\"146\"";
 
 #[derive(Serialize, Clone)]
 struct Row {
@@ -342,7 +343,9 @@ fn now_iso_compact() -> String {
 /// `errored=true` is signalled per parsed event. `[DONE]` returns
 /// `(None, true, false)` to terminate the loop.
 fn parse_sse_data(line: &str) -> Option<SseEvent> {
-    let data = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))?;
+    let data = line
+        .strip_prefix("data: ")
+        .or_else(|| line.strip_prefix("data:"))?;
     let data = data.trim();
     if data == "[DONE]" {
         return Some(SseEvent::Done);
@@ -551,7 +554,10 @@ async fn run_specter_sample(
             }
         })
         .await;
-        let snippet = String::from_utf8_lossy(&body_buf).chars().take(256).collect::<String>();
+        let snippet = String::from_utf8_lossy(&body_buf)
+            .chars()
+            .take(256)
+            .collect::<String>();
         return Ok(SampleResult {
             status: "http_error",
             status_code,
@@ -772,7 +778,12 @@ fn finalize_sample(
         // got deltas but no completed event — treat as error
         ("error", Some("no response.completed received".into()))
     } else {
-        ("error", obs.error_msg.clone().or_else(|| Some("no deltas received".into())))
+        (
+            "error",
+            obs.error_msg
+                .clone()
+                .or_else(|| Some("no deltas received".into())),
+        )
     };
 
     Ok(SampleResult {
@@ -838,12 +849,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warmup_count = option_value(&args, "--warmup")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_WARMUP);
-    let json_path = option_value(&args, "--json").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "docs/benchmarks/codex-real-streaming/{}.json",
-            now_iso_compact()
-        ))
-    });
+    let json_path = option_value(&args, "--json")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "docs/benchmarks/codex-real-streaming/{}.json",
+                now_iso_compact()
+            ))
+        });
 
     if sample_count < MIN_SAMPLES {
         eprintln!(
@@ -852,9 +865,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     if !sample_count.is_multiple_of(2) {
-        eprintln!(
-            "--samples must be even (paired interleaving); got {sample_count}"
-        );
+        eprintln!("--samples must be even (paired interleaving); got {sample_count}");
         std::process::exit(1);
     }
 
@@ -919,7 +930,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_reqwest_sample(&reqwest_client, &token, account_id.as_deref()).await?
         };
         rows.push(row_from_sample(
-            sample1, order.0, false, p * 2, pair_index, true,
+            sample1,
+            order.0,
+            false,
+            p * 2,
+            pair_index,
+            true,
         ));
         tokio::time::sleep(INTER_REQUEST_DELAY).await;
 
@@ -929,7 +945,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_reqwest_sample(&reqwest_client, &token, account_id.as_deref()).await?
         };
         rows.push(row_from_sample(
-            sample2, order.1, false, p * 2 + 1, pair_index, false,
+            sample2,
+            order.1,
+            false,
+            p * 2 + 1,
+            pair_index,
+            false,
         ));
         if p < pair_count - 1 {
             tokio::time::sleep(INTER_REQUEST_DELAY).await;
@@ -972,9 +993,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if s_ok && r_ok {
             passed_pairs += 1;
         } else {
-            failures.push(format!(
-                "pair {p}: specter_ok={s_ok} reqwest_ok={r_ok}"
-            ));
+            failures.push(format!("pair {p}: specter_ok={s_ok} reqwest_ok={r_ok}"));
         }
     }
 
@@ -1058,10 +1077,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ttft_ci[1]
         )
     } else {
-        format!(
-            "Mixed: TTFT CI={:.1?}, wall CI={:.1?}",
-            ttft_ci, wall_ci
-        )
+        format!("Mixed: TTFT CI={:.1?}, wall CI={:.1?}", ttft_ci, wall_ci)
     };
 
     let summary = Summary {
@@ -1126,7 +1142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         passed_pairs,
         pair_count
     );
-    println!("interpretation: {}", artifact.summary.comparison.interpretation);
+    println!(
+        "interpretation: {}",
+        artifact.summary.comparison.interpretation
+    );
 
     if protocol_mismatch {
         eprintln!(

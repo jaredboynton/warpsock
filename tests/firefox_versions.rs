@@ -285,7 +285,10 @@ fn test_firefox_esr_profile_coverage() {
         .map(|(profile, _)| *profile)
         .collect();
     assert_eq!(unique.len(), FIREFOX_ESR_PROFILES.len());
-    assert_ne!(FingerprintProfile::Firefox140, FingerprintProfile::FirefoxEsr140);
+    assert_ne!(
+        FingerprintProfile::Firefox140,
+        FingerprintProfile::FirefoxEsr140
+    );
 }
 
 #[test]
@@ -318,7 +321,10 @@ fn test_firefox_transport_fingerprints_equal_canonical_firefox() {
             "{:?} H3",
             case.profile
         );
-        assert_eq!(case.profile.http2_pseudo_order(), PseudoHeaderOrder::Firefox);
+        assert_eq!(
+            case.profile.http2_pseudo_order(),
+            PseudoHeaderOrder::Firefox
+        );
     }
 }
 
@@ -341,8 +347,14 @@ fn test_firefox_transport_invariants_explain_failures() {
     let h3 = Http3Fingerprint::firefox();
     assert_eq!(h3.alpn_protocols, vec![b"h3".to_vec()]);
     assert!(!h3.transport.grease);
-    assert_eq!(h3.transport.initial_max_stream_data_bidi_local, 4 * 1024 * 1024);
-    assert_eq!(h3.transport.initial_max_stream_data_bidi_remote, 4 * 1024 * 1024);
+    assert_eq!(
+        h3.transport.initial_max_stream_data_bidi_local,
+        4 * 1024 * 1024
+    );
+    assert_eq!(
+        h3.transport.initial_max_stream_data_bidi_remote,
+        4 * 1024 * 1024
+    );
     assert_eq!(h3.transport.initial_max_stream_data_uni, 4 * 1024 * 1024);
     assert!(!h3.stream.send_grease_stream);
     assert!(!h3.stream.send_grease_frames);
@@ -351,7 +363,12 @@ fn test_firefox_transport_invariants_explain_failures() {
 #[test]
 fn test_firefox_header_helpers_match_exact_ordered_sequences() {
     for case in FIREFOX_CASES {
-        assert_eq!((case.nav)(), expected_nav(case.ua), "{:?} nav", case.profile);
+        assert_eq!(
+            (case.nav)(),
+            expected_nav(case.ua),
+            "{:?} nav",
+            case.profile
+        );
         assert_eq!(
             (case.ajax)(),
             expected_ajax(case.ua),
@@ -372,7 +389,9 @@ fn test_firefox_header_helpers_have_no_client_hints() {
     for case in FIREFOX_CASES {
         for headers in [(case.nav)(), (case.ajax)(), (case.form)()] {
             assert!(
-                !headers.iter().any(|(name, _)| name.starts_with("Sec-Ch-Ua")),
+                !headers
+                    .iter()
+                    .any(|(name, _)| name.starts_with("Sec-Ch-Ua")),
                 "{:?}",
                 case.profile
             );
