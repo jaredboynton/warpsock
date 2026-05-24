@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use bytes::Bytes;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

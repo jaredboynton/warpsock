@@ -4,13 +4,17 @@
 //! TLS/HTTP2/HTTP3 fingerprint control.
 
 use bytes::Bytes;
-use pyo3::exceptions::PyRuntimeError;
+use futures_core::Stream;
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use pyo3_async_runtimes::tokio::future_into_py;
-use std::sync::Arc;
+use pyo3_async_runtimes::tokio::{future_into_py, into_future};
+use std::pin::Pin;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 mod websocket;
 mod websocket_h2;
@@ -19,9 +23,9 @@ mod ws_types;
 
 // Re-export specter types - use ::specter to disambiguate from pymodule name
 use ::specter::{
-    Client as RustClient, ClientBuilder as RustClientBuilder, CookieJar as RustCookieJar,
-    Error as RustError, FingerprintProfile as RustFingerprintProfile, Response as RustResponse,
-    Timeouts as RustTimeouts,
+    Body as RustBody, Client as RustClient, ClientBuilder as RustClientBuilder,
+    CookieJar as RustCookieJar, Error as RustError, FingerprintProfile as RustFingerprintProfile,
+    HttpVersion as RustHttpVersion, Response as RustResponse, Timeouts as RustTimeouts,
 };
 
 /// Python wrapper for Specter HTTP client.
@@ -44,13 +48,52 @@ pub struct RequestBuilder {
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    body: Option<Vec<u8>>,
+    body: Option<RequestBodyKind>,
+    version: Option<RustHttpVersion>,
 }
 
 /// Python wrapper for HTTP Response.
 #[pyclass]
 pub struct Response {
-    inner: RustResponse,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Arc<StdMutex<RustBody>>,
+    raw_body: Option<Bytes>,
+    text_body: Option<StdResult<String, String>>,
+    http_version: String,
+    effective_url: Option<String>,
+}
+
+enum RequestBodyKind {
+    Buffered(Vec<u8>),
+    Stream(Py<PyAny>),
+}
+
+struct PythonBodyStream {
+    rx: mpsc::Receiver<StdResult<Bytes, RustError>>,
+}
+
+impl Stream for PythonBodyStream {
+    type Item = StdResult<Bytes, RustError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+#[pyclass]
+pub struct ResponseBody {
+    body: Arc<StdMutex<RustBody>>,
+}
+
+fn to_rust_http_version(version: HttpVersion) -> RustHttpVersion {
+    match version {
+        HttpVersion::Http1_1 => RustHttpVersion::Http1_1,
+        HttpVersion::Http2 => RustHttpVersion::Http2,
+        HttpVersion::Http3 => RustHttpVersion::Http3,
+        HttpVersion::Http3Only => RustHttpVersion::Http3Only,
+        HttpVersion::Auto => RustHttpVersion::Auto,
+    }
 }
 
 /// Python wrapper for CookieJar.
@@ -155,6 +198,7 @@ impl Client {
             method: "GET".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -166,6 +210,7 @@ impl Client {
             method: "POST".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -177,6 +222,7 @@ impl Client {
             method: "PUT".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -188,6 +234,7 @@ impl Client {
             method: "DELETE".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -199,6 +246,7 @@ impl Client {
             method: "PATCH".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -210,6 +258,7 @@ impl Client {
             method: "HEAD".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -221,6 +270,7 @@ impl Client {
             method: "OPTIONS".to_string(),
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -232,6 +282,7 @@ impl Client {
             method,
             headers: Vec::new(),
             body: None,
+            version: None,
         }
     }
 
@@ -255,15 +306,21 @@ impl RequestBuilder {
         Ok(())
     }
 
+    /// Set the preferred HTTP version for this request.
+    fn version(&mut self, version: HttpVersion) -> PyResult<()> {
+        self.version = Some(to_rust_http_version(version));
+        Ok(())
+    }
+
     /// Set the request body as bytes.
     fn body(&mut self, body: &[u8]) -> PyResult<()> {
-        self.body = Some(body.to_vec());
+        self.body = Some(RequestBodyKind::Buffered(body.to_vec()));
         Ok(())
     }
 
     /// Set the request body as a JSON string.
     fn json(&mut self, json_str: &str) -> PyResult<()> {
-        self.body = Some(json_str.as_bytes().to_vec());
+        self.body = Some(RequestBodyKind::Buffered(json_str.as_bytes().to_vec()));
         // Set Content-Type to application/json if not already set
         if !self
             .headers
@@ -278,7 +335,7 @@ impl RequestBuilder {
 
     /// Set the request body as form data.
     fn form(&mut self, form_str: &str) -> PyResult<()> {
-        self.body = Some(form_str.as_bytes().to_vec());
+        self.body = Some(RequestBodyKind::Buffered(form_str.as_bytes().to_vec()));
         // Set Content-Type to application/x-www-form-urlencoded if not already set
         if !self
             .headers
@@ -293,48 +350,112 @@ impl RequestBuilder {
         Ok(())
     }
 
+    /// Set the request body from a Python async iterable of bytes-like chunks.
+    fn body_stream(&mut self, async_iterable: Py<PyAny>) -> PyResult<()> {
+        self.body = Some(RequestBodyKind::Stream(async_iterable));
+        Ok(())
+    }
+
     /// Send the request and return the response.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.inner.clone();
         let url = self.url.clone();
         let method = self.method.clone();
         let headers = self.headers.clone();
-        let body = self.body.clone();
+        let version = self.version;
+        let body = self.body.take();
 
         future_into_py(py, async move {
-            // Build the request using the appropriate method
-            let mut req_builder = match method.as_str() {
-                "GET" => client.get(url.as_str()),
-                "POST" => client.post(url.as_str()),
-                "PUT" => client.put(url.as_str()),
-                "DELETE" => client.delete(url.as_str()),
-                "PATCH" => client.request(::http::Method::PATCH, url.as_str()),
-                "HEAD" => client.request(::http::Method::HEAD, url.as_str()),
-                "OPTIONS" => client.request(::http::Method::OPTIONS, url.as_str()),
-                _ => client.request(
-                    ::http::Method::from_bytes(method.as_bytes()).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                            "Invalid method: {}",
-                            e
-                        ))
-                    })?,
-                    url.as_str(),
-                ),
+            let (body, stream_pump) = match body {
+                Some(RequestBodyKind::Buffered(bytes)) => {
+                    (Some(RequestBodyKind::Buffered(bytes)), None)
+                }
+                Some(RequestBodyKind::Stream(async_iterable)) => {
+                    let (tx, rx) = mpsc::channel(8);
+                    (
+                        Some(RequestBodyKind::Buffered(Vec::new())),
+                        Some((async_iterable, tx, rx)),
+                    )
+                }
+                None => (None, None),
             };
+            let streaming = stream_pump.is_some();
+            let (stream_iterable, stream_tx, stream_rx) = match stream_pump {
+                Some((iterable, tx, rx)) => (Some(iterable), Some(tx), Some(rx)),
+                None => (None, None, None),
+            };
+            let (tx, rx) = oneshot::channel();
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+                    .and_then(|runtime| {
+                        runtime.block_on(async move {
+                            let mut req_builder = match method.as_str() {
+                                "GET" => client.get(url.as_str()),
+                                "POST" => client.post(url.as_str()),
+                                "PUT" => client.put(url.as_str()),
+                                "DELETE" => client.delete(url.as_str()),
+                                "PATCH" => client.request(::http::Method::PATCH, url.as_str()),
+                                "HEAD" => client.request(::http::Method::HEAD, url.as_str()),
+                                "OPTIONS" => client.request(::http::Method::OPTIONS, url.as_str()),
+                                _ => client.request(
+                                    ::http::Method::from_bytes(method.as_bytes()).map_err(|e| {
+                                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                                            "Invalid method: {}",
+                                            e
+                                        ))
+                                    })?,
+                                    url.as_str(),
+                                ),
+                            };
 
-            // Add headers
-            for (key, value) in headers {
-                req_builder = req_builder.header(key, value);
+                            if let Some(version) = version {
+                                req_builder = req_builder.version(version);
+                            }
+
+                            for (key, value) in headers {
+                                req_builder = req_builder.header(key, value);
+                            }
+
+                            if let Some(stream_rx) = stream_rx {
+                                req_builder =
+                                    req_builder.body_stream(PythonBodyStream { rx: stream_rx });
+                            } else if let Some(body_data) = body {
+                                match body_data {
+                                    RequestBodyKind::Buffered(bytes) => {
+                                        req_builder = req_builder.body(bytes);
+                                    }
+                                    RequestBodyKind::Stream(_) => unreachable!(),
+                                }
+                            }
+
+                            let resp = if streaming {
+                                req_builder.send_streaming().await
+                            } else {
+                                req_builder.send().await
+                            }
+                            .map_err(to_py_err)?;
+                            Ok(Response::from_rust(resp))
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+
+            if let (Some(iterable), Some(tx)) = (stream_iterable, stream_tx) {
+                if let Err(err) = pump_python_async_iterable(iterable, tx.clone()).await {
+                    let _ = tx
+                        .send(Err(RustError::HttpProtocol(format!(
+                            "Python request body stream failed: {err}"
+                        ))))
+                        .await;
+                }
             }
 
-            // Add body if present
-            if let Some(body_data) = body {
-                req_builder = req_builder.body(body_data);
-            }
-
-            // Send the request
-            let resp = req_builder.send().await.map_err(to_py_err)?;
-            Ok(Response { inner: resp })
+            rx.await.map_err(|_| {
+                PyRuntimeError::new_err("request worker thread exited before completion")
+            })?
         })
     }
 
@@ -484,19 +605,88 @@ impl ClientBuilder {
     }
 }
 
+async fn pump_python_async_iterable(
+    async_iterable: Py<PyAny>,
+    tx: mpsc::Sender<StdResult<Bytes, RustError>>,
+) -> PyResult<()> {
+    let iterator = Python::with_gil(|py| {
+        async_iterable
+            .bind(py)
+            .call_method0("__aiter__")
+            .map(|obj| obj.unbind())
+    })?;
+
+    loop {
+        let awaitable = Python::with_gil(|py| {
+            iterator
+                .bind(py)
+                .call_method0("__anext__")
+                .map(|obj| obj.unbind())
+        })?;
+
+        let next = match Python::with_gil(|py| into_future(awaitable.bind(py).clone()))?.await {
+            Ok(value) => value,
+            Err(err) => {
+                if Python::with_gil(|py| err.is_instance_of::<PyStopAsyncIteration>(py)) {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
+
+        let chunk = Python::with_gil(|py| {
+            next.bind(py)
+                .extract::<Vec<u8>>()
+                .map_err(|_| PyValueError::new_err("body_stream chunks must be bytes-like"))
+        })?;
+
+        if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+impl Response {
+    fn from_rust(resp: RustResponse) -> Self {
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let raw_body = resp.buffered_bytes().cloned();
+        let text_body = raw_body
+            .as_ref()
+            .map(|_| resp.text().map_err(|err| err.to_string()));
+        let http_version = resp.http_version().to_string();
+        let effective_url = resp.url().map(|url| url.to_string());
+        let body = resp.into_body();
+
+        Self {
+            status,
+            headers,
+            body: Arc::new(StdMutex::new(body)),
+            raw_body,
+            text_body,
+            http_version,
+            effective_url,
+        }
+    }
+}
+
 #[pymethods]
 impl Response {
     /// Get the HTTP status code.
     #[getter]
     fn status(&self) -> u16 {
-        self.inner.status().as_u16()
+        self.status
     }
 
     /// Get the response headers as a dictionary.
     #[getter]
     fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
-        for (key, value) in self.inner.headers().iter() {
+        for (key, value) in self.headers.iter() {
             // Handle multiple values for the same header
             if let Some(existing) = dict.get_item(key)? {
                 let existing_str: String = existing.extract()?;
@@ -511,7 +701,7 @@ impl Response {
     /// Get all headers as a list of tuples.
     fn headers_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for (key, value) in self.inner.headers().iter() {
+        for (key, value) in self.headers.iter() {
             let tuple = (key, value);
             list.append(tuple)?;
         }
@@ -520,17 +710,30 @@ impl Response {
 
     /// Get a specific header value by name.
     fn get_header(&self, name: &str) -> Option<String> {
-        self.inner.get_header(name).map(|s| s.to_string())
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
     }
 
     /// Get the response body as text (with decompression if needed).
     fn text(&self) -> PyResult<String> {
-        self.inner.text().map_err(to_py_err)
+        match &self.text_body {
+            Some(Ok(text)) => Ok(text.clone()),
+            Some(Err(err)) => Err(PyRuntimeError::new_err(err.clone())),
+            None => Err(PyRuntimeError::new_err(
+                "response body is streaming; consume response.body with async for",
+            )),
+        }
     }
 
     /// Get the response body as bytes.
     fn bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let bytes = self.inner.body().clone();
+        let bytes = self.raw_body.clone().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "response body is streaming; consume response.body with async for",
+            )
+        })?;
         future_into_py(py, async move {
             Python::with_gil(|py| {
                 let obj = PyBytesWrapper(bytes).into_pyobject(py)?;
@@ -541,7 +744,7 @@ impl Response {
 
     /// Parse the response body as JSON.
     fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let text = self.inner.text().map_err(to_py_err)?;
+        let text = self.text()?;
         future_into_py(py, async move {
             Python::with_gil(|py| {
                 // Use Python's json module to parse
@@ -552,45 +755,99 @@ impl Response {
         })
     }
 
+    /// Get the response body as an async iterator.
+    #[getter]
+    fn body(&self) -> ResponseBody {
+        ResponseBody {
+            body: self.body.clone(),
+        }
+    }
+
     /// Get the HTTP version string.
     #[getter]
     fn http_version(&self) -> String {
-        self.inner.http_version().to_string()
+        self.http_version.clone()
     }
 
     /// Get the effective URL (after redirects).
     #[getter]
     fn effective_url(&self) -> Option<String> {
-        self.inner.url().map(|url| url.to_string())
+        self.effective_url.clone()
     }
 
     /// Check if the response status is successful (2xx).
     #[getter]
     fn is_success(&self) -> bool {
-        self.inner.is_success()
+        (200..300).contains(&self.status)
     }
 
     /// Check if the response is a redirect (3xx).
     #[getter]
     fn is_redirect(&self) -> bool {
-        self.inner.is_redirect()
+        (300..400).contains(&self.status)
     }
 
     /// Get the redirect URL from Location header if present.
     #[getter]
     fn redirect_url(&self) -> Option<String> {
-        self.inner.redirect_url().map(|s| s.to_string())
+        self.get_header("Location")
     }
 
     /// Get the Content-Type header value.
     #[getter]
     fn content_type(&self) -> Option<String> {
-        self.inner.content_type().map(|s| s.to_string())
+        self.get_header("Content-Type")
     }
 
     /// Get the string representation.
     fn __repr__(&self) -> String {
-        format!("<specter.Response status={}>", self.inner.status().as_u16())
+        format!("<specter.Response status={}>", self.status)
+    }
+}
+
+#[pymethods]
+impl ResponseBody {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let body = self.body.clone();
+        future_into_py(py, async move {
+            let (tx, rx) = oneshot::channel();
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+                    .and_then(|runtime| {
+                        runtime.block_on(async move {
+                            let mut body = body.lock().map_err(|_| {
+                                PyRuntimeError::new_err("response body lock poisoned")
+                            })?;
+                            while let Some(frame) = body.frame().await {
+                                let frame = frame.map_err(to_py_err)?;
+                                if let Ok(data) = frame.into_data() {
+                                    return Ok(Some(data));
+                                }
+                            }
+                            Ok(None)
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+
+            match rx
+                .await
+                .map_err(|_| PyRuntimeError::new_err("response body worker thread exited"))??
+            {
+                Some(data) => Python::with_gil(|py| {
+                    Ok(PyBytesWrapper(data).into_pyobject(py)?.into_any().unbind())
+                }),
+                None => Err(PyStopAsyncIteration::new_err(())),
+            }
+        })
     }
 }
 
@@ -781,6 +1038,7 @@ pub fn specter(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ClientBuilder>()?;
     m.add_class::<RequestBuilder>()?;
     m.add_class::<Response>()?;
+    m.add_class::<ResponseBody>()?;
     m.add_class::<CookieJar>()?;
     m.add_class::<FingerprintProfile>()?;
     m.add_class::<HttpVersion>()?;

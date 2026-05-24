@@ -55,7 +55,9 @@ export interface H3TunnelEvent {
 export class RequestBuilder {
   header(key: string, value: string): this;
   headers(headers: string[][]): this;
+  version(version: HttpVersion): this;
   body(body: Buffer): this;
+  bodyStream(body: AsyncIterable<Buffer | Uint8Array>): this;
   json(jsonStr: string): this;
   form(formStr: string): this;
   send(): Promise<Response>;
@@ -64,6 +66,7 @@ export class RequestBuilder {
 export class Response {
   get status(): number;
   get headers(): Record<string, string>;
+  get body(): AsyncIterable<Buffer>;
   headersList(): string[][];
   getHeader(name: string): string | null;
   text(): string;

@@ -196,7 +196,8 @@ impl WebSocketH3Tunnel {
 impl WebSocketH3Tunnel {
     #[napi]
     pub async fn send_bytes(&self, data: Buffer, fin: Option<bool>) -> Result<()> {
-        let command = SendCommand::Bytes(Bytes::copy_from_slice(data.as_ref()), fin.unwrap_or(false));
+        let command =
+            SendCommand::Bytes(Bytes::copy_from_slice(data.as_ref()), fin.unwrap_or(false));
         self.send_command(command).await
     }
 
@@ -206,6 +207,7 @@ impl WebSocketH3Tunnel {
     }
 
     #[napi]
+    #[allow(clippy::never_loop)]
     pub async fn recv_bytes(&self) -> Result<Option<Buffer>> {
         loop {
             let Some(event) = self.next_event().await? else {

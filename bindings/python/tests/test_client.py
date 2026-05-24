@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl
 
@@ -40,8 +41,37 @@ class LocalHttpHandler(BaseHTTPRequestHandler):
         return
 
     def _send_json(self, head_only=False):
-        length = int(self.headers.get("content-length", "0"))
-        raw_body = self.rfile.read(length).decode() if length else ""
+        if self.path == "/stream":
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            for chunk in (b"alpha-", b"beta-", b"gamma"):
+                self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.005)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            body_chunks = []
+            while True:
+                size_line = self.rfile.readline().strip()
+                if not size_line:
+                    continue
+                size = int(size_line.split(b";", 1)[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                body_chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            raw_body = b"".join(body_chunks).decode()
+        else:
+            length = int(self.headers.get("content-length", "0"))
+            raw_body = self.rfile.read(length).decode() if length else ""
         content_type = self.headers.get("content-type", "")
         parsed_json = json.loads(raw_body) if raw_body and "application/json" in content_type else None
         form = dict(parse_qsl(raw_body)) if raw_body and "application/x-www-form-urlencoded" in content_type else {}
@@ -277,3 +307,29 @@ class TestAsyncRequests:
         assert "application/json" in response.get_header("content-type")
         assert len(await response.bytes()) > 0
         assert (await response.json())["url"] == f"{http_server}/get"
+
+    async def test_response_body_async_iterator(self, http_server):
+        client = specter.Client.builder().build()
+        response = await client.get(f"{http_server}/stream").send()
+        chunks = []
+        async for chunk in response.body:
+            chunks.append(chunk)
+        assert b"".join(chunks) == b"alpha-beta-gamma"
+
+    async def test_post_with_async_iterable_body_stream(self, http_server):
+        async def chunks():
+            yield b"one-"
+            await __import__("asyncio").sleep(0)
+            yield b"two-"
+            yield b"three"
+
+        client = specter.Client.builder().build()
+        request = client.post(f"{http_server}/post")
+        request.version(specter.HttpVersion.Http1_1)
+        request.body_stream(chunks())
+        response = await request.send()
+        response_chunks = []
+        async for chunk in response.body:
+            response_chunks.append(chunk)
+        body = json.loads(b"".join(response_chunks).decode())
+        assert body["data"] == "one-two-three"

@@ -130,6 +130,7 @@ module.exports.Client = binding.Client;
 module.exports.ClientBuilder = binding.ClientBuilder;
 module.exports.RequestBuilder = binding.RequestBuilder;
 module.exports.Response = binding.Response;
+module.exports.BodyStreamBridge = binding.BodyStreamBridge;
 module.exports.CookieJar = binding.CookieJar;
 module.exports.WebSocketBuilder = binding.WebSocketBuilder;
 module.exports.WebSocket = binding.WebSocket;
@@ -157,3 +158,67 @@ module.exports.isValidCloseCode = binding.isValidCloseCode;
 module.exports.clientBuilder = binding.clientBuilder;
 module.exports.timeoutsApiDefaults = binding.timeoutsApiDefaults;
 module.exports.timeoutsStreamingDefaults = binding.timeoutsStreamingDefaults;
+
+const requestBuilderSend = binding.RequestBuilder.prototype.send;
+const requestBuilderBodyStreamBridge = binding.RequestBuilder.prototype.bodyStreamBridge;
+
+binding.RequestBuilder.prototype.bodyStream = function bodyStream(asyncIterable) {
+  if (!asyncIterable || typeof asyncIterable[Symbol.asyncIterator] !== 'function') {
+    throw new TypeError('bodyStream expects an AsyncIterable<Buffer | Uint8Array>');
+  }
+
+  const bridge = new binding.BodyStreamBridge();
+  requestBuilderBodyStreamBridge.call(this, bridge);
+  Object.defineProperty(this, '__specterBodyStream', {
+    value: { asyncIterable, bridge },
+    configurable: true,
+  });
+  return this;
+};
+
+binding.RequestBuilder.prototype.send = function send() {
+  const streamState = this.__specterBodyStream;
+  if (!streamState) {
+    return requestBuilderSend.call(this);
+  }
+
+  const pump = (async () => {
+    try {
+      for await (const chunk of streamState.asyncIterable) {
+        if (chunk == null) {
+          throw new TypeError('bodyStream chunks must be Buffer or Uint8Array values');
+        }
+        await streamState.bridge.write(Buffer.from(chunk));
+      }
+      streamState.bridge.close();
+    } catch (error) {
+      await streamState.bridge.fail(error?.message || String(error));
+    }
+  })();
+
+  pump.catch(() => {});
+  return requestBuilderSend.call(this).finally(() => {
+    streamState.bridge.close();
+  });
+};
+
+Object.defineProperty(binding.Response.prototype, 'body', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    const response = this;
+    return {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            const chunk = await response.nextBodyChunk();
+            if (chunk === null || chunk === undefined) {
+              return { done: true, value: undefined };
+            }
+            return { done: false, value: chunk };
+          },
+        };
+      },
+    };
+  },
+});

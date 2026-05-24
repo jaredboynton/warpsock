@@ -28,7 +28,7 @@ Example:
 """
 
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, AsyncIterable, AsyncIterator, Dict, List, Literal, Optional, Sequence, Tuple
 
 class FingerprintProfile(Enum):
     """Browser fingerprint profiles for impersonation."""
@@ -169,9 +169,17 @@ class RequestBuilder:
     def headers(self, headers: List[Tuple[str, str]]) -> None:
         """Set all headers (replaces existing headers)."""
         ...
+
+    def version(self, version: HttpVersion) -> None:
+        """Set the preferred HTTP version for this request."""
+        ...
     
     def body(self, body: bytes) -> None:
         """Set the request body as bytes."""
+        ...
+
+    def body_stream(self, async_iterable: AsyncIterable[bytes]) -> None:
+        """Set the request body from an async iterable of bytes-like chunks."""
         ...
     
     def json(self, json_str: str) -> None:
@@ -257,6 +265,11 @@ class Response:
     
     def get_header(self, name: str) -> Optional[str]:
         """Get a specific header value by name."""
+        ...
+
+    @property
+    def body(self) -> AsyncIterator[bytes]:
+        """Response body as an async iterator of byte chunks."""
         ...
     
     async def text(self) -> str:

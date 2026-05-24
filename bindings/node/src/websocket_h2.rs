@@ -209,6 +209,7 @@ impl WebSocketH2Tunnel {
     }
 
     #[napi]
+    #[allow(clippy::never_loop)]
     pub async fn recv_bytes(&self) -> Result<Option<Buffer>> {
         loop {
             let Some(event) = self.next_event().await? else {

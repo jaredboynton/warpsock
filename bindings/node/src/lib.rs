@@ -3,12 +3,17 @@
 //! Provides Node.js async access to Specter's HTTP client with full
 //! TLS/HTTP2/HTTP3 fingerprint control.
 
+use bytes::Bytes;
+use futures_core::Stream;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 mod websocket;
 mod websocket_h2;
@@ -17,9 +22,9 @@ mod ws_types;
 
 // Re-export specter types - use ::specter to disambiguate
 use ::specter::{
-    Client as RustClient, ClientBuilder as RustClientBuilder, CookieJar as RustCookieJar,
-    Error as RustError, FingerprintProfile as RustFingerprintProfile, Response as RustResponse,
-    Timeouts as RustTimeouts,
+    Body as RustBody, Client as RustClient, ClientBuilder as RustClientBuilder,
+    CookieJar as RustCookieJar, Error as RustError, FingerprintProfile as RustFingerprintProfile,
+    HttpVersion as RustHttpVersion, Response as RustResponse, Timeouts as RustTimeouts,
 };
 
 /// Node.js wrapper for Specter HTTP client.
@@ -41,13 +46,63 @@ pub struct RequestBuilder {
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    body: Option<Vec<u8>>,
+    body: Arc<StdMutex<Option<RequestBodyKind>>>,
+    version: Option<RustHttpVersion>,
 }
 
 /// Node.js wrapper for HTTP Response.
 #[napi]
 pub struct Response {
-    inner: RustResponse,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Arc<StdMutex<RustBody>>,
+    raw_body: Option<Bytes>,
+    text_body: Option<StdResult<String, String>>,
+    http_version: String,
+    effective_url: Option<String>,
+}
+
+enum RequestBodyKind {
+    Buffered(Vec<u8>),
+    Stream(mpsc::Receiver<StdResult<Bytes, RustError>>),
+}
+
+struct NodeBodyStream {
+    rx: mpsc::Receiver<StdResult<Bytes, RustError>>,
+}
+
+impl Stream for NodeBodyStream {
+    type Item = StdResult<Bytes, RustError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Bridge used by the JavaScript wrapper to feed async-iterable request body chunks.
+type BodyStreamSender = mpsc::Sender<StdResult<Bytes, RustError>>;
+type BodyStreamReceiver = mpsc::Receiver<StdResult<Bytes, RustError>>;
+type SharedBodyStreamSender = Arc<StdMutex<Option<BodyStreamSender>>>;
+type SharedBodyStreamReceiver = Arc<StdMutex<Option<BodyStreamReceiver>>>;
+
+#[napi]
+pub struct BodyStreamBridge {
+    tx: SharedBodyStreamSender,
+    rx: SharedBodyStreamReceiver,
+}
+
+fn request_body_slot() -> Arc<StdMutex<Option<RequestBodyKind>>> {
+    Arc::new(StdMutex::new(None))
+}
+
+fn to_rust_http_version(version: HttpVersion) -> RustHttpVersion {
+    match version {
+        HttpVersion::Http1_1 => RustHttpVersion::Http1_1,
+        HttpVersion::Http2 => RustHttpVersion::Http2,
+        HttpVersion::Http3 => RustHttpVersion::Http3,
+        HttpVersion::Http3Only => RustHttpVersion::Http3Only,
+        HttpVersion::Auto => RustHttpVersion::Auto,
+    }
 }
 
 /// Node.js wrapper for CookieJar.
@@ -92,7 +147,7 @@ pub enum HttpVersion {
 
 /// Timeout configuration for HTTP requests.
 #[napi(object)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Timeouts {
     pub connect: Option<f64>,
     pub ttfb: Option<f64>,
@@ -100,19 +155,6 @@ pub struct Timeouts {
     pub write_idle: Option<f64>,
     pub total: Option<f64>,
     pub pool_acquire: Option<f64>,
-}
-
-impl Default for Timeouts {
-    fn default() -> Self {
-        Self {
-            connect: None,
-            ttfb: None,
-            read_idle: None,
-            write_idle: None,
-            total: None,
-            pool_acquire: None,
-        }
-    }
 }
 
 impl Timeouts {
@@ -164,7 +206,8 @@ impl Client {
             url,
             method: "GET".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -176,7 +219,8 @@ impl Client {
             url,
             method: "POST".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -188,7 +232,8 @@ impl Client {
             url,
             method: "PUT".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -200,7 +245,8 @@ impl Client {
             url,
             method: "DELETE".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -212,7 +258,8 @@ impl Client {
             url,
             method: "PATCH".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -224,7 +271,8 @@ impl Client {
             url,
             method: "HEAD".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -236,7 +284,8 @@ impl Client {
             url,
             method: "OPTIONS".to_string(),
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 
@@ -248,7 +297,8 @@ impl Client {
             url,
             method,
             headers: Vec::new(),
-            body: None,
+            body: request_body_slot(),
+            version: None,
         }
     }
 }
@@ -281,18 +331,34 @@ impl RequestBuilder {
         Ok(self)
     }
 
-    /// Set the request body as bytes.
+    /// Set the preferred HTTP version for this request.
     #[napi]
-    pub fn body(&mut self, body: Buffer) -> &Self {
-        self.body = Some(body.to_vec());
+    pub fn version(&mut self, version: HttpVersion) -> &Self {
+        self.version = Some(to_rust_http_version(version));
         self
     }
 
-    /// Set the request body as a JSON string.
+    /// Set the request body as bytes.
     #[napi]
-    pub fn json(&mut self, json_str: String) -> &Self {
-        self.body = Some(json_str.into_bytes());
-        // Set Content-Type to application/json if not already set
+    pub fn body(&self, body: Buffer) -> Result<&Self> {
+        *self
+            .body
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Request body slot is poisoned"))? =
+            Some(RequestBodyKind::Buffered(body.to_vec()));
+        Ok(self)
+    }
+
+    fn set_buffered_body(&self, body: Vec<u8>) -> Result<()> {
+        *self
+            .body
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Request body slot is poisoned"))? =
+            Some(RequestBodyKind::Buffered(body));
+        Ok(())
+    }
+
+    fn ensure_json_content_type(&mut self) {
         if !self
             .headers
             .iter()
@@ -301,14 +367,9 @@ impl RequestBuilder {
             self.headers
                 .push(("Content-Type".to_string(), "application/json".to_string()));
         }
-        self
     }
 
-    /// Set the request body as form data.
-    #[napi]
-    pub fn form(&mut self, form_str: String) -> &Self {
-        self.body = Some(form_str.into_bytes());
-        // Set Content-Type to application/x-www-form-urlencoded if not already set
+    fn ensure_form_content_type(&mut self) {
         if !self
             .headers
             .iter()
@@ -319,7 +380,44 @@ impl RequestBuilder {
                 "application/x-www-form-urlencoded".to_string(),
             ));
         }
-        self
+    }
+
+    /// Set the request body as a JSON string.
+    #[napi]
+    pub fn json(&mut self, json_str: String) -> Result<&Self> {
+        self.set_buffered_body(json_str.into_bytes())?;
+        self.ensure_json_content_type();
+        Ok(self)
+    }
+
+    /// Set the request body as form data.
+    #[napi]
+    pub fn form(&mut self, form_str: String) -> Result<&Self> {
+        self.set_buffered_body(form_str.into_bytes())?;
+        self.ensure_form_content_type();
+        Ok(self)
+    }
+
+    /// Set the request body from a JavaScript AsyncIterable via the JS wrapper.
+    #[napi]
+    pub fn body_stream_bridge(&self, bridge: &BodyStreamBridge) -> Result<&Self> {
+        let rx = bridge
+            .rx
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Body stream bridge is poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    "Body stream bridge has already been attached to a request",
+                )
+            })?;
+        *self
+            .body
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Request body slot is poisoned"))? =
+            Some(RequestBodyKind::Stream(rx));
+        Ok(self)
     }
 
     /// Send the request and return the response.
@@ -329,38 +427,132 @@ impl RequestBuilder {
         let url = self.url.clone();
         let method = self.method.clone();
         let headers = self.headers.clone();
-        let body = self.body.clone();
+        let version = self.version;
+        let body = self
+            .body
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Request body slot is poisoned"))?
+            .take();
 
-        // Build the request using the appropriate method
-        let mut req_builder = match method.as_str() {
-            "GET" => client.get(url.as_str()),
-            "POST" => client.post(url.as_str()),
-            "PUT" => client.put(url.as_str()),
-            "DELETE" => client.delete(url.as_str()),
-            "PATCH" => client.request(::http::Method::PATCH, url.as_str()),
-            "HEAD" => client.request(::http::Method::HEAD, url.as_str()),
-            "OPTIONS" => client.request(::http::Method::OPTIONS, url.as_str()),
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("Invalid HTTP method: {}", method),
-                ))
-            }
-        };
+        let streaming = matches!(body, Some(RequestBodyKind::Stream(_)));
 
-        // Add headers
-        for (key, value) in headers {
-            req_builder = req_builder.header(key, value);
+        let (tx, rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let mut req_builder = match method.as_str() {
+                            "GET" => client.get(url.as_str()),
+                            "POST" => client.post(url.as_str()),
+                            "PUT" => client.put(url.as_str()),
+                            "DELETE" => client.delete(url.as_str()),
+                            "PATCH" => client.request(::http::Method::PATCH, url.as_str()),
+                            "HEAD" => client.request(::http::Method::HEAD, url.as_str()),
+                            "OPTIONS" => client.request(::http::Method::OPTIONS, url.as_str()),
+                            _ => {
+                                return Err(Error::new(
+                                    Status::InvalidArg,
+                                    format!("Invalid HTTP method: {}", method),
+                                ))
+                            }
+                        };
+
+                        if let Some(version) = version {
+                            req_builder = req_builder.version(version);
+                        }
+
+                        for (key, value) in headers {
+                            req_builder = req_builder.header(key, value);
+                        }
+
+                        if let Some(body_data) = body {
+                            match body_data {
+                                RequestBodyKind::Buffered(bytes) => {
+                                    req_builder = req_builder.body(bytes);
+                                }
+                                RequestBodyKind::Stream(rx) => {
+                                    req_builder = req_builder.body_stream(NodeBodyStream { rx });
+                                }
+                            }
+                        }
+
+                        let resp = if streaming {
+                            req_builder.send_streaming().await
+                        } else {
+                            req_builder.send().await
+                        }
+                        .map_err(to_napi_err)?;
+                        Response::from_rust(resp)
+                    })
+                });
+            let _ = tx.send(result);
+        });
+
+        rx.await
+            .map_err(|_| Error::new(Status::GenericFailure, "Request worker thread exited"))?
+    }
+}
+
+#[napi]
+impl BodyStreamBridge {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel(8);
+        Self {
+            tx: Arc::new(StdMutex::new(Some(tx))),
+            rx: Arc::new(StdMutex::new(Some(rx))),
         }
+    }
 
-        // Add body if present
-        if let Some(body_data) = body {
-            req_builder = req_builder.body(body_data);
+    /// Push one request-body chunk. Resolves only when bounded bridge capacity is available.
+    #[napi]
+    pub async fn write(&self, chunk: Buffer) -> Result<()> {
+        let tx = self
+            .tx
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Body stream bridge is poisoned"))?
+            .clone()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Body stream bridge is closed"))?;
+        tx.send(Ok(Bytes::from(chunk.to_vec())))
+            .await
+            .map_err(|_| Error::new(Status::GenericFailure, "Request body stream is closed"))
+    }
+
+    /// Fail the request-body stream with an error from JavaScript iteration.
+    #[napi]
+    pub async fn fail(&self, message: String) -> Result<()> {
+        let tx = self
+            .tx
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Body stream bridge is poisoned"))?
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(Err(RustError::HttpProtocol(format!(
+                    "JavaScript request body stream failed: {message}"
+                ))))
+                .await;
         }
+        self.close()
+    }
 
-        // Send the request
-        let resp = req_builder.send().await.map_err(to_napi_err)?;
-        Ok(Response { inner: resp })
+    /// Close the request-body stream.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        self.tx
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Body stream bridge is poisoned"))?
+            .take();
+        Ok(())
+    }
+}
+
+impl Default for BodyStreamBridge {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -533,27 +725,53 @@ impl ClientBuilder {
     }
 }
 
+impl Response {
+    fn from_rust(resp: RustResponse) -> Result<Self> {
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let raw_body = resp.buffered_bytes().cloned();
+        let text_body = raw_body
+            .as_ref()
+            .map(|_| resp.text().map_err(|err| err.to_string()));
+        let http_version = resp.http_version().to_string();
+        let effective_url = resp.url().map(|url| url.to_string());
+        let body = resp.into_body();
+
+        Ok(Self {
+            status,
+            headers,
+            body: Arc::new(StdMutex::new(body)),
+            raw_body,
+            text_body,
+            http_version,
+            effective_url,
+        })
+    }
+}
+
 #[napi]
 impl Response {
     /// Get the HTTP status code.
     #[napi(getter)]
     pub fn status(&self) -> u16 {
-        self.inner.status().as_u16()
+        self.status
     }
 
     /// Get the response headers as an object.
     #[napi(getter)]
     pub fn headers(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
-        for (key, value) in self.inner.headers().iter() {
-            let key = key.to_string();
-            let value = value.to_string();
+        for (key, value) in self.headers.iter() {
             // Handle multiple values for the same header by joining with comma
-            map.entry(key)
+            map.entry(key.clone())
                 .and_modify(|v: &mut String| {
                     *v = format!("{}, {}", v, value);
                 })
-                .or_insert(value);
+                .or_insert_with(|| value.clone());
         }
         map
     }
@@ -561,8 +779,7 @@ impl Response {
     /// Get all headers as an array of [key, value] pairs.
     #[napi]
     pub fn headers_list(&self) -> Vec<Vec<String>> {
-        self.inner
-            .headers()
+        self.headers
             .iter()
             .map(|(key, value)| vec![key.to_string(), value.to_string()])
             .collect()
@@ -571,63 +788,115 @@ impl Response {
     /// Get a specific header value by name.
     #[napi]
     pub fn get_header(&self, name: String) -> Option<String> {
-        self.inner.get_header(&name).map(|s| s.to_string())
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+            .map(|(_, value)| value.clone())
     }
 
     /// Get the response body as text (with decompression if needed).
     #[napi]
     pub fn text(&self) -> Result<String> {
-        self.inner.text().map_err(to_napi_err)
+        match &self.text_body {
+            Some(Ok(text)) => Ok(text.clone()),
+            Some(Err(err)) => Err(Error::new(Status::GenericFailure, err.clone())),
+            None => Err(Error::new(
+                Status::GenericFailure,
+                "response body is streaming; consume response.body with for-await",
+            )),
+        }
     }
 
     /// Get the response body as a Buffer.
     #[napi]
-    pub fn bytes(&self) -> Buffer {
-        Buffer::from(self.inner.body().to_vec())
+    pub fn bytes(&self) -> Result<Buffer> {
+        self.raw_body
+            .as_ref()
+            .map(|bytes| Buffer::from(bytes.to_vec()))
+            .ok_or_else(|| {
+                Error::new(
+                    Status::GenericFailure,
+                    "response body is streaming; consume response.body with for-await",
+                )
+            })
     }
 
     /// Parse the response body as JSON and return as string.
     /// Use JSON.parse in JavaScript to convert to an object.
     #[napi]
     pub fn json(&self) -> Result<String> {
-        let json_value: serde_json::Value = self.inner.json().map_err(to_napi_err)?;
+        let text = self.text()?;
+        let json_value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))?;
         Ok(json_value.to_string())
+    }
+
+    /// Return the next response body chunk for the JavaScript AsyncIterator wrapper.
+    #[napi]
+    #[allow(clippy::await_holding_lock)]
+    pub async fn next_body_chunk(&self) -> Result<Option<Buffer>> {
+        let body = self.body.clone();
+        let (tx, rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let mut body = body.lock().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Response body lock is poisoned")
+                        })?;
+                        while let Some(frame) = body.frame().await {
+                            let frame = frame.map_err(to_napi_err)?;
+                            if let Ok(data) = frame.into_data() {
+                                return Ok(Some(Buffer::from(data.to_vec())));
+                            }
+                        }
+                        Ok(None)
+                    })
+                });
+            let _ = tx.send(result);
+        });
+
+        rx.await
+            .map_err(|_| Error::new(Status::GenericFailure, "Response body worker thread exited"))?
     }
 
     /// Get the HTTP version string.
     #[napi(getter)]
     pub fn http_version(&self) -> String {
-        self.inner.http_version().to_string()
+        self.http_version.clone()
     }
 
     /// Get the effective URL (after redirects).
     #[napi(getter)]
     pub fn effective_url(&self) -> Option<String> {
-        self.inner.url().map(|url| url.to_string())
+        self.effective_url.clone()
     }
 
     /// Check if the response status is successful (2xx).
     #[napi(getter)]
     pub fn is_success(&self) -> bool {
-        self.inner.is_success()
+        (200..300).contains(&self.status)
     }
 
     /// Check if the response is a redirect (3xx).
     #[napi(getter)]
     pub fn is_redirect(&self) -> bool {
-        self.inner.is_redirect()
+        (300..400).contains(&self.status)
     }
 
     /// Get the redirect URL from Location header if present.
     #[napi(getter)]
     pub fn redirect_url(&self) -> Option<String> {
-        self.inner.redirect_url().map(|s| s.to_string())
+        self.get_header("Location".to_string())
     }
 
     /// Get the Content-Type header value.
     #[napi(getter)]
     pub fn content_type(&self) -> Option<String> {
-        self.inner.content_type().map(|s| s.to_string())
+        self.get_header("Content-Type".to_string())
     }
 }
 
@@ -659,6 +928,12 @@ impl CookieJar {
             .try_read()
             .map_err(|_| Error::new(Status::GenericFailure, "CookieJar is currently locked"))?
             .is_empty())
+    }
+}
+
+impl Default for CookieJar {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

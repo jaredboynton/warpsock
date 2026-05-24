@@ -26,6 +26,25 @@ function createHttpFixture() {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
+      if (req.url === '/stream') {
+        const responseChunks = [Buffer.from('alpha-'), Buffer.from('beta-'), Buffer.from('gamma')];
+        res.writeHead(200, {
+          'content-type': 'text/plain',
+          'transfer-encoding': 'chunked'
+        });
+
+        const writeNext = (index) => {
+          if (index >= responseChunks.length) {
+            res.end();
+            return;
+          }
+          res.write(responseChunks[index]);
+          setTimeout(() => writeNext(index + 1), 5);
+        };
+        writeNext(0);
+        return;
+      }
+
       const body = Buffer.concat(chunks).toString();
       const headers = {};
       for (const [key, value] of Object.entries(req.headers)) {
@@ -317,5 +336,35 @@ describe('Async Requests', () => {
     expect(response.getHeader('content-type')).toContain('application/json');
     expect(Buffer.isBuffer(response.bytes())).toBe(true);
     expect(JSON.parse(response.json()).url).toBe(`${fixture.baseUrl}/get`);
+  });
+
+  test('response body is async iterable', async () => {
+    const response = await client.get(`${fixture.baseUrl}/stream`).send();
+    const chunks = [];
+    for await (const chunk of response.body) {
+      expect(Buffer.isBuffer(chunk)).toBe(true);
+      chunks.push(chunk);
+    }
+    expect(Buffer.concat(chunks).toString()).toBe('alpha-beta-gamma');
+  });
+
+  test('POST with async iterable bodyStream', async () => {
+    async function* chunks() {
+      yield Buffer.from('one-');
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      yield new Uint8Array(Buffer.from('two-'));
+      yield Buffer.from('three');
+    }
+
+    const response = await client.post(`${fixture.baseUrl}/post`)
+      .version(HttpVersion.Http1_1)
+      .bodyStream(chunks())
+      .send();
+    const responseChunks = [];
+    for await (const chunk of response.body) {
+      responseChunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(responseChunks).toString());
+    expect(body.data).toBe('one-two-three');
   });
 });

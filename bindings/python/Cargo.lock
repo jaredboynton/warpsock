@@ -495,6 +495,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-body"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
+dependencies = [
+ "bytes",
+ "http",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1180,6 +1190,7 @@ name = "specter-python"
 version = "3.1.0"
 dependencies = [
  "bytes",
+ "futures-core",
  "http",
  "pyo3",
  "pyo3-async-runtimes",
@@ -1198,10 +1209,13 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "futures-core",
  "getrandom",
  "hex",
  "http",
+ "http-body",
  "httparse",
+ "pin-project-lite",
  "psl",
  "quiche",
  "rustls-native-certs",
