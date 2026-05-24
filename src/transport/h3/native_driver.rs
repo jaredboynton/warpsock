@@ -796,8 +796,8 @@ struct NativeDriverTunnelState {
     outbound_tx: Option<mpsc::UnboundedSender<H3TunnelOutbound>>,
     outbound_rx: Option<mpsc::UnboundedReceiver<H3TunnelOutbound>>,
     pending_outbound: VecDeque<DriverPendingTunnelOutbound>,
-    inbound_tx: mpsc::Sender<Result<H3TunnelEvent>>,
-    inbound_rx: Option<mpsc::Receiver<Result<H3TunnelEvent>>>,
+    inbound_tx: mpsc::UnboundedSender<Result<H3TunnelEvent>>,
+    inbound_rx: Option<mpsc::UnboundedReceiver<Result<H3TunnelEvent>>>,
     pending_inbound: VecDeque<Result<H3TunnelEvent>>,
     credit: Arc<H3TunnelCredit>,
     opened: bool,
@@ -810,6 +810,7 @@ impl NativeDriverTunnelState {
             response_tx,
             Arc::new(Notify::new()),
             H3TransportConfig::default().tunnel_outbound_byte_budget,
+            H3TransportConfig::default().tunnel_inbound_byte_budget,
         )
     }
 
@@ -817,10 +818,11 @@ impl NativeDriverTunnelState {
         response_tx: oneshot::Sender<Result<H3Tunnel>>,
         driver_notify: Arc<Notify>,
         send_budget: usize,
+        recv_budget: usize,
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, inbound_rx) = mpsc::channel(32);
-        let credit = H3TunnelCredit::new(driver_notify, send_budget);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let credit = H3TunnelCredit::new(driver_notify, send_budget, recv_budget);
         Self {
             response_tx: Some(response_tx),
             outbound_tx: Some(outbound_tx),
@@ -838,7 +840,7 @@ impl NativeDriverTunnelState {
         if let Some(response_tx) = self.response_tx.take() {
             let _ = response_tx.send(Err(error));
         } else {
-            let _ = self.inbound_tx.try_send(Err(error));
+            let _ = self.inbound_tx.send(Err(error));
         }
     }
 
@@ -849,7 +851,12 @@ impl NativeDriverTunnelState {
             return TunnelInboundStatus::Open;
         }
 
-        match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+        match Self::try_send_inbound(
+            &self.inbound_tx,
+            &self.credit,
+            &mut self.pending_inbound,
+            item,
+        ) {
             TunnelInboundStatus::Blocked => TunnelInboundStatus::Open,
             status => status,
         }
@@ -857,7 +864,12 @@ impl NativeDriverTunnelState {
 
     fn flush_inbound(&mut self) -> TunnelInboundStatus {
         while let Some(item) = self.pending_inbound.pop_front() {
-            match Self::try_send_inbound(&self.inbound_tx, &mut self.pending_inbound, item) {
+            match Self::try_send_inbound(
+                &self.inbound_tx,
+                &self.credit,
+                &mut self.pending_inbound,
+                item,
+            ) {
                 TunnelInboundStatus::Open => {}
                 TunnelInboundStatus::Blocked => return TunnelInboundStatus::Open,
                 status => return status,
@@ -868,10 +880,12 @@ impl NativeDriverTunnelState {
 
     fn is_inbound_backpressured(&self, pending_inbound_limit: usize) -> bool {
         self.pending_inbound.len() >= pending_inbound_limit.max(1)
+            || !self.credit.has_inbound_capacity()
     }
 
     fn try_send_inbound(
-        inbound_tx: &mpsc::Sender<Result<H3TunnelEvent>>,
+        inbound_tx: &mpsc::UnboundedSender<Result<H3TunnelEvent>>,
+        credit: &H3TunnelCredit,
         pending_inbound: &mut VecDeque<Result<H3TunnelEvent>>,
         item: Result<H3TunnelEvent>,
     ) -> TunnelInboundStatus {
@@ -879,15 +893,27 @@ impl NativeDriverTunnelState {
             item,
             Ok(H3TunnelEvent::EndStream | H3TunnelEvent::Reset(_) | H3TunnelEvent::GoAway { .. })
         );
-        match inbound_tx.try_send(item) {
+        let inbound_bytes = inbound_event_bytes(&item);
+        if !credit.try_reserve_inbound_bytes(inbound_bytes) {
+            pending_inbound.push_front(item);
+            return TunnelInboundStatus::Blocked;
+        }
+        match inbound_tx.send(item) {
             Ok(()) if remove_after_send => TunnelInboundStatus::Remove,
             Ok(()) => TunnelInboundStatus::Open,
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                pending_inbound.push_front(item);
-                TunnelInboundStatus::Blocked
+            Err(_) => {
+                credit.release_inbound_bytes(inbound_bytes);
+                TunnelInboundStatus::Closed
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => TunnelInboundStatus::Closed,
         }
+    }
+}
+
+fn inbound_event_bytes(item: &Result<H3TunnelEvent>) -> usize {
+    match item {
+        Ok(H3TunnelEvent::Data(bytes)) => bytes.len(),
+        Ok(H3TunnelEvent::EndStream | H3TunnelEvent::Reset(_) | H3TunnelEvent::GoAway { .. })
+        | Err(_) => 0,
     }
 }
 

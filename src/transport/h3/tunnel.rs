@@ -27,7 +27,7 @@ pub enum H3TunnelEvent {
 /// Cap on the outbound byte budget. Tokio's `Semaphore` permits are `usize`,
 /// but acquisitions are `u32`-bounded internally; pinning the budget at
 /// `u32::MAX as usize` keeps every cast lossless without putting an arbitrary
-    /// lower bound on the configured value.
+/// lower bound on the configured value.
 pub(crate) const MAX_TUNNEL_OUTBOUND_BYTE_BUDGET: usize = u32::MAX as usize;
 pub(crate) const MAX_TUNNEL_INBOUND_BYTE_BUDGET: usize = u32::MAX as usize;
 
