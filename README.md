@@ -246,17 +246,17 @@ See [`docs/benchmarks/2026-05-24-streaming/`](docs/benchmarks/2026-05-24-streami
 
 ### Local native HTTP/3 vs Rust H3 clients
 
-Specter's native HTTP/3 path also has a local same-fixture comparator matrix against `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest` HTTP/3. The n=30 artifact [`2026-05-24-full-local-n30.json`](docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30.json) passes the H3 superiority gate with all required comparator rows present:
+Specter's native HTTP/3 path also has a local same-fixture comparator matrix against `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest` HTTP/3. The n=30 artifact [`2026-05-24-full-local-n30-plus-rfc9220-comparators.json`](docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30-plus-rfc9220-comparators.json) passes the H3 superiority gate with all required comparator rows present:
 
 | Client | Role | p50 TTFT | p95 TTFT | Throughput |
 | --- | --- | ---: | ---: | ---: |
-| Specter native H3 | HTTP/3 client | 0.137 ms | 0.268 ms | 10.24 MB/s |
-| h3-quinn | HTTP/3 client | 0.366 ms | 0.887 ms | 8.56 MB/s |
-| reqwest_h3 | HTTP/3 client | 0.384 ms | 0.920 ms | 8.84 MB/s |
-| quiche direct | HTTP/3 client | 2.72 ms | 2.80 ms | 7.87 MB/s |
-| tokio-quiche | HTTP/3 client | 3.32 ms | 3.52 ms | 6.81 MB/s |
+| Specter native H3 | HTTP/3 client | 0.700 ms | 1.912 ms | 8.87 MiB/s |
+| reqwest_h3 | HTTP/3 client | 1.932 ms | 10.707 ms | 5.24 MiB/s |
+| quiche direct | HTTP/3 client | 3.071 ms | 3.581 ms | 6.84 MiB/s |
+| tokio-quiche | HTTP/3 client | 3.508 ms | 4.327 ms | 6.11 MiB/s |
+| h3-quinn | HTTP/3 client | 4.991 ms | 16.532 ms | 4.43 MiB/s |
 
-That gate is explicitly for HTTP/3 request/response workloads. The same artifact includes Specter RFC 9220 WebSocket-over-H3 tunnel echo, close/FIN, mixed slow-consumer rows, and measured low-level `quiche`/`tokio-quiche` raw tunnel comparator rows. This is still not a published RFC 9220 tunnel superiority claim until a dedicated tunnel gate and p99-scale samples exist. `quinn_transport` and `s2n_quic_transport` are separate QUIC transport-only evidence, not H3 HTTP comparator rows. Native QUIC production hardening remains active work for PTO/recovery, Retry/VN handshake integration, key update, RFC-grade close-drain timing, and full path validation.
+That gate is explicitly for HTTP/3 request/response workloads. The same artifact includes Specter RFC 9220 WebSocket-over-H3 tunnel echo, close/FIN, mixed slow-consumer rows, and measured low-level `quiche`/`tokio-quiche` raw tunnel comparator rows. This is still not a published RFC 9220 tunnel superiority claim until a dedicated tunnel gate and p99-scale samples exist. `quinn_transport` and `s2n_quic_transport` are separate QUIC transport-only evidence, not H3 HTTP comparator rows. Native QUIC production hardening remains active work for broader recovery soak/backoff validation, ECN receive reporting plus ACK_ECN generation from received marks, PMTU/path probing, full per-address path migration, browser ACK parity, and safe 0-RTT request replay policy.
 
 ### Local WebSocket echo vs fastwebsockets and tokio-tungstenite
 
