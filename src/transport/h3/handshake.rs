@@ -738,6 +738,7 @@ pub struct NativeQuicHandshake {
     client_initial_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
     client_handshake_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
     client_application_sent_streams: BTreeMap<u64, SentApplicationStreamPacket>,
+    client_application_recovery_lost_packets: Vec<u64>,
     client_path_validator: QuicPathValidator,
     server_transport_parameters_validated: bool,
     recovery: RecoveryState,
@@ -2140,6 +2141,7 @@ impl NativeQuicHandshake {
             client_initial_sent_crypto: BTreeMap::new(),
             client_handshake_sent_crypto: BTreeMap::new(),
             client_application_sent_streams: BTreeMap::new(),
+            client_application_recovery_lost_packets: Vec::new(),
             client_path_validator: QuicPathValidator::default(),
             server_transport_parameters_validated: false,
             recovery: recovery_state_from_transport(&fingerprint.transport),
@@ -2240,6 +2242,7 @@ impl NativeQuicHandshake {
             client_initial_sent_crypto: BTreeMap::new(),
             client_handshake_sent_crypto: BTreeMap::new(),
             client_application_sent_streams: BTreeMap::new(),
+            client_application_recovery_lost_packets: Vec::new(),
             client_path_validator: QuicPathValidator::default(),
             server_transport_parameters_validated: false,
             recovery: recovery_state_from_transport(&fingerprint.transport),
@@ -2327,6 +2330,11 @@ impl NativeQuicHandshake {
                 self.client_application_next_keys = Some(derive_next_packet_key_material(&keys)?);
                 self.client_application_keys = Some(keys);
             }
+        }
+        if self.is_application_ready() && !self.recovery.handshake_complete() {
+            self.recovery.discard_space(PacketNumberSpace::Initial);
+            self.recovery.discard_space(PacketNumberSpace::Handshake);
+            self.recovery.mark_handshake_complete();
         }
         Ok(())
     }
@@ -2522,9 +2530,34 @@ impl NativeQuicHandshake {
     pub fn retransmit_lost_client_application_stream_packets(
         &mut self,
     ) -> Result<Vec<ClientApplicationPacket>> {
-        let lost_packets = self.client_application_loss_detector.lost_packets();
+        let mut lost_packets = self.client_application_loss_detector.lost_packets();
+        lost_packets.extend(self.client_application_recovery_lost_packets.drain(..));
+        self.retransmit_client_application_stream_packets(lost_packets)
+    }
+
+    pub fn retransmit_pto_client_application_stream_packets(
+        &mut self,
+        now: Instant,
+        pto_timeout: Duration,
+    ) -> Result<Vec<ClientApplicationPacket>> {
+        let expired_packets = self
+            .client_application_loss_detector
+            .pto_expired_packets(now, pto_timeout);
+        self.retransmit_client_application_stream_packets(expired_packets)
+    }
+
+    fn retransmit_client_application_stream_packets<I>(
+        &mut self,
+        packet_numbers: I,
+    ) -> Result<Vec<ClientApplicationPacket>>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut packet_numbers = packet_numbers.into_iter().collect::<Vec<_>>();
+        packet_numbers.sort_unstable();
+        packet_numbers.dedup();
         let mut retransmits = Vec::new();
-        for packet_number in lost_packets {
+        for packet_number in packet_numbers {
             self.client_application_loss_detector
                 .retire_packet(packet_number);
             let Some(sent) = self.client_application_sent_streams.remove(&packet_number) else {
@@ -2815,6 +2848,16 @@ impl NativeQuicHandshake {
     /// applied to the Application space after handshake confirmation.
     pub fn application_pto(&self) -> Duration {
         self.recovery.current_pto()
+    }
+
+    /// Application packet-number-space PTO including peer max_ack_delay and
+    /// current RFC9002 PTO backoff.
+    pub fn application_pto_timeout(&self) -> Duration {
+        let max_ack_delay = self.recovery.max_ack_delay();
+        let backoff = 1u32 << self.recovery.pto_count().min(31);
+        self.recovery
+            .current_pto()
+            .saturating_add(max_ack_delay.saturating_mul(backoff))
     }
 
     /// Marks Handshake confirmation so Application PTO includes `max_ack_delay`
@@ -3309,12 +3352,22 @@ impl NativeQuicHandshake {
                 self.application_key_update.note_packet_acked(packet_number);
             }
             if matches!(frame, QuicFrame::Ack { .. } | QuicFrame::AckEcn { .. }) {
-                self.recovery.on_ack_received(
+                let outcome = self.recovery.on_ack_received(
                     PacketNumberSpace::Application,
                     frame,
                     self.fingerprint.transport.ack_delay_exponent,
                     now,
                 )?;
+                for (packet_number, _) in outcome.newly_acked {
+                    self.client_application_sent_streams.remove(&packet_number);
+                    self.application_key_update.note_packet_acked(packet_number);
+                }
+                self.client_application_recovery_lost_packets.extend(
+                    outcome
+                        .lost
+                        .into_iter()
+                        .map(|(packet_number, _)| packet_number),
+                );
             }
             match frame {
                 QuicFrame::MaxData(max_data) => {
@@ -3721,6 +3774,7 @@ impl NativeQuicHandshake {
         self.client_initial_sent_crypto.clear();
         self.client_handshake_sent_crypto.clear();
         self.client_application_sent_streams.clear();
+        self.client_application_recovery_lost_packets.clear();
         self.client_path_validator = QuicPathValidator::default();
         self.recovery = recovery_state_from_transport(&self.fingerprint.transport);
         self.next_client_initial_packet_number = 1;
@@ -4194,8 +4248,10 @@ mod receive_flow_control_tests {
             .expect("small drain");
         assert!(fc.take_update_frames().is_empty());
 
-        // Cumulative drain hits the next half-window threshold and emits
-        // exactly initial(40) + total(50) = 90.
+        // Cumulative drain (5 + 20 + 5 + 16 = 46) crosses the next
+        // half-window delta relative to the previously announced 65, so the
+        // emitted frame is the exact absolute initial(40) + drained(46) = 86,
+        // not rounded up to a static receive-threshold ceiling.
         fc.record_stream_consumed(stream_id, 16)
             .expect("next threshold");
         let frames = fc.take_update_frames();
@@ -4203,7 +4259,7 @@ mod receive_flow_control_tests {
             frames,
             vec![QuicFrame::MaxStreamData {
                 stream_id,
-                max_stream_data: 90,
+                max_stream_data: 86,
             }]
         );
     }

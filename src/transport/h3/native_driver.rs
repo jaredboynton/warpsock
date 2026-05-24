@@ -20,6 +20,7 @@ use crate::transport::h3::handshake::{NativeQuicHandshake, ServerH3Event, Server
 use crate::transport::h3::native::{
     decode_header_block, H3Frame, H3Header, H3Setting, H3StreamType,
 };
+use crate::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use crate::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
 use crate::transport::h3::{
     H3TransportConfig, H3Tunnel, H3TunnelCredit, H3TunnelEvent, H3TunnelOutbound,
@@ -1040,6 +1041,10 @@ impl NativeH3Driver {
                 self.run_close_window(&mut buf).await?;
                 return Ok(());
             }
+            let client_loss_detection_deadline = self.client_loss_detection_deadline();
+            let client_loss_detection_delay = client_loss_detection_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::ZERO);
             let client_application_ack_deadline = self.client_application_ack_deadline();
             let client_application_ack_delay = client_application_ack_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -1081,6 +1086,9 @@ impl NativeH3Driver {
                 _ = tokio::time::sleep(client_application_ack_delay), if client_application_ack_deadline.is_some() => {
                     self.send_delayed_application_ack().await?;
                 }
+                _ = tokio::time::sleep(client_loss_detection_delay), if client_loss_detection_deadline.is_some() => {
+                    self.handle_loss_detection_timeout().await?;
+                }
                 _ = self.body_progress_notify.notified() => {
                     self.cancel_closed_streaming_bodies().await?;
                     self.flush_scheduled_send_work().await?;
@@ -1104,6 +1112,7 @@ impl NativeH3Driver {
             || !self.pending_tunnels.is_empty()
             || !self.pending_commands.is_empty()
             || self.client_application_ack_deadline().is_some()
+            || self.client_loss_detection_deadline().is_some()
     }
 
     fn has_outbound_send_work(&self) -> bool {
@@ -1154,6 +1163,10 @@ impl NativeH3Driver {
             .client_application_ack_deadline(Duration::from_millis(
                 self.fingerprint.transport.max_ack_delay_ms,
             ))
+    }
+
+    fn client_loss_detection_deadline(&self) -> Option<Instant> {
+        self.handshake.loss_detection_timer()
     }
 
     async fn send_preface(&mut self) -> Result<()> {
@@ -1289,6 +1302,55 @@ impl NativeH3Driver {
                 .send_to(packet.packet.as_ref(), self.peer_addr)
                 .await
                 .map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn send_pto_application_stream_retransmits(
+        &mut self,
+        now: Instant,
+        pto_timeout: Duration,
+    ) -> Result<()> {
+        for packet in self
+            .handshake
+            .retransmit_pto_client_application_stream_packets(now, pto_timeout)?
+        {
+            self.socket
+                .send_to(packet.packet.as_ref(), self.peer_addr)
+                .await
+                .map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_loss_detection_timeout(&mut self) -> Result<()> {
+        let Some(timer) = self.handshake.loss_detection_timer() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < timer {
+            return Ok(());
+        }
+
+        let pto_timeout = self.handshake.application_pto_timeout();
+        match self.handshake.on_loss_detection_timeout(now) {
+            LossDetectionOutcome::Pto {
+                space: PacketNumberSpace::Application,
+            } => {
+                self.send_pto_application_stream_retransmits(now, pto_timeout)
+                    .await?;
+                self.send_scheduler.observe_loss();
+            }
+            LossDetectionOutcome::Loss {
+                space: PacketNumberSpace::Application,
+                ..
+            } => {
+                self.send_lost_application_stream_retransmits().await?;
+                self.send_scheduler.observe_loss();
+            }
+            LossDetectionOutcome::Pto { .. }
+            | LossDetectionOutcome::Loss { .. }
+            | LossDetectionOutcome::Idle => {}
         }
         Ok(())
     }

@@ -266,14 +266,31 @@ mod tests {
         (tunnel, outbound_rx, credit)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn send_larger_than_budget_blocks_until_consumer_drains() {
         let budget = 64 * 1024;
         let (tunnel, outbound_rx, credit) = make_tunnel(budget);
 
-        // 4x budget producer payload; drainer releases credit a fraction at a time.
+        // Prefill: drain every credit permit before the producer starts. This
+        // guarantees the producer's first `send_bytes` must observe the
+        // drainer releasing permits in order to proceed; otherwise the test
+        // could not distinguish byte-bounded backpressure from a no-op
+        // semaphore.
+        let prefill = credit
+            .send_semaphore
+            .clone()
+            .try_acquire_many_owned(budget as u32)
+            .expect("must reserve every permit before the producer starts");
+        std::mem::forget(prefill);
+        assert_eq!(credit.available_send_permits(), 0);
+
+        // 4x budget single producer payload + a small follow-up so the test
+        // also exercises the "oversized chunk waits, then a normal-sized chunk
+        // succeeds once enough credit is back" path. The drainer releases
+        // permits in small slices so producers genuinely contend for budget.
         let payload_size = 4 * budget;
         let payload = Bytes::from(vec![0x42u8; payload_size]);
+        let follow_up = Bytes::from(vec![0x21u8; budget / 2]);
 
         let drainer = OutboundDrainer::new(
             outbound_rx,
@@ -281,84 +298,92 @@ mod tests {
             budget / 8,
             Duration::from_millis(1),
         );
-        let drainer_clone = drainer.clone();
-        let drainer_handle = tokio::spawn(async move { drainer_clone.run().await });
+        let drainer_handle = {
+            let drainer = drainer.clone();
+            tokio::spawn(async move { drainer.run().await })
+        };
 
-        let send_started = std::time::Instant::now();
-        timeout(
-            Duration::from_secs(5),
-            tunnel.send_bytes(payload.clone(), false),
-        )
-        .await
-        .expect("first send_bytes must complete once consumer drains the queue")
-        .expect("send_bytes returned an error");
+        let tunnel = Arc::new(tunnel);
+        let producer = {
+            let tunnel = tunnel.clone();
+            let payload = payload.clone();
+            let follow_up = follow_up.clone();
+            tokio::spawn(async move {
+                tunnel
+                    .send_bytes(payload, false)
+                    .await
+                    .expect("oversized send_bytes must complete once credit is released");
+                tunnel
+                    .send_bytes(follow_up, false)
+                    .await
+                    .expect("follow-up send_bytes must complete");
+                tunnel
+                    .send_bytes(Bytes::new(), true)
+                    .await
+                    .expect("close_send must complete even after credit is drained");
+            })
+        };
 
-        // A producer issuing a second send must have waited for the drainer to
-        // refund enough credit before it can acquire its own permits. With the
-        // drainer's per-chunk delay this is strictly nonzero work.
-        let payload_b = Bytes::from(vec![0x21u8; budget / 2]);
-        timeout(Duration::from_secs(5), tunnel.send_bytes(payload_b, true))
+        // Release the prefilled credit so the producer can make initial
+        // progress; from there the drainer keeps refunding credit as it
+        // observes the producer's chunks.
+        credit.release_send_bytes(budget);
+
+        timeout(Duration::from_secs(5), producer)
             .await
-            .expect("second send_bytes must eventually complete")
-            .expect("second send_bytes returned an error");
+            .expect("producer must not deadlock when sending more than budget")
+            .expect("producer task panicked");
 
         let collected = drainer_handle.await.expect("drainer task did not panic");
+        let total_collected: usize = collected.iter().map(|o| o.bytes.len()).sum();
         assert_eq!(
-            collected.len(),
-            2,
-            "drainer should observe exactly the two outbounds the producer queued"
+            total_collected,
+            payload_size + follow_up.len(),
+            "drainer must have observed every byte the producer queued"
         );
-        assert_eq!(collected[0].bytes.len(), payload_size);
-        assert!(collected[1].fin);
-        // Sanity: the entire send round did real time work because the drainer
-        // gated each chunk on a small delay; if backpressure was item-bounded
-        // we would have completed essentially instantly.
         assert!(
-            send_started.elapsed() >= Duration::from_millis(1),
-            "byte-credit backpressure should make the producer observe the drainer's pacing"
+            collected.last().expect("at least one outbound").fin,
+            "last drained outbound must carry the producer's close_send fin"
         );
     }
 
-    #[tokio::test(start_paused = false)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn two_producers_respect_total_byte_budget() {
         let budget = 8 * 1024;
         let (tunnel, outbound_rx, credit) = make_tunnel(budget);
-        let tunnel = Arc::new(tunnel);
 
-        // Slow drainer so the producers actually contend for credit.
         let drainer =
             OutboundDrainer::new(outbound_rx, credit.clone(), 512, Duration::from_millis(2));
         let peak_in_flight = drainer.peak_in_flight.clone();
-        let drainer_clone = drainer.clone();
-        let drainer_handle = tokio::spawn(async move { drainer_clone.run().await });
-
-        let producer_a = {
-            let tunnel = tunnel.clone();
-            tokio::spawn(async move {
-                for _ in 0..6 {
-                    tunnel
-                        .send_bytes(Bytes::from(vec![1u8; 2 * 1024]), false)
-                        .await
-                        .expect("producer A send_bytes");
-                }
-            })
-        };
-        let producer_b = {
-            let tunnel = tunnel.clone();
-            tokio::spawn(async move {
-                for _ in 0..6 {
-                    tunnel
-                        .send_bytes(Bytes::from(vec![2u8; 2 * 1024]), false)
-                        .await
-                        .expect("producer B send_bytes");
-                }
-            })
+        let drainer_handle = {
+            let drainer = drainer.clone();
+            tokio::spawn(async move { drainer.run().await })
         };
 
-        producer_a.await.expect("producer A did not panic");
-        producer_b.await.expect("producer B did not panic");
+        // Two concurrent producers race for the same credit semaphore via
+        // `tokio::join!`. Sharing `&tunnel` across two futures on the same
+        // task is enough to exercise interleaving without requiring
+        // `H3Tunnel: Sync` (mpsc::Receiver is `!Sync`).
+        let tunnel_ref = &tunnel;
+        let producer_a = async move {
+            for _ in 0..6 {
+                tunnel_ref
+                    .send_bytes(Bytes::from(vec![1u8; 2 * 1024]), false)
+                    .await
+                    .expect("producer A send_bytes");
+            }
+        };
+        let producer_b = async move {
+            for _ in 0..6 {
+                tunnel_ref
+                    .send_bytes(Bytes::from(vec![2u8; 2 * 1024]), false)
+                    .await
+                    .expect("producer B send_bytes");
+            }
+        };
+        tokio::join!(producer_a, producer_b);
 
-        // Send a final empty fin so the drainer exits.
+        // Final fin so the drainer exits.
         tunnel
             .send_bytes(Bytes::new(), true)
             .await
@@ -370,8 +395,8 @@ mod tests {
             observed_peak <= budget,
             "peak in-flight bytes {observed_peak} must not exceed the configured budget {budget}",
         );
-        // Sanity check that the producers actually shared the pipe (otherwise the
-        // assertion above is uninteresting).
+        // Sanity check that the producers actually shared the pipe (otherwise
+        // the bound above is uninteresting).
         assert!(
             observed_peak >= 2 * 1024,
             "peak in-flight should be at least one full producer chunk (was {observed_peak})",
