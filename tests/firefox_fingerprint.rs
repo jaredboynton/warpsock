@@ -1,15 +1,46 @@
 //! Firefox-specific fingerprint validation tests.
 //!
-//! Validates Firefox 133 TLS, HTTP/2, and header fingerprints match expected values.
+//! Validates shared Firefox TLS, HTTP/2, and header fingerprints match expected values.
 
 use specter::fingerprint::http2::Http2Settings;
 use specter::fingerprint::profiles::FingerprintProfile;
 use specter::fingerprint::tls::TlsFingerprint;
 use specter::headers::{firefox_133_ajax_headers, firefox_133_form_headers, firefox_133_headers};
 
+const FIREFOX_PROFILES: &[FingerprintProfile] = &[
+    FingerprintProfile::Firefox133,
+    FingerprintProfile::Firefox134,
+    FingerprintProfile::Firefox135,
+    FingerprintProfile::Firefox136,
+    FingerprintProfile::Firefox137,
+    FingerprintProfile::Firefox138,
+    FingerprintProfile::Firefox139,
+    FingerprintProfile::Firefox140,
+    FingerprintProfile::Firefox141,
+    FingerprintProfile::Firefox142,
+    FingerprintProfile::Firefox143,
+    FingerprintProfile::Firefox144,
+    FingerprintProfile::Firefox145,
+    FingerprintProfile::Firefox146,
+    FingerprintProfile::Firefox147,
+    FingerprintProfile::Firefox148,
+    FingerprintProfile::Firefox149,
+    FingerprintProfile::Firefox150,
+    FingerprintProfile::Firefox151,
+    FingerprintProfile::FirefoxEsr115,
+    FingerprintProfile::FirefoxEsr128,
+    FingerprintProfile::FirefoxEsr140,
+];
+
 #[test]
 fn test_firefox_tls_fingerprint_constants() {
-    let fp = TlsFingerprint::firefox_133();
+    let fp = TlsFingerprint::firefox();
+
+    assert_eq!(
+        fp,
+        TlsFingerprint::firefox_133(),
+        "Firefox 133 constructor remains a compatibility alias"
+    );
 
     // Firefox does NOT use GREASE
     assert!(!fp.grease, "Firefox should NOT use GREASE");
@@ -29,6 +60,21 @@ fn test_firefox_tls_fingerprint_constants() {
     // Verify signature algorithms
     assert!(!fp.sigalgs.is_empty());
     assert_eq!(fp.sigalgs[0], "ecdsa_secp256r1_sha256");
+}
+
+#[test]
+fn test_all_firefox_profiles_use_shared_firefox_transport_invariants() {
+    for profile in FIREFOX_PROFILES {
+        let tls = profile.tls_fingerprint();
+        assert_eq!(tls, TlsFingerprint::firefox(), "{profile:?} TLS");
+        assert!(!tls.grease, "{profile:?} should not use GREASE");
+        assert_eq!(tls.cert_compression, specter::fingerprint::tls::CertCompression::None);
+        assert!(!tls.enable_kyber, "{profile:?} should not enable Kyber");
+
+        let h2 = profile.http2_settings();
+        assert_eq!(h2, Http2Settings::firefox(), "{profile:?} H2");
+        assert_eq!(profile.http2_pseudo_order().akamai_string(), "m,p,a,s");
+    }
 }
 
 #[test]
@@ -129,7 +175,7 @@ fn test_firefox_http2_pseudo_header_order() {
 #[test]
 fn test_firefox_vs_chrome_differences() {
     let chrome_fp = TlsFingerprint::chrome_142();
-    let firefox_fp = TlsFingerprint::firefox_133();
+    let firefox_fp = TlsFingerprint::firefox();
 
     // GREASE difference
     assert!(chrome_fp.grease, "Chrome should use GREASE");
