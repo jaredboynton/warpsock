@@ -1380,7 +1380,11 @@ impl NativeQuicServerHandshake {
     }
 
     pub fn open_client_application_packet(&mut self, packet: &[u8]) -> Result<Vec<QuicFrame>> {
-        if self.close_draining {
+        // RFC9000 § 10.2: stop parsing inbound packets once we have entered
+        // the draining phase. Closing-phase parsing is preserved so the
+        // server can take the MAY-optimisation path (§ 10.2: closing -> draining
+        // once the peer's CONNECTION_CLOSE is observed).
+        if self.close_state.is_draining() {
             return Ok(Vec::new());
         }
         let Some(client_application_keys) = self.client_application_keys.as_ref() else {
@@ -1564,7 +1568,11 @@ impl NativeQuicServerHandshake {
     }
 
     pub fn open_client_h3_event_packet(&mut self, packet: &[u8]) -> Result<Vec<ClientH3Event>> {
-        if self.close_draining {
+        // RFC9000 § 10.2: once we are in the draining phase we MUST NOT
+        // process any further inbound packets. While in the closing phase
+        // we still parse incoming packets so we can take the MAY-optimisation
+        // path and transition to draining when the peer also closes.
+        if self.close_state.is_draining() {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
@@ -3568,7 +3576,12 @@ impl NativeQuicHandshake {
     }
 
     pub fn open_server_h3_event_packet(&mut self, packet: &[u8]) -> Result<Vec<ServerH3Event>> {
-        if self.close_draining {
+        // RFC9000 § 10.2: once we are draining we MUST drop inbound packets.
+        // Closing-phase parsing remains active so the MAY optimisation in
+        // § 10.2 ("transition from closing to draining if you can confirm
+        // the peer is also closing") fires when the peer sends us a
+        // CONNECTION_CLOSE in response to ours.
+        if self.close_state.is_draining() {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
