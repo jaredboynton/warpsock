@@ -1,5 +1,6 @@
 //! Native QUIC/TLS helpers for HTTP/3.
 
+use std::ffi::c_void;
 use std::io::Read;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,6 +26,14 @@ use crate::transport::h3::quic::{
     encode_transport_parameters_with_initial_source_connection_id, ConnectionId, LongHeaderPacket,
     LongHeaderType, QuicPacketKeyMaterial,
 };
+
+unsafe extern "C" {
+    fn SSL_get_peer_quic_transport_params(
+        ssl: *const c_void,
+        out_params: *mut *const u8,
+        out_params_len: *mut usize,
+    );
+}
 
 const QUIC_VERSION_1: u32 = 1;
 const CLIENT_INITIAL_PACKET_NUMBER: u64 = 0;
@@ -142,6 +151,26 @@ impl NativeQuicTlsSession {
         Ok(session)
     }
 
+    pub fn server_with_transport_parameter_connection_ids(
+        fingerprint: &Http3Fingerprint,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        original_destination_connection_id: &ConnectionId,
+        initial_source_connection_id: &ConnectionId,
+        retry_source_connection_id: Option<&ConnectionId>,
+    ) -> Result<Self> {
+        let mut session = Self::new_server(
+            fingerprint,
+            cert_pem,
+            key_pem,
+            Some(original_destination_connection_id),
+            Some(initial_source_connection_id),
+            retry_source_connection_id,
+        )?;
+        session.drive_handshake("QUIC server handshake")?;
+        Ok(session)
+    }
+
     pub fn client_with_tls_fingerprint(
         server_name: &str,
         fingerprint: &Http3Fingerprint,
@@ -252,6 +281,23 @@ impl NativeQuicTlsSession {
 
     pub fn transport_parameters(&self) -> &Bytes {
         &self.transport_parameters
+    }
+
+    pub fn peer_transport_parameters(&self) -> Bytes {
+        let mut params = std::ptr::null();
+        let mut params_len = 0usize;
+        unsafe {
+            SSL_get_peer_quic_transport_params(
+                self.ssl.as_ptr().cast_const().cast(),
+                &mut params,
+                &mut params_len,
+            );
+            if params.is_null() || params_len == 0 {
+                Bytes::new()
+            } else {
+                Bytes::copy_from_slice(std::slice::from_raw_parts(params, params_len))
+            }
+        }
     }
 
     fn new_client(
