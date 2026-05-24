@@ -10,7 +10,7 @@ Node.js bindings for Specter, a high-performance async HTTP client with TLS, HTT
 - Cookie store and shared cookie jar support across HTTP and WebSocket handshakes
 - Granular connect, TTFB, read/write idle, total, pool, and WebSocket handshake timeouts
 
-Supported Chrome profiles are `FingerprintProfile.Chrome142` through `FingerprintProfile.Chrome148`; examples use `Chrome148`, the latest implemented profile.
+Supported Chrome profiles are `FingerprintProfile.Chrome142` through `FingerprintProfile.Chrome148`. Supported Firefox profiles are `FingerprintProfile.Firefox133` through `FingerprintProfile.Firefox151`, plus ESR branches `FirefoxEsr115`, `FirefoxEsr128`, and `FirefoxEsr140`; examples use `Chrome148`, the latest implemented Chrome profile.
 
 ## Installation
 

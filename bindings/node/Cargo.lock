@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "specter-node"
-version = "3.2.0"
+version = "4.0.0"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "specters"
-version = "3.2.0"
+version = "4.0.0"
 dependencies = [
  "atomic-waker",
  "base64",

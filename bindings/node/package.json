@@ -1,7 +1,7 @@
 {
   "name": "specters",
-  "version": "3.2.0",
-  "description": "Node.js bindings for Specter, a Chrome-accurate HTTP client with TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSocket fingerprinting. Improved TTFT/TPS over reqwest for LLM providers.",
+  "version": "4.0.0",
+  "description": "Node.js bindings for Specter, a browser-fingerprint HTTP client with TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSocket support.",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
@@ -35,10 +35,10 @@
     ]
   },
   "optionalDependencies": {
-    "specters-darwin-x64": "3.2.0",
-    "specters-darwin-arm64": "3.2.0",
-    "specters-linux-x64-gnu": "3.2.0",
-    "specters-linux-arm64-gnu": "3.2.0"
+    "specters-darwin-x64": "4.0.0",
+    "specters-darwin-arm64": "4.0.0",
+    "specters-linux-x64-gnu": "4.0.0",
+    "specters-linux-arm64-gnu": "4.0.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.2",
