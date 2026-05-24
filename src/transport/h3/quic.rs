@@ -547,6 +547,11 @@ struct AckRange {
     end: u64,
 }
 
+/// RFC9002 § 5.3 initial smoothed RTT used when no samples have been taken yet.
+pub const INITIAL_RTT: Duration = Duration::from_millis(333);
+/// RFC9002 § 6.1.2 loss detection timer granularity floor.
+pub const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicLossDetector {
     sent: BTreeSet<u64>,
@@ -556,6 +561,22 @@ pub struct QuicLossDetector {
     ecn_counts: Option<EcnCounters>,
     ecn_validation_failed: bool,
     ecn_ce_marked_packets: u64,
+    largest_sent: Option<u64>,
+    largest_acked: Option<u64>,
+    /// RFC9002 § 5.1 latest_rtt observed for the most recent acknowledgement
+    /// that newly acknowledged the largest packet number.
+    latest_rtt: Option<Duration>,
+    /// RFC9002 § 5.2 smoothed_rtt, updated using the standard 7/8 + 1/8 EWMA.
+    smoothed_rtt: Option<Duration>,
+    /// RFC9002 § 5.3 rttvar, the variation in the RTT samples.
+    rttvar: Duration,
+    /// RFC9002 § 5.2 min_rtt, the smallest RTT sample observed.
+    min_rtt: Option<Duration>,
+    /// RFC9002 § 6.2.1: peer's ack_delay_exponent for decoding ACK ack_delay
+    /// fields prior to subtraction from latest_rtt.
+    peer_ack_delay_exponent: u64,
+    /// RFC9002 § 6.2.1 max_ack_delay used when computing the PTO duration.
+    max_ack_delay: Duration,
 }
 
 impl Default for QuicLossDetector {
@@ -568,6 +589,14 @@ impl Default for QuicLossDetector {
             ecn_counts: None,
             ecn_validation_failed: false,
             ecn_ce_marked_packets: 0,
+            largest_sent: None,
+            largest_acked: None,
+            latest_rtt: None,
+            smoothed_rtt: None,
+            rttvar: Duration::ZERO,
+            min_rtt: None,
+            peer_ack_delay_exponent: 0,
+            max_ack_delay: Duration::from_millis(25),
         }
     }
 }
