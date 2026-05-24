@@ -149,6 +149,44 @@ fn native_h3_driver_schedules_timer_driven_delayed_application_acks() {
 }
 
 #[test]
+fn native_mock_h3_server_schedules_timer_driven_delayed_application_acks() {
+    let mock_server = std::fs::read_to_string("tests/helpers/mock_h3_server.rs")
+        .expect("native mock H3 server source");
+
+    assert!(
+        mock_server.contains("server_application_ack_deadline"),
+        "native mock H3 server must derive a delayed ACK deadline from max_ack_delay_ms"
+    );
+    assert!(
+        mock_server.contains("send_delayed_application_ack().await?"),
+        "native mock H3 server must wake on the delayed ACK timer below ack_eliciting_threshold"
+    );
+    assert!(
+        mock_server.contains("build_server_application_ack_packet_after_or_delay"),
+        "native mock H3 server must use threshold-or-delay ACK emission instead of immediate ACKs"
+    );
+}
+
+#[test]
+fn native_h3_same_fixture_schedules_timer_driven_delayed_application_acks() {
+    let fixture = std::fs::read_to_string("benches/native_h3_vs_rust_clients/src/main.rs")
+        .expect("native H3 same-fixture benchmark source");
+
+    assert!(
+        fixture.contains("server_application_ack_deadline"),
+        "native H3 same-fixture server must derive a delayed ACK deadline from max_ack_delay_ms"
+    );
+    assert!(
+        fixture.contains("send_delayed_application_ack().await?"),
+        "native H3 same-fixture server must wake on the delayed ACK timer below ack_eliciting_threshold"
+    );
+    assert!(
+        fixture.contains("build_server_application_ack_packet_after_or_delay"),
+        "native H3 same-fixture server must use threshold-or-delay ACK emission instead of immediate ACKs"
+    );
+}
+
+#[test]
 fn native_mock_h3_server_schedules_lost_application_stream_retransmits() {
     let mock_server = std::fs::read_to_string("tests/helpers/mock_h3_server.rs")
         .expect("native mock H3 server source");
