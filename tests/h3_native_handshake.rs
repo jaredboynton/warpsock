@@ -2584,6 +2584,54 @@ fn native_h3_server_retransmits_unacked_initial_and_handshake_crypto_after_pto()
     ));
 }
 
+#[test]
+fn native_h3_client_initial_ack_retires_pto_retransmission() {
+    let fingerprint = Http3Fingerprint::chrome();
+    let client_destination_cid = ConnectionId::from_static(b"server-dcid");
+    let client_source_cid = ConnectionId::from_static(b"client-scid");
+    let mut client = NativeQuicHandshake::client_with_verify_peer(
+        "localhost",
+        &fingerprint,
+        client_destination_cid.clone(),
+        client_source_cid.clone(),
+        false,
+    )
+    .unwrap();
+    let (cert_pem, key_pem) = helpers::tls::cached_cert_and_key_pem();
+    let mut server = NativeQuicServerHandshake::new(
+        &fingerprint,
+        &cert_pem,
+        &key_pem,
+        client_destination_cid,
+        client_source_cid,
+        ConnectionId::from_static(b"native-server-cid"),
+    )
+    .unwrap();
+    client.record_client_initial_sent_at(Instant::now() - Duration::from_secs(1));
+    server
+        .process_client_initial(client.client_initial().packet.as_ref())
+        .unwrap();
+    let ack = server
+        .build_server_initial_ack_packet()
+        .unwrap()
+        .expect("server must ACK the client Initial");
+
+    client.process_server_datagram(ack.packet.as_ref()).unwrap();
+
+    assert_eq!(
+        client
+            .retransmit_pto_client_initial_crypto_packets(Instant::now(), Duration::ZERO)
+            .unwrap(),
+        Vec::new(),
+        "ACKed client Initial CRYPTO must not be retransmitted on PTO"
+    );
+    assert_eq!(
+        client.recovery().congestion().bytes_in_flight(),
+        0,
+        "Initial ACK must release recovery bytes-in-flight"
+    );
+}
+
 #[tokio::test]
 async fn native_h3_backend_sends_client_initial_datagram_before_timeout() {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
