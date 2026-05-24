@@ -553,11 +553,7 @@ fn decode_ack_delay(ack_delay: u64, ack_delay_exponent: u64) -> Duration {
 }
 
 fn duration_abs_diff(a: Duration, b: Duration) -> Duration {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
+    a.abs_diff(b)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -991,17 +987,12 @@ impl QuicLossDetector {
 /// `Closing` phase after sending a CONNECTION_CLOSE frame and the `Draining`
 /// phase after receiving one from the peer. Both terminate after a 3*PTO
 /// window expires, at which point the connection state is discarded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuicClosePhase {
+    #[default]
     Open,
     Closing,
     Draining,
-}
-
-impl Default for QuicClosePhase {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 /// RFC9000 § 10.2 close-state machine. Tracks the active close phase, the
@@ -1102,8 +1093,7 @@ impl QuicCloseState {
     /// Returns the new packet counter so callers can log or assert progress.
     pub fn observe_inbound_packet(&mut self) -> u64 {
         if matches!(self.phase, QuicClosePhase::Closing) {
-            self.packets_since_last_replay =
-                self.packets_since_last_replay.saturating_add(1);
+            self.packets_since_last_replay = self.packets_since_last_replay.saturating_add(1);
         }
         self.packets_since_last_replay
     }
@@ -1206,6 +1196,30 @@ pub fn derive_packet_key_material_from_secret(secret: Bytes) -> Result<QuicPacke
         iv: hkdf_expand_label_sha256(&secret, b"quic iv", AES_128_GCM_IV_LEN)?,
         header_protection_key: hkdf_expand_label_sha256(&secret, b"quic hp", AES_128_GCM_KEY_LEN)?,
         secret,
+    })
+}
+
+/// Derive the next 1-RTT traffic secret per RFC9001 § 6.1 using the `quic ku`
+/// HKDF-Expand-Label step. Input is the current application traffic secret;
+/// output is the secret used to protect packets after the next key update.
+pub fn derive_next_application_secret(secret: &[u8]) -> Result<Bytes> {
+    hkdf_expand_label_sha256(secret, b"quic ku", INITIAL_SECRET_LEN)
+}
+
+/// Derive the packet protection keys for the next key phase per RFC9001 § 6.1.
+///
+/// The packet key and IV rotate from a freshly derived traffic secret; the
+/// header protection key is intentionally preserved from the current phase
+/// per RFC9001 § 6.1 ("Header protection keys are not updated.").
+pub fn derive_next_packet_key_material(
+    current: &QuicPacketKeyMaterial,
+) -> Result<QuicPacketKeyMaterial> {
+    let next_secret = derive_next_application_secret(&current.secret)?;
+    Ok(QuicPacketKeyMaterial {
+        packet_key: hkdf_expand_label_sha256(&next_secret, b"quic key", AES_128_GCM_KEY_LEN)?,
+        iv: hkdf_expand_label_sha256(&next_secret, b"quic iv", AES_128_GCM_IV_LEN)?,
+        header_protection_key: current.header_protection_key.clone(),
+        secret: next_secret,
     })
 }
 
@@ -2302,7 +2316,7 @@ pub fn decode_version_negotiation_packet(bytes: &[u8]) -> Result<VersionNegotiat
             "QUIC Version Negotiation packet has no versions".into(),
         ));
     }
-    if input.remaining() % 4 != 0 {
+    if !input.remaining().is_multiple_of(4) {
         return Err(Error::HttpProtocol(
             "truncated QUIC Version Negotiation supported version list".into(),
         ));
@@ -2982,10 +2996,12 @@ mod close_state_tests {
     fn loss_detector_uses_initial_rtt_when_no_samples_have_been_taken() {
         let detector = QuicLossDetector::default().with_max_ack_delay(Duration::from_millis(25));
         let pto = detector.current_pto();
-        let expected_variance =
-            (INITIAL_RTT / 2).saturating_mul(4).max(TIMER_GRANULARITY);
+        let expected_variance = (INITIAL_RTT / 2).saturating_mul(4).max(TIMER_GRANULARITY);
         let expected = INITIAL_RTT + expected_variance + Duration::from_millis(25);
-        assert_eq!(pto, expected, "initial PTO must follow RFC9002 6.2.1 defaults");
+        assert_eq!(
+            pto, expected,
+            "initial PTO must follow RFC9002 6.2.1 defaults"
+        );
         assert_eq!(detector.close_window(), expected * 3);
         assert!(detector.smoothed_rtt().is_none());
     }
@@ -3017,8 +3033,9 @@ mod close_state_tests {
         assert_eq!(rttvar, expected_adjusted / 2);
 
         let pto = detector.current_pto();
-        let expected_pto =
-            smoothed + (rttvar.saturating_mul(4)).max(TIMER_GRANULARITY) + Duration::from_millis(25);
+        let expected_pto = smoothed
+            + (rttvar.saturating_mul(4)).max(TIMER_GRANULARITY)
+            + Duration::from_millis(25);
         assert_eq!(pto, expected_pto);
     }
 

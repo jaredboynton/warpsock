@@ -149,11 +149,7 @@ impl RttEstimator {
 
         match (self.smoothed_rtt, self.rttvar) {
             (Some(srtt), Some(rttvar)) => {
-                let diff = if srtt > adjusted_rtt {
-                    srtt - adjusted_rtt
-                } else {
-                    adjusted_rtt - srtt
-                };
+                let diff = srtt.abs_diff(adjusted_rtt);
                 let new_rttvar = (rttvar * 3 + diff) / 4;
                 let new_srtt = (srtt * 7 + adjusted_rtt) / 8;
                 self.rttvar = Some(new_rttvar);
@@ -320,9 +316,7 @@ impl CongestionController {
     }
 
     fn on_persistent_congestion(&mut self) {
-        self.cwnd = self
-            .max_datagram_size
-            .saturating_mul(K_MIN_CWND_PACKETS);
+        self.cwnd = self.max_datagram_size.saturating_mul(K_MIN_CWND_PACKETS);
         self.congestion_recovery_start_time = None;
     }
 }
@@ -543,17 +537,16 @@ impl RecoveryState {
         };
 
         let mut acked: Vec<(u64, SentPacketInfo)> = Vec::new();
-        let mut smallest = self.consume_range(space, largest_acknowledged, first_ack_range, &mut acked);
+        let mut smallest =
+            self.consume_range(space, largest_acknowledged, first_ack_range, &mut acked);
         for range in ranges {
             let gap = range.gap.saturating_add(2);
             let Some(anchor) = smallest else { break };
-            let Some(largest_in_range) = anchor.checked_sub(gap) else { break };
-            smallest = self.consume_range(
-                space,
-                largest_in_range,
-                range.ack_range_length,
-                &mut acked,
-            );
+            let Some(largest_in_range) = anchor.checked_sub(gap) else {
+                break;
+            };
+            smallest =
+                self.consume_range(space, largest_in_range, range.ack_range_length, &mut acked);
         }
 
         if acked.is_empty() {
@@ -573,7 +566,8 @@ impl RecoveryState {
             if info.ack_eliciting {
                 let latest_rtt = now.saturating_duration_since(info.sent_at);
                 let shift = ack_delay_exponent.min(62) as u32;
-                let scaled_delay_us = ack_delay.saturating_mul(1u64.checked_shl(shift).unwrap_or(0));
+                let scaled_delay_us =
+                    ack_delay.saturating_mul(1u64.checked_shl(shift).unwrap_or(0));
                 let ack_delay_duration = Duration::from_micros(scaled_delay_us);
                 self.rtt
                     .update(latest_rtt, ack_delay_duration, self.handshake_complete, now);
@@ -719,9 +713,7 @@ impl RecoveryState {
         if ack_eliciting_in_flight.len() < 2 {
             return;
         }
-        let pc_duration = (self.rtt.smoothed_rtt()
-            + self.rtt.rttvar() * 4
-            + self.max_ack_delay)
+        let pc_duration = (self.rtt.smoothed_rtt() + self.rtt.rttvar() * 4 + self.max_ack_delay)
             * self.persistent_congestion_threshold;
         let first = ack_eliciting_in_flight.first().unwrap();
         let last = ack_eliciting_in_flight.last().unwrap();
@@ -777,8 +769,8 @@ impl RecoveryState {
                 if !self.handshake_complete {
                     continue;
                 }
-                space_duration = space_duration
-                    .saturating_add(self.max_ack_delay.saturating_mul(backoff));
+                space_duration =
+                    space_duration.saturating_add(self.max_ack_delay.saturating_mul(backoff));
             }
             let Some(last) = pkt_space.time_of_last_ack_eliciting_packet else {
                 continue;
@@ -861,12 +853,7 @@ mod tests {
     fn rtt_estimator_first_sample_initialises_smoothed_and_var() {
         let mut rtt = RttEstimator::new(Duration::from_millis(25));
         let now = Instant::now();
-        rtt.update(
-            Duration::from_millis(80),
-            Duration::ZERO,
-            false,
-            now,
-        );
+        rtt.update(Duration::from_millis(80), Duration::ZERO, false, now);
         assert_eq!(rtt.smoothed_rtt(), Duration::from_millis(80));
         assert_eq!(rtt.rttvar(), Duration::from_millis(40));
         assert_eq!(rtt.latest_rtt(), Some(Duration::from_millis(80)));
@@ -891,12 +878,7 @@ mod tests {
     fn rtt_estimator_subtracts_ack_delay_when_within_min_rtt() {
         let mut rtt = RttEstimator::new(Duration::from_millis(20));
         let now = Instant::now();
-        rtt.update(
-            Duration::from_millis(50),
-            Duration::ZERO,
-            false,
-            now,
-        );
+        rtt.update(Duration::from_millis(50), Duration::ZERO, false, now);
         rtt.update(
             Duration::from_millis(70),
             Duration::from_millis(15),
@@ -912,11 +894,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         let now = Instant::now();
         let sent_at = now - Duration::from_millis(75);
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(sent_at, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(sent_at, 1200));
         let frame = ack_frame(1, 0);
         let outcome = recovery
             .on_ack_received(PacketNumberSpace::Application, &frame, 3, now)
@@ -957,11 +935,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         let now = Instant::now();
         for pn in 1..=4u64 {
-            recovery.on_packet_sent(
-                PacketNumberSpace::Application,
-                pn,
-                meta(now, 1200),
-            );
+            recovery.on_packet_sent(PacketNumberSpace::Application, pn, meta(now, 1200));
         }
         let frame = ack_frame(4, 0);
         let outcome = recovery
@@ -980,11 +954,7 @@ mod tests {
     fn recovery_time_threshold_marks_old_packet_lost_after_loss_delay() {
         let mut recovery = RecoveryState::default();
         let base = Instant::now();
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(base, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(base, 1200));
         recovery.on_packet_sent(
             PacketNumberSpace::Application,
             2,
@@ -1005,11 +975,7 @@ mod tests {
         let now = Instant::now();
         recovery.set_peer_completed_address_validation(true);
         recovery.mark_handshake_complete();
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(now, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(now, 1200));
         let timer = recovery.loss_detection_timer().expect("timer armed");
         let pto = recovery.current_pto() + recovery.max_ack_delay();
         let expected = now + pto;
@@ -1027,11 +993,7 @@ mod tests {
         let now = Instant::now();
         recovery.set_peer_completed_address_validation(true);
         recovery.mark_handshake_complete();
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(now, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(now, 1200));
         assert_eq!(recovery.pto_count(), 0);
         let outcome = recovery.on_loss_detection_timeout(now);
         match outcome {
@@ -1049,21 +1011,18 @@ mod tests {
         let now = Instant::now();
         recovery.set_peer_completed_address_validation(true);
         recovery.mark_handshake_complete();
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(now, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(now, 1200));
         let _ = recovery.on_loss_detection_timeout(now);
         assert_eq!(recovery.pto_count(), 1);
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            2,
-            meta(now, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 2, meta(now, 1200));
         let frame = ack_frame(2, 0);
         let _ = recovery
-            .on_ack_received(PacketNumberSpace::Application, &frame, 3, now + Duration::from_millis(50))
+            .on_ack_received(
+                PacketNumberSpace::Application,
+                &frame,
+                3,
+                now + Duration::from_millis(50),
+            )
             .expect("ack");
         assert_eq!(recovery.pto_count(), 0);
     }
@@ -1073,10 +1032,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         recovery.set_peer_completed_address_validation(false);
         recovery.set_has_handshake_keys(false);
-        let space = recovery
-            .pto_time_and_space()
-            .expect("anti-deadlock pto")
-            .0;
+        let space = recovery.pto_time_and_space().expect("anti-deadlock pto").0;
         assert_eq!(space, PacketNumberSpace::Initial);
     }
 
@@ -1085,10 +1041,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         recovery.set_peer_completed_address_validation(false);
         recovery.set_has_handshake_keys(true);
-        let space = recovery
-            .pto_time_and_space()
-            .expect("anti-deadlock pto")
-            .0;
+        let space = recovery.pto_time_and_space().expect("anti-deadlock pto").0;
         assert_eq!(space, PacketNumberSpace::Handshake);
     }
 
@@ -1097,11 +1050,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         let now = Instant::now();
         recovery.set_has_handshake_keys(true);
-        recovery.on_packet_sent(
-            PacketNumberSpace::Initial,
-            1,
-            meta(now, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Initial, 1, meta(now, 1200));
         recovery.on_packet_sent(
             PacketNumberSpace::Handshake,
             1,
@@ -1115,16 +1064,8 @@ mod tests {
     fn recovery_discard_space_resets_bytes_in_flight_and_pto_count() {
         let mut recovery = RecoveryState::default();
         let now = Instant::now();
-        recovery.on_packet_sent(
-            PacketNumberSpace::Initial,
-            1,
-            meta(now, 1200),
-        );
-        recovery.on_packet_sent(
-            PacketNumberSpace::Initial,
-            2,
-            meta(now, 800),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Initial, 1, meta(now, 1200));
+        recovery.on_packet_sent(PacketNumberSpace::Initial, 2, meta(now, 800));
         let _ = recovery.on_loss_detection_timeout(now);
         recovery.discard_space(PacketNumberSpace::Initial);
         assert_eq!(recovery.pto_count(), 0);
@@ -1155,22 +1096,13 @@ mod tests {
                 now - Duration::from_millis(40),
             )
             .expect("ack");
-        let pc_unit = recovery.rtt().smoothed_rtt()
-            + recovery.rtt().rttvar() * 4
-            + recovery.max_ack_delay();
-        let span = pc_unit * K_PERSISTENT_CONGESTION_THRESHOLD as u32 + Duration::from_millis(10);
+        let pc_unit =
+            recovery.rtt().smoothed_rtt() + recovery.rtt().rttvar() * 4 + recovery.max_ack_delay();
+        let span = pc_unit * K_PERSISTENT_CONGESTION_THRESHOLD + Duration::from_millis(10);
         let first_sent = now;
         let last_sent = first_sent + span;
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            1,
-            meta(first_sent, 1200),
-        );
-        recovery.on_packet_sent(
-            PacketNumberSpace::Application,
-            2,
-            meta(last_sent, 1200),
-        );
+        recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(first_sent, 1200));
+        recovery.on_packet_sent(PacketNumberSpace::Application, 2, meta(last_sent, 1200));
         recovery.on_packet_sent(
             PacketNumberSpace::Application,
             5,

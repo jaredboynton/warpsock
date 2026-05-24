@@ -3,18 +3,21 @@
 mod body;
 mod command;
 mod connection;
+mod dispatcher;
 mod handle;
 pub mod handshake;
 pub mod native;
 pub mod native_driver;
 pub mod quic;
 pub mod recovery;
+pub mod session_cache;
 pub mod tls;
 mod tunnel;
 
 pub(crate) use body::{H3Body, H3BodyTimeouts, DEFAULT_H3_BODY_SLOT_CAPACITY};
 pub use command::DriverCommand;
 pub use connection::H3Connection;
+pub(crate) use dispatcher::H3Dispatcher;
 pub use handle::H3Handle;
 pub(crate) use tunnel::H3TunnelCredit;
 pub use tunnel::{H3Tunnel, H3TunnelEvent, H3TunnelOutbound};
@@ -40,6 +43,7 @@ pub const MIN_H3_TUNNEL_OUTBOUND_BYTE_BUDGET: usize = 1024;
 
 use crate::error::{Error, Result};
 use crate::fingerprint::{Http3Fingerprint, TlsFingerprint};
+use crate::pool::multiplexer::OriginKey;
 use crate::request::RequestBody;
 use crate::response::Response;
 use crate::transport::dns::DnsConfig;
@@ -95,6 +99,18 @@ struct H3PoolKey {
     fingerprint: String,
 }
 
+impl H3PoolKey {
+    /// Origin coordinate used by the pool-level `OriginFairQueue` to
+    /// rotate slow-path admission between distinct authorities.
+    fn origin_key(&self) -> OriginKey {
+        OriginKey {
+            host: self.host.clone(),
+            port: self.port,
+            is_https: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct H3HotHandle {
     url: String,
@@ -115,6 +131,10 @@ pub struct H3Client {
     dns_config: DnsConfig,
     pool: Arc<RwLock<HashMap<H3PoolKey, H3Handle>>>,
     hot_handle: Arc<StdRwLock<Option<H3HotHandle>>>,
+    /// Origin-fair admission for slow-path requests. Shared across clones
+    /// so concurrent requests through the same `H3Client` rotate origins
+    /// when they would otherwise pile up behind a single connecting host.
+    dispatcher: Arc<H3Dispatcher>,
     /// Counter incremented every time a request resolves to an existing
     /// healthy pooled H3Handle. Shared with the parent `Client` so the
     /// public reuse-count surface aggregates H1/H2/H3 hits.
@@ -141,6 +161,7 @@ impl H3Client {
             dns_config: DnsConfig::new(),
             pool: Arc::new(RwLock::new(HashMap::new())),
             hot_handle: Arc::new(StdRwLock::new(None)),
+            dispatcher: H3Dispatcher::new(),
             pool_reuse_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -158,6 +179,7 @@ impl H3Client {
             dns_config: DnsConfig::new(),
             pool: Arc::new(RwLock::new(HashMap::new())),
             hot_handle: Arc::new(StdRwLock::new(None)),
+            dispatcher: H3Dispatcher::new(),
             pool_reuse_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -486,6 +508,8 @@ impl H3Client {
                 return Ok(handle);
             }
         }
+
+        let _ticket = self.dispatcher.acquire(key.origin_key()).await;
 
         let mut pool = self.pool.write().await;
         if let Some(handle) = pool.get(&key).cloned() {

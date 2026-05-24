@@ -61,10 +61,6 @@ impl H3TunnelCredit {
         self.released_recv_bytes.swap(0, Ordering::Relaxed)
     }
 
-    pub(crate) fn send_budget(&self) -> usize {
-        self.send_budget
-    }
-
     pub(crate) fn release_send_bytes(&self, bytes: usize) {
         if bytes == 0 {
             return;
@@ -73,6 +69,7 @@ impl H3TunnelCredit {
         self.send_semaphore.add_permits(capped);
     }
 
+    #[cfg(test)]
     pub(crate) fn available_send_permits(&self) -> usize {
         self.send_semaphore.available_permits()
     }
@@ -120,9 +117,7 @@ impl H3Tunnel {
                     .send_semaphore
                     .acquire_many(to_acquire as u32)
                     .await
-                    .map_err(|_| {
-                        Error::HttpProtocol("H3 tunnel outbound credit closed".into())
-                    })?;
+                    .map_err(|_| Error::HttpProtocol("H3 tunnel outbound credit closed".into()))?;
                 permit.forget();
             }
         }
