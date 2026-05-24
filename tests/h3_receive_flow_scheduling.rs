@@ -10,6 +10,45 @@ fn native_h3_driver_schedules_receive_flow_control_updates() {
 }
 
 #[test]
+fn native_h3_driver_defers_receive_credit_while_streaming_bodies_are_backpressured() {
+    let driver =
+        std::fs::read_to_string("src/transport/h3/native_driver.rs").expect("native driver source");
+    let process_datagram = driver
+        .split("async fn process_datagram")
+        .nth(1)
+        .expect("driver must have process_datagram")
+        .split("fn apply_h3_event")
+        .next()
+        .expect("process_datagram section");
+    let event_index = process_datagram
+        .find("for event in events")
+        .expect("process_datagram must apply H3 events");
+    let update_index = process_datagram
+        .find("send_receive_flow_control_updates().await?")
+        .expect("process_datagram must flush receive-window updates");
+
+    assert!(
+        event_index < update_index,
+        "native H3 driver must apply response DATA to bounded body queues before advertising more receive credit"
+    );
+    assert!(
+        process_datagram.contains("if !self.streaming_response_body_backpressured()"),
+        "native H3 driver must not advertise more receive credit while every streaming body is backpressured"
+    );
+    assert!(
+        driver
+            .split("_ = self.body_progress_notify.notified() =>")
+            .nth(1)
+            .expect("body progress branch")
+            .split('}')
+            .next()
+            .expect("body progress branch body")
+            .contains("send_receive_flow_control_updates().await?"),
+        "body progress must retry deferred receive-credit updates when user reads open body capacity"
+    );
+}
+
+#[test]
 fn native_mock_h3_server_schedules_receive_flow_control_updates() {
     let mock_server = std::fs::read_to_string("tests/helpers/mock_h3_server.rs")
         .expect("native mock H3 server source");

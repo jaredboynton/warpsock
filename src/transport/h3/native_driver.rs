@@ -711,6 +711,9 @@ impl NativeH3Driver {
                     self.cancel_closed_streaming_bodies().await?;
                     self.flush_request_stream_bodies().await?;
                     self.flush_streaming_responses();
+                    if !self.streaming_response_body_backpressured() {
+                        self.send_receive_flow_control_updates().await?;
+                    }
                 }
             }
         }
@@ -1286,7 +1289,6 @@ impl NativeH3Driver {
                 .await
                 .map_err(Error::Io)?;
         }
-        self.send_receive_flow_control_updates().await?;
         self.send_lost_application_stream_retransmits().await?;
         for event in events {
             match event {
@@ -1301,6 +1303,10 @@ impl NativeH3Driver {
             }
         }
         self.cancel_closed_streaming_bodies().await?;
+        self.flush_streaming_responses();
+        if !self.streaming_response_body_backpressured() {
+            self.send_receive_flow_control_updates().await?;
+        }
         self.process_pending_commands().await?;
         Ok(())
     }
