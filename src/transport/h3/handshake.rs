@@ -10,12 +10,12 @@ use crate::fingerprint::{Http3Fingerprint, QuicTransportParams, TlsFingerprint};
 use crate::transport::h3::native;
 use crate::transport::h3::quic::{
     build_initial_crypto_packet, decode_frames, decode_transport_parameters,
-    decode_version_negotiation_packet, derive_initial_key_material, encode_frame,
-    encode_long_header, open_long_header_packet, open_short_header_packet,
-    protect_long_header_packet, protect_short_header_packet, split_long_header_datagram,
-    validate_retry_integrity_tag_v1, ConnectionId, LongHeaderPacket, LongHeaderType,
-    QuicAckTracker, QuicCryptoAssembler, QuicFrame, QuicLossDetector, QuicPacketKeyMaterial,
-    QuicPathValidator, TransportParameter,
+    decode_version_negotiation_packet, derive_initial_key_material,
+    derive_next_packet_key_material, encode_frame, encode_long_header, open_long_header_packet,
+    open_short_header_packet, protect_long_header_packet, protect_short_header_packet,
+    split_long_header_datagram, validate_retry_integrity_tag_v1, ConnectionId, LongHeaderPacket,
+    LongHeaderType, OpenedShortHeaderPacket, QuicAckTracker, QuicCloseState, QuicCryptoAssembler,
+    QuicFrame, QuicLossDetector, QuicPacketKeyMaterial, QuicPathValidator, TransportParameter,
 };
 use crate::transport::h3::tls::{
     build_client_initial_packet_from_capture_with_size,
@@ -185,6 +185,116 @@ struct SentApplicationStreamPacket {
     stream_offset: u64,
     fin: bool,
     data: Bytes,
+}
+
+/// Retained previous-phase packet protection keys for the RFC9001 § 6.2
+/// previous-key window. Reordered packets at the old phase are decrypted via
+/// these keys until `retire_at` elapses, then they are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviousKeys {
+    keys: QuicPacketKeyMaterial,
+    phase: bool,
+    retire_at: Instant,
+}
+
+/// Bound on how long the previous-phase keys remain valid after a successful
+/// key update. RFC9001 § 6.5 recommends retaining old keys for "three times
+/// the PTO" worth of time, which is connection-specific; we use a conservative
+/// fixed window that covers typical loss/reorder horizons.
+const PREVIOUS_KEY_WINDOW: Duration = Duration::from_secs(3);
+
+/// Tracks RFC9001 § 6.5 "key update in progress" enforcement: once the local
+/// endpoint initiates a key update it MUST NOT initiate another until an ACK
+/// confirms a packet sent at the new key phase has been received.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct OneRttKeyUpdate {
+    write_update_in_progress: bool,
+    write_update_anchor: Option<u64>,
+}
+
+impl OneRttKeyUpdate {
+    fn note_packet_acked(&mut self, packet_number: u64) {
+        if let Some(anchor) = self.write_update_anchor {
+            if packet_number >= anchor {
+                self.write_update_in_progress = false;
+                self.write_update_anchor = None;
+            }
+        }
+    }
+}
+
+/// Result of opening a 1-RTT short-header packet, describing which set of
+/// per-phase keys decrypted the AEAD so the caller can commit the receive
+/// rotation when applicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneRttOpenOutcome {
+    Current,
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneRttOpenedPacket {
+    opened: OpenedShortHeaderPacket,
+    outcome: OneRttOpenOutcome,
+}
+
+fn try_open_one_rtt_packet(
+    current: &QuicPacketKeyMaterial,
+    next: Option<&QuicPacketKeyMaterial>,
+    previous: Option<&PreviousKeys>,
+    expected_read_phase: bool,
+    now: Instant,
+    packet: &[u8],
+    destination_cid_len: usize,
+    expected_packet_number: u64,
+) -> Result<OneRttOpenedPacket> {
+    if let Ok(opened) =
+        open_short_header_packet(current, packet, destination_cid_len, expected_packet_number)
+    {
+        if opened.key_phase == expected_read_phase {
+            return Ok(OneRttOpenedPacket {
+                opened,
+                outcome: OneRttOpenOutcome::Current,
+            });
+        }
+    }
+
+    if let Some(previous) = previous {
+        if previous.retire_at > now {
+            if let Ok(opened) = open_short_header_packet(
+                &previous.keys,
+                packet,
+                destination_cid_len,
+                expected_packet_number,
+            ) {
+                if opened.key_phase == previous.phase {
+                    return Ok(OneRttOpenedPacket {
+                        opened,
+                        outcome: OneRttOpenOutcome::Previous,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(next) = next {
+        let expected_next_phase = !expected_read_phase;
+        if let Ok(opened) =
+            open_short_header_packet(next, packet, destination_cid_len, expected_packet_number)
+        {
+            if opened.key_phase == expected_next_phase {
+                return Ok(OneRttOpenedPacket {
+                    opened,
+                    outcome: OneRttOpenOutcome::Next,
+                });
+            }
+        }
+    }
+
+    Err(Error::Quic(
+        "native QUIC 1-RTT short-header packet could not be decrypted with current, previous, or next phase keys".into(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,9 +502,7 @@ impl QuicReceiveFlowControl {
 
     fn new(local_initiator: u64, local_transport: &QuicTransportParams) -> Self {
         let initial_max_data = local_transport.initial_max_data;
-        let max_connection_window = local_transport
-            .max_connection_window
-            .max(initial_max_data);
+        let max_connection_window = local_transport.max_connection_window.max(initial_max_data);
         // Emit MAX_DATA when the absolute value we would announce has grown
         // by at least half of the originally negotiated initial window since
         // the last announcement. This keeps the same "half-window" cadence
@@ -487,20 +595,16 @@ impl QuicReceiveFlowControl {
             })?;
         self.stream_consumed.insert(stream_id, stream_total);
 
-        self.connection_consumed = self
-            .connection_consumed
-            .checked_add(len)
-            .ok_or_else(|| {
-                Error::HttpProtocol("QUIC receive flow control connection consumed overflow".into())
-            })?;
+        self.connection_consumed = self.connection_consumed.checked_add(len).ok_or_else(|| {
+            Error::HttpProtocol("QUIC receive flow control connection consumed overflow".into())
+        })?;
 
         let stream_announced = *self
             .last_announced_max_stream_data
             .get(&stream_id)
             .unwrap_or(&initial_stream_limit);
         let stream_absolute = initial_stream_limit
-            .checked_add(stream_total)
-            .unwrap_or(u64::MAX)
+            .saturating_add(stream_total)
             .min(stream_window);
         if stream_absolute > stream_announced
             && stream_absolute - stream_announced >= stream_threshold
@@ -515,8 +619,7 @@ impl QuicReceiveFlowControl {
 
         let connection_absolute = self
             .initial_max_data
-            .checked_add(self.connection_consumed)
-            .unwrap_or(u64::MAX)
+            .saturating_add(self.connection_consumed)
             .min(self.max_connection_window);
         if connection_absolute > self.last_announced_max_data
             && connection_absolute - self.last_announced_max_data
@@ -606,6 +709,12 @@ pub struct NativeQuicHandshake {
     server_handshake_keys: Option<QuicPacketKeyMaterial>,
     client_application_keys: Option<QuicPacketKeyMaterial>,
     server_application_keys: Option<QuicPacketKeyMaterial>,
+    client_application_next_keys: Option<QuicPacketKeyMaterial>,
+    server_application_next_keys: Option<QuicPacketKeyMaterial>,
+    server_application_previous: Option<PreviousKeys>,
+    write_key_phase: bool,
+    read_key_phase: bool,
+    application_key_update: OneRttKeyUpdate,
     initial_crypto: QuicCryptoAssembler,
     handshake_crypto: QuicCryptoAssembler,
     initial_ack_tracker: QuicAckTracker,
@@ -633,6 +742,7 @@ pub struct NativeQuicHandshake {
     server_h3_stream_buffer_offsets: BTreeMap<u64, u64>,
     server_h3_stream_types: BTreeMap<u64, native::H3StreamType>,
     close_draining: bool,
+    close_state: QuicCloseState,
 }
 
 pub struct NativeQuicServerHandshake {
@@ -648,10 +758,14 @@ pub struct NativeQuicServerHandshake {
     client_initial_ack_tracker: QuicAckTracker,
     client_handshake_ack_tracker: QuicAckTracker,
     client_application_ack_tracker: QuicAckTracker,
+    server_initial_loss_detector: QuicLossDetector,
+    server_handshake_loss_detector: QuicLossDetector,
     server_application_loss_detector: QuicLossDetector,
     server_application_flow_control: QuicApplicationFlowControl,
     server_application_receive_flow_control: QuicReceiveFlowControl,
     server_application_sent_streams: BTreeMap<u64, SentApplicationStreamPacket>,
+    server_initial_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
+    server_handshake_sent_crypto: BTreeMap<u64, SentCryptoPacket>,
     next_client_initial_packet_number: u64,
     next_client_handshake_packet_number: u64,
     next_client_application_packet_number: u64,
@@ -661,6 +775,12 @@ pub struct NativeQuicServerHandshake {
     next_server_unidirectional_stream_id: u64,
     client_application_keys: Option<QuicPacketKeyMaterial>,
     server_application_keys: Option<QuicPacketKeyMaterial>,
+    client_application_next_keys: Option<QuicPacketKeyMaterial>,
+    server_application_next_keys: Option<QuicPacketKeyMaterial>,
+    client_application_previous: Option<PreviousKeys>,
+    write_key_phase: bool,
+    read_key_phase: bool,
+    application_key_update: OneRttKeyUpdate,
     server_initial_crypto_offset: u64,
     server_handshake_crypto_offset: u64,
     server_stream_offsets: BTreeMap<u64, u64>,
@@ -669,6 +789,7 @@ pub struct NativeQuicServerHandshake {
     client_h3_stream_buffer_offsets: BTreeMap<u64, u64>,
     client_h3_stream_types: BTreeMap<u64, native::H3StreamType>,
     close_draining: bool,
+    close_state: QuicCloseState,
 }
 
 impl NativeQuicServerHandshake {
@@ -700,6 +821,8 @@ impl NativeQuicServerHandshake {
             client_initial_ack_tracker: QuicAckTracker::default(),
             client_handshake_ack_tracker: QuicAckTracker::default(),
             client_application_ack_tracker: QuicAckTracker::default(),
+            server_initial_loss_detector: QuicLossDetector::default(),
+            server_handshake_loss_detector: QuicLossDetector::default(),
             server_application_loss_detector: QuicLossDetector::default(),
             server_application_flow_control: QuicApplicationFlowControl::server(
                 &fingerprint.transport,
@@ -708,6 +831,8 @@ impl NativeQuicServerHandshake {
                 &fingerprint.transport,
             ),
             server_application_sent_streams: BTreeMap::new(),
+            server_initial_sent_crypto: BTreeMap::new(),
+            server_handshake_sent_crypto: BTreeMap::new(),
             next_client_initial_packet_number: 0,
             next_client_handshake_packet_number: 0,
             next_client_application_packet_number: 0,
@@ -717,6 +842,12 @@ impl NativeQuicServerHandshake {
             next_server_unidirectional_stream_id: 3,
             client_application_keys: None,
             server_application_keys: None,
+            client_application_next_keys: None,
+            server_application_next_keys: None,
+            client_application_previous: None,
+            write_key_phase: false,
+            read_key_phase: false,
+            application_key_update: OneRttKeyUpdate::default(),
             server_initial_crypto_offset: 0,
             server_handshake_crypto_offset: 0,
             server_stream_offsets: BTreeMap::new(),
@@ -725,6 +856,7 @@ impl NativeQuicServerHandshake {
             client_h3_stream_buffer_offsets: BTreeMap::new(),
             client_h3_stream_types: BTreeMap::new(),
             close_draining: false,
+            close_state: QuicCloseState::default(),
         })
     }
 
@@ -760,6 +892,8 @@ impl NativeQuicServerHandshake {
             client_initial_ack_tracker: QuicAckTracker::default(),
             client_handshake_ack_tracker: QuicAckTracker::default(),
             client_application_ack_tracker: QuicAckTracker::default(),
+            server_initial_loss_detector: QuicLossDetector::default(),
+            server_handshake_loss_detector: QuicLossDetector::default(),
             server_application_loss_detector: QuicLossDetector::default(),
             server_application_flow_control: QuicApplicationFlowControl::server(
                 &fingerprint.transport,
@@ -768,6 +902,8 @@ impl NativeQuicServerHandshake {
                 &fingerprint.transport,
             ),
             server_application_sent_streams: BTreeMap::new(),
+            server_initial_sent_crypto: BTreeMap::new(),
+            server_handshake_sent_crypto: BTreeMap::new(),
             next_client_initial_packet_number: 0,
             next_client_handshake_packet_number: 0,
             next_client_application_packet_number: 0,
@@ -777,6 +913,12 @@ impl NativeQuicServerHandshake {
             next_server_unidirectional_stream_id: 3,
             client_application_keys: None,
             server_application_keys: None,
+            client_application_next_keys: None,
+            server_application_next_keys: None,
+            client_application_previous: None,
+            write_key_phase: false,
+            read_key_phase: false,
+            application_key_update: OneRttKeyUpdate::default(),
             server_initial_crypto_offset: 0,
             server_handshake_crypto_offset: 0,
             server_stream_offsets: BTreeMap::new(),
@@ -785,6 +927,7 @@ impl NativeQuicServerHandshake {
             client_h3_stream_buffer_offsets: BTreeMap::new(),
             client_h3_stream_types: BTreeMap::new(),
             close_draining: false,
+            close_state: QuicCloseState::default(),
         })
     }
 
@@ -794,6 +937,165 @@ impl NativeQuicServerHandshake {
 
     pub fn is_close_draining(&self) -> bool {
         self.close_draining
+    }
+
+    pub fn close_state(&self) -> &QuicCloseState {
+        &self.close_state
+    }
+
+    pub fn close_state_mut(&mut self) -> &mut QuicCloseState {
+        &mut self.close_state
+    }
+
+    /// RFC9000 § 10.2 closing: called by the server driver after emitting a
+    /// CONNECTION_CLOSE frame to suppress further outbound application data
+    /// and anchor the close timer.
+    pub fn server_enter_closing(&mut self, now: Instant) {
+        self.close_state.enter_closing(now);
+        self.close_draining = true;
+    }
+
+    /// RFC9000 § 10.2 draining: called by the server driver when entering
+    /// the draining phase explicitly. Receiving a peer CONNECTION_CLOSE in
+    /// `open_client_h3_event_packet` also drives this transition.
+    pub fn server_enter_draining(&mut self, now: Instant) {
+        self.close_state.enter_draining(now);
+        self.close_draining = true;
+    }
+
+    /// Returns the RFC9000 § 10.2 close window derived from the server's
+    /// application-space loss detector via RFC9002 § 6.2.1
+    /// `current_PTO * 3`.
+    pub fn server_close_window(&self) -> Duration {
+        self.server_application_loss_detector.close_window()
+    }
+
+    pub fn server_is_close_window_expired(&self, now: Instant) -> bool {
+        self.close_state.is_expired(now, self.server_close_window())
+    }
+
+    pub fn server_close_time_until_expiry(&self, now: Instant) -> Option<Duration> {
+        self.close_state
+            .time_until_expiry(now, self.server_close_window())
+    }
+
+    pub fn server_should_replay_connection_close(&self, now: Instant) -> bool {
+        self.close_state.should_replay(now)
+    }
+
+    pub fn server_mark_connection_close_replayed(&mut self, now: Instant) {
+        self.close_state.mark_replayed(now);
+    }
+
+    pub fn server_observe_inbound_packet_for_close(&mut self) -> u64 {
+        self.close_state.observe_inbound_packet()
+    }
+
+    pub fn server_application_pto(&self) -> Duration {
+        self.server_application_loss_detector.current_pto()
+    }
+
+    /// Current write-side key phase bit per RFC9001 § 6 (the bit set on
+    /// outbound 1-RTT short-header packets).
+    pub fn write_key_phase(&self) -> bool {
+        self.write_key_phase
+    }
+
+    /// Current read-side key phase bit per RFC9001 § 6 (what the peer's
+    /// most-recent committed write phase looks like from here).
+    pub fn read_key_phase(&self) -> bool {
+        self.read_key_phase
+    }
+
+    /// Whether a locally-initiated key update is currently waiting for an ACK
+    /// of a packet sent at the new write phase per RFC9001 § 6.5.
+    pub fn key_update_in_progress(&self) -> bool {
+        self.application_key_update.write_update_in_progress
+    }
+
+    /// Force a 1-RTT key update. Returns an error when the previous local key
+    /// update has not yet been confirmed via ACK (RFC9001 § 6.5) so callers
+    /// cannot accidentally chain updates faster than the peer can confirm.
+    ///
+    /// This is the deterministic test hook called for by the production
+    /// implementation; in production code, a key update can also be triggered
+    /// implicitly when a peer's packet at the next phase is decrypted.
+    pub fn force_key_update(&mut self) -> Result<()> {
+        if self.application_key_update.write_update_in_progress {
+            return Err(Error::Quic(
+                "RFC9001 § 6.5: cannot initiate a new key update while a previous one is unconfirmed"
+                    .into(),
+            ));
+        }
+        let next = self.server_application_next_keys.take().ok_or_else(|| {
+            Error::Quic(
+                "native QUIC server cannot force a key update before TLS application secrets are installed"
+                    .into(),
+            )
+        })?;
+        self.server_application_keys = Some(next);
+        let new_current = self
+            .server_application_keys
+            .as_ref()
+            .expect("server application keys just installed");
+        self.server_application_next_keys = Some(derive_next_packet_key_material(new_current)?);
+        self.write_key_phase = !self.write_key_phase;
+        self.application_key_update.write_update_in_progress = true;
+        self.application_key_update.write_update_anchor =
+            Some(self.next_server_application_packet_number);
+        Ok(())
+    }
+
+    fn commit_receive_key_update(&mut self, now: Instant) -> Result<()> {
+        let Some(current) = self.client_application_keys.take() else {
+            return Err(Error::Quic(
+                "native QUIC server cannot rotate read keys without an installed current key set"
+                    .into(),
+            ));
+        };
+        let Some(next) = self.client_application_next_keys.take() else {
+            return Err(Error::Quic(
+                "native QUIC server cannot rotate read keys without precomputed next key set"
+                    .into(),
+            ));
+        };
+        let old_phase = self.read_key_phase;
+        self.client_application_keys = Some(next);
+        let new_current = self
+            .client_application_keys
+            .as_ref()
+            .expect("client application keys just installed");
+        self.client_application_next_keys = Some(derive_next_packet_key_material(new_current)?);
+        self.client_application_previous = Some(PreviousKeys {
+            keys: current,
+            phase: old_phase,
+            retire_at: now + PREVIOUS_KEY_WINDOW,
+        });
+        self.read_key_phase = !self.read_key_phase;
+
+        if self.write_key_phase != self.read_key_phase
+            && !self.application_key_update.write_update_in_progress
+        {
+            let next_write = self.server_application_next_keys.take().ok_or_else(|| {
+                Error::Quic(
+                    "native QUIC server cannot mirror peer key update without precomputed next write keys"
+                        .into(),
+                )
+            })?;
+            self.server_application_keys = Some(next_write);
+            let new_current_write = self
+                .server_application_keys
+                .as_ref()
+                .expect("server application keys just rotated");
+            self.server_application_next_keys =
+                Some(derive_next_packet_key_material(new_current_write)?);
+            self.write_key_phase = !self.write_key_phase;
+            self.application_key_update.write_update_in_progress = true;
+            self.application_key_update.write_update_anchor =
+                Some(self.next_server_application_packet_number);
+        }
+
+        Ok(())
     }
 
     pub fn server_application_lost_packets(&self) -> Vec<u64> {
@@ -841,6 +1143,9 @@ impl NativeQuicServerHandshake {
             self.next_client_initial_packet_number = opened.packet_number + 1;
 
             for frame in decode_frames(&opened.payload)? {
+                for packet_number in self.server_initial_loss_detector.on_ack_frame(&frame)? {
+                    self.server_initial_sent_crypto.remove(&packet_number);
+                }
                 if let QuicFrame::Crypto { offset, data } = frame {
                     self.client_initial_crypto.insert(offset, data)?;
                 }
@@ -947,6 +1252,9 @@ impl NativeQuicServerHandshake {
             self.next_client_handshake_packet_number = opened.packet_number + 1;
 
             for frame in decode_frames(&opened.payload)? {
+                for packet_number in self.server_handshake_loss_detector.on_ack_frame(&frame)? {
+                    self.server_handshake_sent_crypto.remove(&packet_number);
+                }
                 if let QuicFrame::Crypto { offset, data } = frame {
                     self.client_handshake_crypto.insert(offset, data)?;
                 }
@@ -971,18 +1279,27 @@ impl NativeQuicServerHandshake {
         if self.close_draining {
             return Ok(Vec::new());
         }
-        let Some(client_application_keys) = &self.client_application_keys else {
+        let Some(client_application_keys) = self.client_application_keys.as_ref() else {
             return Err(Error::Quic(
                 "native server application packet decryption is waiting for TLS application keys"
                     .into(),
             ));
         };
-        let opened = open_short_header_packet(
+        let now = Instant::now();
+        let opened = try_open_one_rtt_packet(
             client_application_keys,
+            self.client_application_next_keys.as_ref(),
+            self.client_application_previous.as_ref(),
+            self.read_key_phase,
+            now,
             packet,
             self.server_source_cid.as_bytes().len(),
             self.next_client_application_packet_number,
         )?;
+        if matches!(opened.outcome, OneRttOpenOutcome::Next) {
+            self.commit_receive_key_update(now)?;
+        }
+        let opened = opened.opened;
         self.next_client_application_packet_number = opened.packet_number + 1;
         let frames = decode_frames(&opened.payload)?;
         for frame in &frames {
@@ -998,6 +1315,7 @@ impl NativeQuicServerHandshake {
             }
             for packet_number in self.server_application_loss_detector.on_ack_frame(frame)? {
                 self.server_application_sent_streams.remove(&packet_number);
+                self.application_key_update.note_packet_acked(packet_number);
             }
             match frame {
                 QuicFrame::MaxData(max_data) => {
@@ -1059,7 +1377,7 @@ impl NativeQuicServerHandshake {
             &self.client_source_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
         self.client_application_ack_tracker.mark_ack_sent();
@@ -1174,7 +1492,12 @@ impl NativeQuicServerHandshake {
                     frame_type,
                     reason,
                 } => {
+                    // RFC9000 § 10.2: peer CONNECTION_CLOSE transitions us
+                    // into the draining phase, which forbids any further
+                    // outbound packets except an optional one-shot
+                    // CONNECTION_CLOSE acknowledgement.
                     self.close_draining = true;
+                    self.close_state.enter_draining(Instant::now());
                     events.push(ClientH3Event::ConnectionClose {
                         error_code,
                         frame_type,
@@ -1257,11 +1580,18 @@ impl NativeQuicServerHandshake {
         error_code: u64,
         reason: Bytes,
     ) -> Result<ServerApplicationControlPacket> {
-        self.build_server_application_control_packet(QuicFrame::ConnectionClose {
+        let packet = self.build_server_application_control_packet(QuicFrame::ConnectionClose {
             error_code,
             frame_type: None,
             reason,
-        })
+        })?;
+        // RFC9000 § 10.2: emitting a CONNECTION_CLOSE transitions the
+        // connection into the closing phase. Mirroring the client handshake
+        // helper, we anchor the timer at build time so server-side drivers
+        // do not have to call `server_enter_closing` separately on every
+        // path that emits a CONNECTION_CLOSE.
+        self.server_enter_closing(Instant::now());
+        Ok(packet)
     }
 
     pub fn build_server_max_data_packet(
@@ -1310,6 +1640,21 @@ impl NativeQuicServerHandshake {
             .into_iter()
             .map(|frame| self.build_server_application_control_packet(frame))
             .collect()
+    }
+
+    // Server-side symmetric hook for app-consumed bytes. RFC 9000 Section 4
+    // treats client and server receivers identically: both advertise
+    // MAX_DATA / MAX_STREAM_DATA absolute values derived from
+    // `initial_max_*data + bytes_consumed_by_application` and only emit a
+    // frame when the gating threshold is crossed.
+    pub fn record_server_stream_consumed(&mut self, stream_id: u64, len: u64) -> Result<()> {
+        self.server_application_receive_flow_control
+            .record_stream_consumed(stream_id, len)
+    }
+
+    pub fn release_server_stream(&mut self, stream_id: u64) {
+        self.server_application_receive_flow_control
+            .release_stream(stream_id);
     }
 
     pub fn build_server_handshake_done_packet(&mut self) -> Result<ServerApplicationControlPacket> {
@@ -1365,10 +1710,16 @@ impl NativeQuicServerHandshake {
                     self.server_handshake_keys = Some(secret.packet_key_material()?);
                 }
                 (QuicSecretDirection::Read, QuicEncryptionLevel::Application) => {
-                    self.client_application_keys = Some(secret.packet_key_material()?);
+                    let keys = secret.packet_key_material()?;
+                    self.client_application_next_keys =
+                        Some(derive_next_packet_key_material(&keys)?);
+                    self.client_application_keys = Some(keys);
                 }
                 (QuicSecretDirection::Write, QuicEncryptionLevel::Application) => {
-                    self.server_application_keys = Some(secret.packet_key_material()?);
+                    let keys = secret.packet_key_material()?;
+                    self.server_application_next_keys =
+                        Some(derive_next_packet_key_material(&keys)?);
+                    self.server_application_keys = Some(keys);
                 }
                 _ => {}
             }
@@ -1377,6 +1728,22 @@ impl NativeQuicServerHandshake {
     }
 
     fn build_server_initial_packet(&mut self, crypto_data: Bytes) -> Result<ServerHandshakePacket> {
+        let crypto_offset = self.server_initial_crypto_offset;
+        let packet = self.build_server_initial_packet_at_offset_with_sent_at(
+            crypto_offset,
+            crypto_data,
+            Instant::now(),
+        )?;
+        self.server_initial_crypto_offset += packet.crypto_data.len() as u64;
+        Ok(packet)
+    }
+
+    fn build_server_initial_packet_at_offset_with_sent_at(
+        &mut self,
+        crypto_offset: u64,
+        crypto_data: Bytes,
+        sent_at: Instant,
+    ) -> Result<ServerHandshakePacket> {
         let packet_number = self.next_server_initial_packet_number;
         self.next_server_initial_packet_number += 1;
         let packet = build_server_crypto_packet(
@@ -1385,16 +1752,86 @@ impl NativeQuicServerHandshake {
             &self.client_source_cid,
             &self.server_source_cid,
             packet_number,
-            self.server_initial_crypto_offset,
-            crypto_data,
+            crypto_offset,
+            crypto_data.clone(),
         )?;
-        self.server_initial_crypto_offset += packet.crypto_data.len() as u64;
+        self.server_initial_loss_detector
+            .on_packet_sent_at(packet_number, sent_at);
+        self.server_initial_sent_crypto.insert(
+            packet_number,
+            SentCryptoPacket {
+                packet_type: LongHeaderType::Initial,
+                crypto_offset,
+                crypto_data: crypto_data.clone(),
+            },
+        );
         Ok(packet)
     }
 
     fn build_server_handshake_packet(
         &mut self,
         crypto_data: Bytes,
+    ) -> Result<ServerHandshakePacket> {
+        let crypto_offset = self.server_handshake_crypto_offset;
+        let packet = self.build_server_handshake_packet_at_offset_with_sent_at(
+            crypto_offset,
+            crypto_data,
+            Instant::now(),
+        )?;
+        self.server_handshake_crypto_offset += packet.crypto_data.len() as u64;
+        Ok(packet)
+    }
+
+    pub fn retransmit_pto_server_crypto_packets(
+        &mut self,
+        now: Instant,
+        pto: Duration,
+    ) -> Result<Vec<ServerHandshakePacket>> {
+        let mut retransmits = Vec::new();
+        for packet_number in self
+            .server_initial_loss_detector
+            .pto_expired_packets(now, pto)
+        {
+            self.server_initial_loss_detector
+                .retire_packet(packet_number);
+            let Some(sent) = self.server_initial_sent_crypto.remove(&packet_number) else {
+                continue;
+            };
+            if sent.packet_type != LongHeaderType::Initial {
+                continue;
+            }
+            retransmits.push(self.build_server_initial_packet_at_offset_with_sent_at(
+                sent.crypto_offset,
+                sent.crypto_data,
+                now,
+            )?);
+        }
+        for packet_number in self
+            .server_handshake_loss_detector
+            .pto_expired_packets(now, pto)
+        {
+            self.server_handshake_loss_detector
+                .retire_packet(packet_number);
+            let Some(sent) = self.server_handshake_sent_crypto.remove(&packet_number) else {
+                continue;
+            };
+            if sent.packet_type != LongHeaderType::Handshake {
+                continue;
+            }
+            retransmits.push(self.build_server_handshake_packet_at_offset_with_sent_at(
+                sent.crypto_offset,
+                sent.crypto_data,
+                now,
+            )?);
+        }
+        Ok(retransmits)
+    }
+
+    fn build_server_handshake_packet_at_offset_with_sent_at(
+        &mut self,
+        crypto_offset: u64,
+        crypto_data: Bytes,
+        sent_at: Instant,
     ) -> Result<ServerHandshakePacket> {
         let Some(server_handshake_keys) = &self.server_handshake_keys else {
             return Err(Error::Quic(
@@ -1410,10 +1847,19 @@ impl NativeQuicServerHandshake {
             &self.client_source_cid,
             &self.server_source_cid,
             packet_number,
-            self.server_handshake_crypto_offset,
-            crypto_data,
+            crypto_offset,
+            crypto_data.clone(),
         )?;
-        self.server_handshake_crypto_offset += packet.crypto_data.len() as u64;
+        self.server_handshake_loss_detector
+            .on_packet_sent_at(packet_number, sent_at);
+        self.server_handshake_sent_crypto.insert(
+            packet_number,
+            SentCryptoPacket {
+                packet_type: LongHeaderType::Handshake,
+                crypto_offset,
+                crypto_data: crypto_data.clone(),
+            },
+        );
         Ok(packet)
     }
 
@@ -1472,7 +1918,7 @@ impl NativeQuicServerHandshake {
             &self.client_source_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
 
@@ -1517,7 +1963,7 @@ impl NativeQuicServerHandshake {
             &self.client_source_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
         self.server_application_loss_detector
@@ -1615,6 +2061,12 @@ impl NativeQuicHandshake {
             server_handshake_keys: None,
             client_application_keys: None,
             server_application_keys: None,
+            client_application_next_keys: None,
+            server_application_next_keys: None,
+            server_application_previous: None,
+            write_key_phase: false,
+            read_key_phase: false,
+            application_key_update: OneRttKeyUpdate::default(),
             initial_crypto: QuicCryptoAssembler::default(),
             handshake_crypto: QuicCryptoAssembler::default(),
             initial_ack_tracker: QuicAckTracker::default(),
@@ -1646,6 +2098,7 @@ impl NativeQuicHandshake {
             server_h3_stream_buffer_offsets: BTreeMap::new(),
             server_h3_stream_types: BTreeMap::new(),
             close_draining: false,
+            close_state: QuicCloseState::default(),
         })
     }
 
@@ -1701,11 +2154,15 @@ impl NativeQuicHandshake {
             } else if secret.direction == QuicSecretDirection::Read
                 && secret.level == QuicEncryptionLevel::Application
             {
-                self.server_application_keys = Some(secret.packet_key_material()?);
+                let keys = secret.packet_key_material()?;
+                self.server_application_next_keys = Some(derive_next_packet_key_material(&keys)?);
+                self.server_application_keys = Some(keys);
             } else if secret.direction == QuicSecretDirection::Write
                 && secret.level == QuicEncryptionLevel::Application
             {
-                self.client_application_keys = Some(secret.packet_key_material()?);
+                let keys = secret.packet_key_material()?;
+                self.client_application_next_keys = Some(derive_next_packet_key_material(&keys)?);
+                self.client_application_keys = Some(keys);
             }
         }
         Ok(())
@@ -1723,6 +2180,157 @@ impl NativeQuicHandshake {
         self.close_draining
     }
 
+    pub fn close_state(&self) -> &QuicCloseState {
+        &self.close_state
+    }
+
+    pub fn close_state_mut(&mut self) -> &mut QuicCloseState {
+        &mut self.close_state
+    }
+
+    /// RFC9000 § 10.2 closing: called by the client driver after emitting a
+    /// CONNECTION_CLOSE frame to suppress further outbound application data
+    /// and anchor the close timer at `now`.
+    pub fn client_enter_closing(&mut self, now: Instant) {
+        self.close_state.enter_closing(now);
+        self.close_draining = true;
+    }
+
+    /// RFC9000 § 10.2 draining: called when the client driver wants to
+    /// enter draining explicitly. Peer CONNECTION_CLOSE handling in
+    /// `open_client_h3_event_packet` also drives this transition.
+    pub fn client_enter_draining(&mut self, now: Instant) {
+        self.close_state.enter_draining(now);
+        self.close_draining = true;
+    }
+
+    /// Returns the RFC9000 § 10.2 close window derived from the client
+    /// application-space loss detector via RFC9002 § 6.2.1 `current_PTO * 3`.
+    pub fn client_close_window(&self) -> Duration {
+        self.client_application_loss_detector.close_window()
+    }
+
+    pub fn client_is_close_window_expired(&self, now: Instant) -> bool {
+        self.close_state.is_expired(now, self.client_close_window())
+    }
+
+    pub fn client_close_time_until_expiry(&self, now: Instant) -> Option<Duration> {
+        self.close_state
+            .time_until_expiry(now, self.client_close_window())
+    }
+
+    pub fn client_should_replay_connection_close(&self, now: Instant) -> bool {
+        self.close_state.should_replay(now)
+    }
+
+    pub fn client_mark_connection_close_replayed(&mut self, now: Instant) {
+        self.close_state.mark_replayed(now);
+    }
+
+    pub fn client_observe_inbound_packet_for_close(&mut self) -> u64 {
+        self.close_state.observe_inbound_packet()
+    }
+
+    pub fn client_application_pto(&self) -> Duration {
+        self.client_application_loss_detector.current_pto()
+    }
+
+    /// Current write-side key phase bit per RFC9001 § 6.
+    pub fn write_key_phase(&self) -> bool {
+        self.write_key_phase
+    }
+
+    /// Current read-side key phase bit per RFC9001 § 6.
+    pub fn read_key_phase(&self) -> bool {
+        self.read_key_phase
+    }
+
+    /// Whether a locally-initiated key update is currently waiting for an ACK
+    /// of a packet sent at the new write phase per RFC9001 § 6.5.
+    pub fn key_update_in_progress(&self) -> bool {
+        self.application_key_update.write_update_in_progress
+    }
+
+    /// Force a 1-RTT key update. Returns an error when the previous local key
+    /// update has not yet been confirmed via ACK (RFC9001 § 6.5).
+    pub fn force_key_update(&mut self) -> Result<()> {
+        if self.application_key_update.write_update_in_progress {
+            return Err(Error::Quic(
+                "RFC9001 § 6.5: cannot initiate a new key update while a previous one is unconfirmed"
+                    .into(),
+            ));
+        }
+        let next = self.client_application_next_keys.take().ok_or_else(|| {
+            Error::Quic(
+                "native QUIC client cannot force a key update before TLS application secrets are installed"
+                    .into(),
+            )
+        })?;
+        self.client_application_keys = Some(next);
+        let new_current = self
+            .client_application_keys
+            .as_ref()
+            .expect("client application keys just installed");
+        self.client_application_next_keys = Some(derive_next_packet_key_material(new_current)?);
+        self.write_key_phase = !self.write_key_phase;
+        self.application_key_update.write_update_in_progress = true;
+        self.application_key_update.write_update_anchor =
+            Some(self.next_client_application_packet_number);
+        Ok(())
+    }
+
+    fn commit_receive_key_update(&mut self, now: Instant) -> Result<()> {
+        let Some(current) = self.server_application_keys.take() else {
+            return Err(Error::Quic(
+                "native QUIC client cannot rotate read keys without an installed current key set"
+                    .into(),
+            ));
+        };
+        let Some(next) = self.server_application_next_keys.take() else {
+            return Err(Error::Quic(
+                "native QUIC client cannot rotate read keys without precomputed next key set"
+                    .into(),
+            ));
+        };
+        let old_phase = self.read_key_phase;
+        self.server_application_keys = Some(next);
+        let new_current = self
+            .server_application_keys
+            .as_ref()
+            .expect("server application keys just installed");
+        self.server_application_next_keys = Some(derive_next_packet_key_material(new_current)?);
+        self.server_application_previous = Some(PreviousKeys {
+            keys: current,
+            phase: old_phase,
+            retire_at: now + PREVIOUS_KEY_WINDOW,
+        });
+        self.read_key_phase = !self.read_key_phase;
+
+        if self.write_key_phase != self.read_key_phase
+            && !self.application_key_update.write_update_in_progress
+        {
+            let next_write = self.client_application_next_keys.take().ok_or_else(|| {
+                Error::Quic(
+                    "native QUIC client cannot mirror peer key update without precomputed next write keys"
+                        .into(),
+                )
+            })?;
+            self.client_application_keys = Some(next_write);
+            let new_current_write = self
+                .client_application_keys
+                .as_ref()
+                .expect("client application keys just rotated");
+            self.client_application_next_keys =
+                Some(derive_next_packet_key_material(new_current_write)?);
+            self.write_key_phase = !self.write_key_phase;
+            self.application_key_update.write_update_in_progress = true;
+            self.application_key_update.write_update_anchor =
+                Some(self.next_client_application_packet_number);
+        }
+
+        Ok(())
+    }
+
     pub fn client_path_validation_pending_count(&self) -> usize {
         self.client_path_validator.pending_count()
     }
@@ -1733,6 +2341,19 @@ impl NativeQuicHandshake {
 
     pub fn client_application_lost_packets(&self) -> Vec<u64> {
         self.client_application_loss_detector.lost_packets()
+    }
+
+    /// Smoothed RTT observed on the application packet number space, as
+    /// updated by RFC9002 § 5.3 from inbound ACK frames. Read-only consumer
+    /// of the loss detector's RTT estimator.
+    pub fn client_application_smoothed_rtt(&self) -> Option<Duration> {
+        self.client_application_loss_detector.smoothed_rtt()
+    }
+
+    /// Minimum RTT observed on the application packet number space.
+    /// Read-only consumer of the loss detector's RTT estimator.
+    pub fn client_application_min_rtt(&self) -> Option<Duration> {
+        self.client_application_loss_detector.min_rtt()
     }
 
     pub fn retransmit_lost_client_application_stream_packets(
@@ -1826,7 +2447,7 @@ impl NativeQuicHandshake {
             &self.destination_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
         self.application_ack_tracker.mark_ack_sent();
@@ -2040,7 +2661,7 @@ impl NativeQuicHandshake {
             &self.destination_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
 
@@ -2224,11 +2845,17 @@ impl NativeQuicHandshake {
         error_code: u64,
         reason: Bytes,
     ) -> Result<ClientApplicationControlPacket> {
-        self.build_client_application_control_packet(QuicFrame::ConnectionClose {
+        let packet = self.build_client_application_control_packet(QuicFrame::ConnectionClose {
             error_code,
             frame_type: None,
             reason,
-        })
+        })?;
+        // RFC9000 § 10.2: emitting a CONNECTION_CLOSE transitions the
+        // connection into the closing phase. We anchor the timer here so the
+        // driver does not have to remember to call `client_enter_closing`
+        // separately on every send path.
+        self.client_enter_closing(Instant::now());
+        Ok(packet)
     }
 
     pub fn build_client_max_data_packet(
@@ -2279,6 +2906,20 @@ impl NativeQuicHandshake {
             .collect()
     }
 
+    // Hook for the H3 driver to surface bytes the application has actually
+    // drained from a streaming response body or RFC 9220 tunnel inbound
+    // channel. Per RFC 9000 Section 4 these counters drive the absolute
+    // MAX_DATA / MAX_STREAM_DATA values we are willing to advertise.
+    pub fn record_client_stream_consumed(&mut self, stream_id: u64, len: u64) -> Result<()> {
+        self.client_application_receive_flow_control
+            .record_stream_consumed(stream_id, len)
+    }
+
+    pub fn release_client_stream(&mut self, stream_id: u64) {
+        self.client_application_receive_flow_control
+            .release_stream(stream_id);
+    }
+
     fn build_client_application_control_packet(
         &mut self,
         frame: QuicFrame,
@@ -2297,7 +2938,7 @@ impl NativeQuicHandshake {
             &self.destination_cid,
             packet_number,
             packet_number_len,
-            false,
+            self.write_key_phase,
             &frame,
         )?;
         self.client_application_loss_detector
@@ -2315,17 +2956,26 @@ impl NativeQuicHandshake {
         if self.close_draining {
             return Ok(Vec::new());
         }
-        let Some(server_application_keys) = &self.server_application_keys else {
+        let Some(server_application_keys) = self.server_application_keys.as_ref() else {
             return Err(Error::Quic(
                 "native application packet decryption is waiting for TLS application keys".into(),
             ));
         };
-        let opened = open_short_header_packet(
+        let now = Instant::now();
+        let opened = try_open_one_rtt_packet(
             server_application_keys,
+            self.server_application_next_keys.as_ref(),
+            self.server_application_previous.as_ref(),
+            self.read_key_phase,
+            now,
             packet,
             self.source_cid.as_bytes().len(),
             self.next_server_application_packet_number,
         )?;
+        if matches!(opened.outcome, OneRttOpenOutcome::Next) {
+            self.commit_receive_key_update(now)?;
+        }
+        let opened = opened.opened;
         self.next_server_application_packet_number = opened.packet_number + 1;
         let frames = decode_frames(&opened.payload)?;
         for frame in &frames {
@@ -2341,6 +2991,7 @@ impl NativeQuicHandshake {
             }
             for packet_number in self.client_application_loss_detector.on_ack_frame(frame)? {
                 self.client_application_sent_streams.remove(&packet_number);
+                self.application_key_update.note_packet_acked(packet_number);
             }
             match frame {
                 QuicFrame::MaxData(max_data) => {
@@ -2429,7 +3080,12 @@ impl NativeQuicHandshake {
                     frame_type,
                     reason,
                 } => {
+                    // RFC9000 § 10.2: peer CONNECTION_CLOSE transitions us
+                    // into the draining phase. Drivers must stop sending
+                    // packets and may emit at most one CONNECTION_CLOSE in
+                    // response.
                     self.close_draining = true;
+                    self.close_state.enter_draining(Instant::now());
                     events.push(ServerH3Event::ConnectionClose {
                         error_code,
                         frame_type,
@@ -2604,9 +3260,10 @@ impl NativeQuicHandshake {
             .copied()
             .find(|version| packet.supported_versions.contains(version));
         let Some(chosen_version) = chosen_version else {
-            return Err(Error::Quic(
-                "version_negotiation_failed: native H3 client and server share no supported QUIC version".into(),
-            ));
+            return Err(Error::Quic(format!(
+                "version_negotiation_failed: native H3 server did not offer QUIC version 1 or any other version we support (offered {:?})",
+                packet.supported_versions,
+            )));
         };
 
         self.restart_for_version_negotiation(chosen_version)?;
@@ -2621,21 +3278,19 @@ impl NativeQuicHandshake {
             return Ok(());
         }
 
-        let retry = validate_retry_integrity_tag_v1(&self.original_destination_cid, retry_packet)?;
+        let retry =
+            match validate_retry_integrity_tag_v1(&self.original_destination_cid, retry_packet) {
+                Ok(retry) => retry,
+                Err(_) => return Ok(()),
+            };
         if retry.destination_cid != self.source_cid {
-            return Err(Error::Quic(
-                "native H3 Retry destination CID does not match client source CID".into(),
-            ));
+            return Ok(());
         }
         if retry.source_cid.as_bytes() == self.original_destination_cid.as_bytes() {
-            return Err(Error::Quic(
-                "native H3 Retry source CID matches the client's original destination CID".into(),
-            ));
+            return Ok(());
         }
         if retry.token.is_empty() {
-            return Err(Error::Quic(
-                "native H3 Retry packet contained an empty token".into(),
-            ));
+            return Ok(());
         }
 
         let retry_keys = derive_initial_key_material(retry.source_cid.as_bytes())?;
@@ -2805,7 +3460,7 @@ fn is_version_negotiation_datagram(datagram: &[u8]) -> bool {
         && u32::from_be_bytes([datagram[1], datagram[2], datagram[3], datagram[4]]) == 0
 }
 
-fn build_client_initial_packet_with_token(
+fn build_client_initial_packet_with_token_and_version(
     fingerprint: &Http3Fingerprint,
     crypto_data: Bytes,
     transport_parameters: Bytes,
@@ -2814,6 +3469,7 @@ fn build_client_initial_packet_with_token(
     source_cid: ConnectionId,
     token: Bytes,
     packet_number: u64,
+    version: u32,
 ) -> Result<ClientInitialPacket> {
     let header_len_without_length = 1
         + 4
@@ -2831,7 +3487,7 @@ fn build_client_initial_packet_with_token(
     let payload_len = padded_plaintext_len + AES_GCM_TAG_LEN;
     let header = encode_long_header(&LongHeaderPacket {
         packet_type: LongHeaderType::Initial,
-        version: QUIC_VERSION_1,
+        version,
         destination_cid: destination_cid.clone(),
         source_cid,
         token,
@@ -2862,6 +3518,13 @@ fn build_client_initial_packet_with_token(
         transport_parameters,
         secrets,
     })
+}
+
+fn random_connection_id(len: usize) -> Result<ConnectionId> {
+    let mut bytes = vec![0u8; len];
+    getrandom_fill(&mut bytes)
+        .map_err(|err| Error::Quic(format!("native H3 connection id RNG failed: {err}")))?;
+    ConnectionId::from_bytes(Bytes::from(bytes))
 }
 
 fn initial_plaintext_len(
@@ -3117,4 +3780,210 @@ fn build_ack_packet(
         packet_number,
         packet_number_offset,
     }))
+}
+
+#[cfg(test)]
+mod receive_flow_control_tests {
+    use super::*;
+    use crate::fingerprint::QuicTransportParams;
+
+    // Build a `QuicTransportParams` that exposes small, easy-to-reason-about
+    // initial limits so threshold/gating math is obvious. RFC 9000 Section 4
+    // numbers the absolute MAX_DATA / MAX_STREAM_DATA value space; the
+    // initial limits below are what the peer is presumed to know via the
+    // transport parameter exchange (RFC 9000 Section 18.2).
+    fn flow_control_params() -> QuicTransportParams {
+        let mut params = QuicTransportParams::chrome();
+        params.initial_max_data = 100;
+        params.initial_max_stream_data_bidi_local = 40;
+        params.initial_max_stream_data_bidi_remote = 40;
+        params.initial_max_stream_data_uni = 40;
+        params.max_connection_window = 100_000;
+        params.max_stream_window = 100_000;
+        params
+    }
+
+    fn client_flow_control() -> QuicReceiveFlowControl {
+        QuicReceiveFlowControl::client(&flow_control_params())
+    }
+
+    // Stream 0 (client-bidi-local) consumes exactly N bytes; the absolute
+    // MAX_STREAM_DATA we are willing to advertise is initial + N, never the
+    // bytes seen on the wire, per RFC 9000 Section 4.1 ("a receiver
+    // advertises a credit limit based on its progress on the application
+    // protocol").
+    #[test]
+    fn record_stream_consumed_advertises_initial_plus_drained_per_stream() {
+        let mut fc = client_flow_control();
+        let stream_id = 0;
+
+        fc.record_stream_consumed(stream_id, 5)
+            .expect("first drain");
+        // 5 bytes < threshold (40 / 2 = 20), so no frame yet.
+        assert!(fc.take_update_frames().is_empty());
+
+        fc.record_stream_consumed(stream_id, 20)
+            .expect("threshold-crossing drain");
+        // Total drained is 25 >= threshold; emit MAX_STREAM_DATA with the
+        // absolute initial(40) + drained(25) = 65 value, not an arbitrary
+        // receive-threshold ceiling.
+        let frames = fc.take_update_frames();
+        assert_eq!(
+            frames,
+            vec![QuicFrame::MaxStreamData {
+                stream_id,
+                max_stream_data: 65,
+            }]
+        );
+
+        // A further small drain below the next threshold delta keeps the
+        // queue empty so we do not flood the wire with one frame per byte.
+        fc.record_stream_consumed(stream_id, 5)
+            .expect("small drain");
+        assert!(fc.take_update_frames().is_empty());
+
+        // Cumulative drain hits the next half-window threshold and emits
+        // exactly initial(40) + total(50) = 90.
+        fc.record_stream_consumed(stream_id, 16)
+            .expect("next threshold");
+        let frames = fc.take_update_frames();
+        assert_eq!(
+            frames,
+            vec![QuicFrame::MaxStreamData {
+                stream_id,
+                max_stream_data: 90,
+            }]
+        );
+    }
+
+    // RFC 9000 Section 4.2: the connection-level MAX_DATA value is the
+    // initial connection window plus the sum of bytes consumed across all
+    // streams, with no double-counting between per-stream and connection
+    // counters.
+    #[test]
+    fn record_stream_consumed_aggregates_connection_level_across_streams() {
+        let mut fc = client_flow_control();
+        // Two distinct client-bidi-local streams.
+        let stream_a = 0;
+        let stream_b = 4;
+
+        // 30 bytes on each stream: total 60 consumed. Connection threshold
+        // is 100 / 2 = 50, so MAX_DATA fires; each stream is above its 20
+        // stream-level threshold, so per-stream MAX_STREAM_DATA fires too.
+        fc.record_stream_consumed(stream_a, 30).expect("a drains");
+        fc.record_stream_consumed(stream_b, 30).expect("b drains");
+        let mut frames = fc.take_update_frames();
+        frames.sort_by_key(|frame| match frame {
+            QuicFrame::MaxData(_) => 0u8,
+            QuicFrame::MaxStreamData { stream_id, .. } => 1 + (*stream_id as u8 % 8),
+            _ => 255,
+        });
+
+        // initial_max_data(100) + connection_consumed(60) = 160 absolute.
+        assert!(frames.contains(&QuicFrame::MaxData(160)));
+        // Per-stream absolute = initial(40) + per-stream drained(30) = 70.
+        assert!(frames.contains(&QuicFrame::MaxStreamData {
+            stream_id: stream_a,
+            max_stream_data: 70,
+        }));
+        assert!(frames.contains(&QuicFrame::MaxStreamData {
+            stream_id: stream_b,
+            max_stream_data: 70,
+        }));
+    }
+
+    // RFC 9000 Section 19.9/19.10 forbid emitting frames for every byte
+    // drained; we gate emission on a half-initial-window delta but the
+    // absolute value still comes from the consumed counter.
+    #[test]
+    fn threshold_gates_emit_but_does_not_round_absolute_value() {
+        let mut fc = client_flow_control();
+        let stream_id = 0;
+
+        // Many tiny drains adding up to just below the half-window
+        // threshold do not produce a frame.
+        for _ in 0..19 {
+            fc.record_stream_consumed(stream_id, 1).expect("tiny drain");
+            assert!(fc.take_update_frames().is_empty());
+        }
+
+        // The very next byte crosses the 20-byte half-initial-window
+        // threshold and emits exactly initial(40) + drained(20) = 60.
+        fc.record_stream_consumed(stream_id, 1)
+            .expect("crossing drain");
+        let frames = fc.take_update_frames();
+        assert_eq!(
+            frames,
+            vec![QuicFrame::MaxStreamData {
+                stream_id,
+                max_stream_data: 60,
+            }]
+        );
+    }
+
+    // Stream completion must release per-stream bookkeeping cleanly. The
+    // connection-level counter is monotonic across stream lifetimes
+    // (RFC 9000 Section 4.1) so completed streams must not be double-counted
+    // into the next stream's absolute value.
+    #[test]
+    fn release_stream_drops_per_stream_state_without_double_counting_connection() {
+        let mut fc = client_flow_control();
+        let stream_a = 0;
+        let stream_b = 4;
+
+        fc.record_stream_consumed(stream_a, 40)
+            .expect("a fully drains");
+        let _ = fc.take_update_frames();
+        // Stream A retires.
+        fc.release_stream(stream_a);
+        assert!(
+            !fc.stream_consumed.contains_key(&stream_a),
+            "release_stream must clear per-stream consumed bookkeeping"
+        );
+        assert!(
+            !fc.last_announced_max_stream_data.contains_key(&stream_a),
+            "release_stream must clear per-stream announced bookkeeping"
+        );
+
+        // Stream B drains fresh; the connection counter still reflects
+        // 40 (from A) + 30 (from B) = 70, not 30 alone, and not 110.
+        fc.record_stream_consumed(stream_b, 30)
+            .expect("b drains after a retired");
+        let frames = fc.take_update_frames();
+        // 70 >= connection threshold (50): emit MAX_DATA with absolute
+        // initial(100) + connection_consumed(70) = 170.
+        assert!(frames.contains(&QuicFrame::MaxData(170)));
+        // Per-stream B is still ahead of its threshold and emits
+        // initial(40) + per-stream(30) = 70.
+        assert!(frames.contains(&QuicFrame::MaxStreamData {
+            stream_id: stream_b,
+            max_stream_data: 70,
+        }));
+    }
+
+    // RFC 9000 Section 4.1: violations of an advertised limit MUST cause a
+    // FLOW_CONTROL_ERROR. The receive-side enforcement still uses the
+    // advertised window, which now grows from the consumed counter; once we
+    // advertise more, the peer is allowed to send up to that new limit.
+    #[test]
+    fn observe_stream_frame_uses_advertised_limit_after_consume_grows_window() {
+        let mut fc = client_flow_control();
+        let stream_id = 0;
+
+        // Without any consumption, the initial 40-byte stream window is
+        // enforced.
+        let too_much = fc.observe_stream_frame(stream_id, Some(0), 41);
+        assert!(too_much.is_err(), "must reject data above initial limit");
+
+        // Drain 40 bytes to push absolute to 80; emit and clear frames.
+        fc.observe_stream_frame(stream_id, Some(0), 40)
+            .expect("fill initial window");
+        fc.record_stream_consumed(stream_id, 40)
+            .expect("drain initial window");
+        let _ = fc.take_update_frames();
+
+        // 41 more bytes (offsets 40..81) now fit under the new 80 absolute.
+        fc.observe_stream_frame(stream_id, Some(40), 40)
+            .expect("data within newly advertised window");
+    }
 }

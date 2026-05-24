@@ -111,7 +111,10 @@ pub enum NativeH3HandshakeStatus {
 
 impl NativeH3HandshakeStatus {
     pub fn is_resumed(self) -> bool {
-        matches!(self, Self::Resumed | Self::EarlyAccepted | Self::EarlyRejected)
+        matches!(
+            self,
+            Self::Resumed | Self::EarlyAccepted | Self::EarlyRejected
+        )
     }
 
     pub fn early_data_accepted(self) -> bool {
@@ -440,15 +443,12 @@ impl NativeQuicTlsSession {
         let ssl = self.ssl.as_ptr().cast_const();
         let reused = unsafe { SSL_session_reused(ssl) != 0 };
         let zero_rtt_offered = self.zero_rtt_offer.is_some();
-        if !reused && !zero_rtt_offered {
-            return NativeH3HandshakeStatus::None;
-        }
-        let accepted = unsafe { SSL_early_data_accepted(ssl) != 0 };
-        let in_early = unsafe { SSL_in_early_data(ssl) != 0 };
-        match (reused, zero_rtt_offered, accepted || in_early) {
-            (true, true, true) => NativeH3HandshakeStatus::EarlyAccepted,
-            (true, true, false) => NativeH3HandshakeStatus::EarlyRejected,
-            (true, false, _) => NativeH3HandshakeStatus::Resumed,
+        let accepted_or_in_early =
+            unsafe { SSL_early_data_accepted(ssl) != 0 || SSL_in_early_data(ssl) != 0 };
+        match (reused, accepted_or_in_early, zero_rtt_offered) {
+            (true, true, _) => NativeH3HandshakeStatus::EarlyAccepted,
+            (true, false, true) => NativeH3HandshakeStatus::EarlyRejected,
+            (true, false, false) => NativeH3HandshakeStatus::Resumed,
             (false, _, _) => NativeH3HandshakeStatus::None,
         }
     }
@@ -889,7 +889,7 @@ unsafe fn write_decompressed_cert(
     result: std::io::Result<usize>,
     decompressed: &[u8],
 ) -> c_int {
-    if !matches!(result, Ok(_) if decompressed.len() == uncompressed_len) {
+    if !result.is_ok() && (decompressed.len() == uncompressed_len) {
         return 0;
     }
 

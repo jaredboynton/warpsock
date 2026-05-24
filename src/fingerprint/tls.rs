@@ -152,6 +152,11 @@ pub enum TlsExtensionOrderBehavior {
     Deterministic,
 }
 
+/// Historical reason string preserved so downstream callers that pattern-match on the
+/// "TLS resumption: unsupported" diagnostic still link. Native H3 now wires
+/// `SSL_CTX_sess_set_new_cb` / `SSL_set_session` (RFC 8446 section 2.2) and
+/// `SSL_set_quic_early_data_context` (RFC 9001 section 4.6), so the constants
+/// are retained only as immutable historical text.
 pub const NATIVE_H3_SESSION_RESUMPTION_UNSUPPORTED_REASON: &str =
     "native H3 does not yet wire BoringSSL session tickets into the QUIC handshake";
 pub const NATIVE_H3_ZERO_RTT_UNSUPPORTED_REASON: &str =
@@ -171,6 +176,15 @@ impl NativeH3TlsFeatureStatus {
 }
 
 /// Native HTTP/3 TLS capabilities derived from the current fingerprint/config surface.
+///
+/// Session resumption is reported as [`NativeH3TlsFeatureStatus::Supported`] because
+/// the native H3 TLS context now captures TLS 1.3 NewSessionTicket frames via
+/// `SSL_CTX_sess_set_new_cb` and replays them with `SSL_set_session` (RFC 8446
+/// section 4.6.1). 0-RTT is reported as [`NativeH3TlsFeatureStatus::Supported`]
+/// because the native H3 TLS context configures a QUIC early-data context via
+/// `SSL_set_quic_early_data_context` and surfaces accept/reject through
+/// `SSL_early_data_accepted` per RFC 9001 sections 4.6 / 9.2. Per-handshake
+/// outcome is reported separately by `NativeQuicTlsSession::handshake_status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeH3TlsCapabilities {
     pub session_resumption: NativeH3TlsFeatureStatus,
@@ -180,12 +194,8 @@ pub struct NativeH3TlsCapabilities {
 impl NativeH3TlsCapabilities {
     pub fn current() -> Self {
         Self {
-            session_resumption: NativeH3TlsFeatureStatus::Unsupported {
-                reason: NATIVE_H3_SESSION_RESUMPTION_UNSUPPORTED_REASON,
-            },
-            zero_rtt: NativeH3TlsFeatureStatus::Unsupported {
-                reason: NATIVE_H3_ZERO_RTT_UNSUPPORTED_REASON,
-            },
+            session_resumption: NativeH3TlsFeatureStatus::Supported,
+            zero_rtt: NativeH3TlsFeatureStatus::Supported,
         }
     }
 
