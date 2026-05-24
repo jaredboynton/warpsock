@@ -13,7 +13,7 @@ Specter now has credible proof for the H1/H2, RFC6455, and local same-fixture na
 - **Live Codex WSS vs tokio-tungstenite:** persisted n=50 artifact passes all samples and shows better Specter p95 tail, but median TTFT remains within/noisy against tungstenite.
 - **Native H3 HTTP comparator:** isolated comparator crate now has a release-grade n=30 proof at `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-full-local-n30-plus-rfc9220-comparators.json` with real rows for `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest_h3`; optional transport-only `quinn_transport`/`s2n_quic_transport` rows are measured separately and fixture packet errors now carry stable `category`/`fatal` fields if they reappear.
 - **RFC9220 WebSocket-over-H3:** correctness/API exists as a raw byte tunnel. The same-fixture proof now includes Specter local rows for echo, client DATA+FIN/server FIN, a slow-consumer tunnel plus concurrent H3 streaming workload, and measured low-level `quiche`/`tokio-quiche` raw tunnel comparator rows. There is still no published RFC9220 tunnel superiority claim because p99-scale samples and a dedicated tunnel gate remain open.
-- **Native QUIC production readiness:** still not production-complete; PTO send-time tracking, ACK-driven RTT/PTO estimator updates, client Initial/Handshake plus server Initial/Handshake CRYPTO PTO retransmission, event-level peer-close draining, bounded client CONNECTION_CLOSE replay, 1-RTT key-update handling, ACK_ECN frame/counter validation, Retry/VN client-handshake handling, client PATH_CHALLENGE/PATH_RESPONSE token lifecycle, and H3Client-level native session-cache wiring exist, but full packet-space recovery/backoff, RFC-grade close-drain timing, ECN marking/congestion response, per-address path migration, and 0-RTT replay policy remain gaps.
+- **Native QUIC production readiness:** still not production-complete; PTO send-time tracking, ACK-driven RTT/PTO estimator updates, client Initial/Handshake plus server Initial/Handshake CRYPTO PTO retransmission, client application-space PTO timer/retransmit, event-level peer-close draining, bounded client CONNECTION_CLOSE replay, 1-RTT key-update handling, ACK_ECN frame/counter validation, Retry/VN client-handshake handling, client PATH_CHALLENGE/PATH_RESPONSE token lifecycle, and H3Client-level native session-cache wiring exist, but full packet-space recovery/backoff, RFC-grade close-drain timing, ECN marking/congestion response, per-address path migration, and 0-RTT replay policy remain gaps.
 
 ## Direct answers captured during audit
 
@@ -121,6 +121,7 @@ Specter status:
 - RTT sampling is no longer a disconnected helper: newly ACKed largest sent packets update the native loss detector's latest/min/smoothed RTT, RTT variance, and PTO estimate.
 - Client Initial PTO replay is no longer just a helper: H3 connection establishment records Initial sends, arms the loss-detection timer, retransmits Initial CRYPTO on PTO, retires ACKed Initial CRYPTO, and releases recovery bytes-in-flight on Initial ACKs.
 - Server-side CRYPTO PTO retransmission is no longer missing: native server Initial and Handshake CRYPTO flights are tracked by packet number, ACK-retired, and retransmitted with preserved CRYPTO offsets and fresh packet numbers when PTO expires.
+- Client application-space PTO is no longer driver-dark: native H3 marks handshake completion for application recovery, feeds application ACKs into `RecoveryState`, treats the loss-detection deadline as pending driver work, wakes on that timer, and retransmits unacked client STREAM packets on application PTO.
 - Client path validation is no longer just a helper: native QUIC can packetize PATH_CHALLENGE and validate matching PATH_RESPONSE tokens; full migration/per-address state remains open.
 - Retry/VN is no longer only packet parsing: the native client handshake now drives Retry-driven Initial restart (validate QUIC v1 integrity, swap DCID to the Retry SCID, regenerate Initial keys, replay CRYPTO from offset zero with the Retry token), VN-driven Initial restart (RFC9000 § 6.1–6.3 supported-version selection via `set_supported_versions`, regenerated source connection ID, full per-attempt state reset, `version_negotiation_failed` error on no overlap), RFC9000 § 17.2.5.1/.2 and § 6.1–6.3 loop guards (single Retry per attempt, late Retry discard once Initial/Handshake is observed, single VN response, VN listing the issued version discarded), and validates server CID transport parameters after Retry.
 - H3 scheduling is no longer FIFO-only: the native driver has request-body/tunnel class rotation, stream rotation, RTT/loss/BDP-aware adaptive DATA budgets, and H3Client slow-path admission now acquires origin-fair dispatcher tickets before fresh connects.
@@ -133,7 +134,7 @@ Specter status:
 
 ### P0
 
-1. **RFC9002 recovery/PTO completion:** send-time tracking, ACK-driven RTT/PTO estimator updates, client Initial/Handshake CRYPTO PTO retransmission, and server Initial/Handshake CRYPTO PTO retransmission exist, but full PTO backoff, unified packet-space timer coverage after handshake, and production loss recovery remain open.
+1. **RFC9002 recovery/PTO completion:** send-time tracking, ACK-driven RTT/PTO estimator updates, client Initial/Handshake CRYPTO PTO retransmission, server Initial/Handshake CRYPTO PTO retransmission, and client application-space PTO timer/retransmit exist, but full production loss recovery, server-side application timer integration, and broader packet-space/backoff policy remain open.
 2. **RFC9220 statistical proof:** Specter local tunnel echo, close/FIN, slow-consumer mixed rows, and low-level `quiche`/`tokio-quiche` raw tunnel echo comparator rows are persisted at n=30; statistically meaningful p99 (n>=100), third-party close/mixed comparator coverage, and a dedicated tunnel superiority gate remain missing.
 
 ### P1
@@ -174,7 +175,7 @@ Specter status:
    - Third-party RFC9220 comparators: low-level `quiche` and `tokio-quiche` Extended CONNECT tunnel adapters are now measured; keep `reqwest`, `h3-quinn`, and `tokio-tungstenite` as unsupported capability rows unless their public APIs grow RFC9220/H3 tunnel support.
 
 6. **Close native QUIC production gaps**
-   - Continue from landed PTO send-time tracking and client/server CRYPTO PTO retransmission toward full packet-space recovery/PTO and post-handshake timer integration.
+   - Continue from landed PTO send-time tracking, client/server CRYPTO PTO retransmission, and client application PTO toward full packet-space recovery/PTO, server-side application timer integration, and production backoff policy.
    - Keep Retry/version negotiation and key update under regression coverage while finishing close drain and path migration.
    - Finish ECN marking/congestion response, PMTU/path probing, and browser capture parity after the recovery/state-machine core is stable.
 
