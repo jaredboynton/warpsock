@@ -987,6 +987,175 @@ impl QuicLossDetector {
     }
 }
 
+/// RFC9000 § 10.2 connection-close phase tracker. Endpoints enter the
+/// `Closing` phase after sending a CONNECTION_CLOSE frame and the `Draining`
+/// phase after receiving one from the peer. Both terminate after a 3*PTO
+/// window expires, at which point the connection state is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicClosePhase {
+    Open,
+    Closing,
+    Draining,
+}
+
+impl Default for QuicClosePhase {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// RFC9000 § 10.2 close-state machine. Tracks the active close phase, the
+/// instant we entered it, and the metadata required to rate-limit
+/// CONNECTION_CLOSE replays per RFC9000 § 10.2.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicCloseState {
+    phase: QuicClosePhase,
+    started_at: Option<Instant>,
+    last_replay_at: Option<Instant>,
+    packets_since_last_replay: u64,
+    /// RFC9000 § 10.2.1: minimum number of inbound packets received during
+    /// the closing phase before another CONNECTION_CLOSE may be replayed.
+    /// The default of 1 means we ack any peer packet, but the floor still
+    /// requires `replay_min_interval` to have passed.
+    replay_packet_threshold: u64,
+    /// Minimum wall-clock interval between CONNECTION_CLOSE replays. Defaults
+    /// to one PTO when constructed via `with_replay_interval_from_loss_detector`.
+    replay_min_interval: Duration,
+}
+
+impl Default for QuicCloseState {
+    fn default() -> Self {
+        Self {
+            phase: QuicClosePhase::Open,
+            started_at: None,
+            last_replay_at: None,
+            packets_since_last_replay: 0,
+            replay_packet_threshold: 1,
+            replay_min_interval: TIMER_GRANULARITY,
+        }
+    }
+}
+
+impl QuicCloseState {
+    pub fn phase(&self) -> QuicClosePhase {
+        self.phase
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self.phase, QuicClosePhase::Open)
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self.phase, QuicClosePhase::Closing)
+    }
+
+    pub fn is_draining(&self) -> bool {
+        matches!(self.phase, QuicClosePhase::Draining)
+    }
+
+    pub fn started_at(&self) -> Option<Instant> {
+        self.started_at
+    }
+
+    pub fn replay_packet_threshold(&self) -> u64 {
+        self.replay_packet_threshold
+    }
+
+    pub fn replay_min_interval(&self) -> Duration {
+        self.replay_min_interval
+    }
+
+    pub fn set_replay_packet_threshold(&mut self, threshold: u64) {
+        self.replay_packet_threshold = threshold.max(1);
+    }
+
+    pub fn set_replay_min_interval(&mut self, interval: Duration) {
+        self.replay_min_interval = interval.max(TIMER_GRANULARITY);
+    }
+
+    /// Transition into the RFC9000 § 10.2 closing phase. No-op if the
+    /// connection is already closing or draining (peer-driven draining wins
+    /// over a subsequent local close).
+    pub fn enter_closing(&mut self, now: Instant) {
+        if !matches!(self.phase, QuicClosePhase::Open) {
+            return;
+        }
+        self.phase = QuicClosePhase::Closing;
+        self.started_at = Some(now);
+        self.last_replay_at = Some(now);
+        self.packets_since_last_replay = 0;
+    }
+
+    /// Transition into the RFC9000 § 10.2 draining phase. This is permitted
+    /// from `Open` or `Closing` because receiving a peer CONNECTION_CLOSE
+    /// supersedes any local closing-phase replay obligations: RFC9000 § 10.2
+    /// requires draining endpoints to stop sending application packets.
+    pub fn enter_draining(&mut self, now: Instant) {
+        if matches!(self.phase, QuicClosePhase::Draining) {
+            return;
+        }
+        self.phase = QuicClosePhase::Draining;
+        self.started_at = Some(now);
+    }
+
+    /// Record one inbound packet that arrived while in the closing phase.
+    /// Returns the new packet counter so callers can log or assert progress.
+    pub fn observe_inbound_packet(&mut self) -> u64 {
+        if matches!(self.phase, QuicClosePhase::Closing) {
+            self.packets_since_last_replay =
+                self.packets_since_last_replay.saturating_add(1);
+        }
+        self.packets_since_last_replay
+    }
+
+    /// RFC9000 § 10.2.1: an endpoint SHOULD rate-limit CONNECTION_CLOSE
+    /// replays sent in response to peer packets to avoid amplification. We
+    /// gate replays on both an inbound packet count threshold and a minimum
+    /// wall-clock interval (one PTO by default).
+    pub fn should_replay(&self, now: Instant) -> bool {
+        if !matches!(self.phase, QuicClosePhase::Closing) {
+            return false;
+        }
+        if self.packets_since_last_replay < self.replay_packet_threshold {
+            return false;
+        }
+        match self.last_replay_at {
+            Some(last) => now.saturating_duration_since(last) >= self.replay_min_interval,
+            None => true,
+        }
+    }
+
+    /// Record that a CONNECTION_CLOSE replay was just sent. Resets the
+    /// inbound-packet counter so the next replay must wait for the
+    /// configured threshold and interval again.
+    pub fn mark_replayed(&mut self, now: Instant) {
+        self.last_replay_at = Some(now);
+        self.packets_since_last_replay = 0;
+    }
+
+    /// Returns `true` when the configured close window has elapsed since the
+    /// phase was entered. The caller passes the active `close_window`
+    /// (typically `3 * current_PTO` from a `QuicLossDetector`).
+    pub fn is_expired(&self, now: Instant, close_window: Duration) -> bool {
+        match (self.phase, self.started_at) {
+            (QuicClosePhase::Open, _) => false,
+            (_, Some(started)) => now.saturating_duration_since(started) >= close_window,
+            (_, None) => false,
+        }
+    }
+
+    /// Remaining time (if any) until the close window expires. Returns `None`
+    /// when the connection is still open or already past expiry.
+    pub fn time_until_expiry(&self, now: Instant, close_window: Duration) -> Option<Duration> {
+        let started = self.started_at?;
+        if matches!(self.phase, QuicClosePhase::Open) {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(started);
+        close_window.checked_sub(elapsed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicInitialKeyMaterial {
     pub initial_secret: Bytes,
@@ -2793,5 +2962,166 @@ fn varint_len(value: u64) -> usize {
         0x40..=0x3fff => 2,
         0x4000..=0x3fff_ffff => 4,
         _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod close_state_tests {
+    use super::*;
+
+    fn ack_frame(largest_acknowledged: u64, ack_delay: u64) -> QuicFrame {
+        QuicFrame::Ack {
+            largest_acknowledged,
+            ack_delay,
+            first_ack_range: 0,
+            ranges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn loss_detector_uses_initial_rtt_when_no_samples_have_been_taken() {
+        let detector = QuicLossDetector::default().with_max_ack_delay(Duration::from_millis(25));
+        let pto = detector.current_pto();
+        let expected_variance =
+            (INITIAL_RTT / 2).saturating_mul(4).max(TIMER_GRANULARITY);
+        let expected = INITIAL_RTT + expected_variance + Duration::from_millis(25);
+        assert_eq!(pto, expected, "initial PTO must follow RFC9002 6.2.1 defaults");
+        assert_eq!(detector.close_window(), expected * 3);
+        assert!(detector.smoothed_rtt().is_none());
+    }
+
+    #[test]
+    fn loss_detector_takes_rtt_sample_from_largest_ack() {
+        let mut detector = QuicLossDetector::default()
+            .with_max_ack_delay(Duration::from_millis(25))
+            .with_peer_ack_delay_exponent(0);
+        let sent_at = Instant::now();
+        detector.on_packet_sent_at(7, sent_at);
+        let acked_at = sent_at + Duration::from_millis(80);
+        let acked = detector
+            .on_ack_frame_at(&ack_frame(7, 10_000), acked_at)
+            .expect("ack frame decoded");
+        assert!(acked.contains(&7));
+        assert!(detector.smoothed_rtt().is_some());
+        let smoothed = detector.smoothed_rtt().unwrap();
+        let latest = detector.latest_rtt().unwrap();
+        assert_eq!(latest, Duration::from_millis(80));
+        let min_rtt = detector.min_rtt().unwrap();
+        assert_eq!(min_rtt, latest, "first sample establishes min_rtt");
+        let expected_adjusted = latest - Duration::from_millis(10);
+        assert_eq!(
+            smoothed, expected_adjusted,
+            "first smoothed_rtt is the adjusted latest sample"
+        );
+        let rttvar = detector.rttvar();
+        assert_eq!(rttvar, expected_adjusted / 2);
+
+        let pto = detector.current_pto();
+        let expected_pto =
+            smoothed + (rttvar.saturating_mul(4)).max(TIMER_GRANULARITY) + Duration::from_millis(25);
+        assert_eq!(pto, expected_pto);
+    }
+
+    #[test]
+    fn loss_detector_smooths_subsequent_rtt_samples() {
+        let mut detector = QuicLossDetector::default()
+            .with_max_ack_delay(Duration::from_millis(25))
+            .with_peer_ack_delay_exponent(0);
+        let base = Instant::now();
+        detector.on_packet_sent_at(1, base);
+        detector
+            .on_ack_frame_at(&ack_frame(1, 0), base + Duration::from_millis(100))
+            .unwrap();
+        let smoothed_after_first = detector.smoothed_rtt().unwrap();
+        let rttvar_after_first = detector.rttvar();
+
+        detector.on_packet_sent_at(2, base + Duration::from_millis(120));
+        detector
+            .on_ack_frame_at(&ack_frame(2, 0), base + Duration::from_millis(240))
+            .unwrap();
+        let smoothed_after_second = detector.smoothed_rtt().unwrap();
+        let rttvar_after_second = detector.rttvar();
+
+        let expected_smoothed = (smoothed_after_first * 7 + Duration::from_millis(120)) / 8;
+        assert_eq!(smoothed_after_second, expected_smoothed);
+
+        let rttvar_sample = duration_abs_diff(smoothed_after_first, Duration::from_millis(120));
+        let expected_rttvar = (rttvar_after_first * 3 + rttvar_sample) / 4;
+        assert_eq!(rttvar_after_second, expected_rttvar);
+
+        let min_rtt = detector.min_rtt().unwrap();
+        assert_eq!(min_rtt, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn close_state_enters_closing_then_expires_after_three_pto() {
+        let mut state = QuicCloseState::default();
+        let now = Instant::now();
+        let close_window = Duration::from_millis(900);
+        assert!(state.is_open());
+        state.enter_closing(now);
+        assert!(state.is_closing());
+        assert!(!state.is_expired(now, close_window));
+        assert!(!state.is_expired(now + close_window - TIMER_GRANULARITY, close_window));
+        assert!(state.is_expired(now + close_window, close_window));
+    }
+
+    #[test]
+    fn close_state_draining_supersedes_closing() {
+        let mut state = QuicCloseState::default();
+        let t0 = Instant::now();
+        state.enter_closing(t0);
+        let t1 = t0 + Duration::from_millis(10);
+        state.enter_draining(t1);
+        assert!(state.is_draining());
+        assert!(!state.is_closing());
+        assert!(state.started_at().is_some());
+    }
+
+    #[test]
+    fn close_state_replay_is_rate_limited_by_interval_and_packet_count() {
+        let mut state = QuicCloseState::default();
+        state.set_replay_min_interval(Duration::from_millis(50));
+        state.set_replay_packet_threshold(2);
+        let t0 = Instant::now();
+        state.enter_closing(t0);
+
+        assert!(
+            !state.should_replay(t0),
+            "no peer packets observed yet, replay must wait"
+        );
+        state.observe_inbound_packet();
+        assert!(
+            !state.should_replay(t0 + Duration::from_millis(60)),
+            "only one packet seen, threshold of 2 not met"
+        );
+        state.observe_inbound_packet();
+        assert!(
+            !state.should_replay(t0 + Duration::from_millis(10)),
+            "interval not yet elapsed"
+        );
+        assert!(
+            state.should_replay(t0 + Duration::from_millis(60)),
+            "interval elapsed and packet threshold met"
+        );
+        state.mark_replayed(t0 + Duration::from_millis(60));
+        assert!(
+            !state.should_replay(t0 + Duration::from_millis(60)),
+            "after mark_replayed the counter is reset"
+        );
+        state.observe_inbound_packet();
+        state.observe_inbound_packet();
+        assert!(state.should_replay(t0 + Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn close_state_does_not_replay_in_draining_phase() {
+        let mut state = QuicCloseState::default();
+        state.set_replay_min_interval(Duration::from_millis(50));
+        let t0 = Instant::now();
+        state.enter_draining(t0);
+        state.observe_inbound_packet();
+        state.observe_inbound_packet();
+        assert!(!state.should_replay(t0 + Duration::from_secs(5)));
     }
 }

@@ -8,6 +8,7 @@ pub mod handshake;
 pub mod native;
 pub mod native_driver;
 pub mod quic;
+pub mod recovery;
 pub mod tls;
 mod tunnel;
 
@@ -17,6 +18,19 @@ pub use connection::H3Connection;
 pub use handle::H3Handle;
 pub(crate) use tunnel::H3TunnelCredit;
 pub use tunnel::{H3Tunnel, H3TunnelEvent, H3TunnelOutbound};
+
+/// Default outbound byte budget for an RFC 9220 tunnel send path.
+///
+/// Acts as a per-tunnel cap on the bytes that can be queued from the public
+/// `H3Tunnel` handle through the driver before `send_bytes` exerts
+/// backpressure on the caller. Replaces the legacy item-count bound that
+/// treated a 1 MiB chunk and a 64 B chunk as equally costly.
+pub const DEFAULT_H3_TUNNEL_OUTBOUND_BYTE_BUDGET: usize = 256 * 1024;
+
+/// Minimum accepted outbound byte budget. Values below this are clamped up by
+/// [`H3TransportConfig::normalized`] so that even pathological configs leave
+/// enough credit for control-plane sends.
+pub const MIN_H3_TUNNEL_OUTBOUND_BYTE_BUDGET: usize = 1024;
 
 // Re-implement H3Client using the new H3Connection/Handle architecture
 // to maintain API compatibility but gain multiplexing.

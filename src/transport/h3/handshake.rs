@@ -18,9 +18,12 @@ use crate::transport::h3::quic::{
     QuicPathValidator, TransportParameter,
 };
 use crate::transport::h3::tls::{
-    build_client_initial_packet_from_capture_with_size, ClientInitialPacket, NativeQuicTlsSession,
-    QuicEncryptionLevel, QuicSecretDirection, QuicTlsSecret,
+    build_client_initial_packet_from_capture_with_size,
+    build_client_initial_packet_from_capture_with_version_and_size, ClientInitialPacket,
+    NativeQuicTlsSession, QuicEncryptionLevel, QuicSecretDirection, QuicTlsSecret,
 };
+
+use getrandom::fill as getrandom_fill;
 
 const QUIC_VERSION_1: u32 = 1;
 const INITIAL_PACKET_NUMBER_LEN: usize = 4;
@@ -493,6 +496,16 @@ pub struct NativeQuicHandshake {
     pending_client_initial: Option<ClientInitialPacket>,
     tls: NativeQuicTlsSession,
     fingerprint: Http3Fingerprint,
+    server_name: String,
+    tls_fingerprint: Option<TlsFingerprint>,
+    verify_peer: bool,
+    root_certs: Vec<Vec<u8>>,
+    use_platform_roots: bool,
+    supported_versions: Vec<u32>,
+    client_initial_version: u32,
+    retry_received: bool,
+    vn_received: bool,
+    server_initial_or_handshake_seen: bool,
     original_destination_cid: ConnectionId,
     retry_source_cid: Option<ConnectionId>,
     destination_cid: ConnectionId,
@@ -1492,6 +1505,16 @@ impl NativeQuicHandshake {
             pending_client_initial: None,
             tls,
             fingerprint: fingerprint.clone(),
+            server_name: server_name.to_string(),
+            tls_fingerprint: tls_fingerprint.cloned(),
+            verify_peer,
+            root_certs: root_certs.to_vec(),
+            use_platform_roots,
+            supported_versions: vec![QUIC_VERSION_1],
+            client_initial_version: QUIC_VERSION_1,
+            retry_received: false,
+            vn_received: false,
+            server_initial_or_handshake_seen: false,
             original_destination_cid: destination_cid.clone(),
             retry_source_cid: None,
             destination_cid,

@@ -40,6 +40,12 @@ unsafe extern "C" {
         context: *const u8,
         context_len: usize,
     ) -> c_int;
+    fn SSL_CTX_set_early_data_enabled(ctx: *mut ffi::SSL_CTX, enabled: c_int);
+    fn SSL_set_early_data_enabled(ssl: *mut ffi::SSL, enabled: c_int);
+    fn SSL_in_early_data(ssl: *const ffi::SSL) -> c_int;
+    fn SSL_early_data_accepted(ssl: *const ffi::SSL) -> c_int;
+    fn SSL_session_reused(ssl: *const ffi::SSL) -> c_int;
+    fn SSL_get_early_data_reason(ssl: *const ffi::SSL) -> u32;
 }
 
 const QUIC_VERSION_1: u32 = 1;
@@ -82,6 +88,39 @@ pub struct NativeH3SessionTicket {
 pub struct NativeH3ZeroRttOffer {
     pub early_data_len: usize,
     pub context: Bytes,
+}
+
+/// Runtime status of TLS 1.3 session resumption / QUIC 0-RTT (RFC 9001 section 4.6)
+/// for a native HTTP/3 handshake.
+///
+/// Reported by [`NativeQuicTlsSession::handshake_status`] after the TLS handshake
+/// completes (the read/write application secrets are installed). For unfinished
+/// or non-resuming handshakes the status is [`NativeH3HandshakeStatus::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeH3HandshakeStatus {
+    /// First handshake to this peer/fingerprint or session ticket was not offered.
+    None,
+    /// TLS session resumption succeeded but no 0-RTT data was offered/accepted.
+    Resumed,
+    /// Server accepted the offered 0-RTT (early data) per RFC 9001 section 4.6.
+    EarlyAccepted,
+    /// 0-RTT was offered but the server rejected it; the caller must replay over
+    /// 1-RTT per RFC 8446 section 4.2.10 / RFC 9001 section 4.6.1.
+    EarlyRejected,
+}
+
+impl NativeH3HandshakeStatus {
+    pub fn is_resumed(self) -> bool {
+        matches!(self, Self::Resumed | Self::EarlyAccepted | Self::EarlyRejected)
+    }
+
+    pub fn early_data_accepted(self) -> bool {
+        matches!(self, Self::EarlyAccepted)
+    }
+
+    pub fn early_data_rejected(self) -> bool {
+        matches!(self, Self::EarlyRejected)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -872,6 +911,22 @@ pub fn build_client_initial_packet_from_capture_with_size(
     source_cid: ConnectionId,
     initial_datagram_size: usize,
 ) -> Result<ClientInitialPacket> {
+    build_client_initial_packet_from_capture_with_version_and_size(
+        captured,
+        destination_cid,
+        source_cid,
+        QUIC_VERSION_1,
+        initial_datagram_size,
+    )
+}
+
+pub fn build_client_initial_packet_from_capture_with_version_and_size(
+    captured: CapturedClientInitial,
+    destination_cid: ConnectionId,
+    source_cid: ConnectionId,
+    version: u32,
+    initial_datagram_size: usize,
+) -> Result<ClientInitialPacket> {
     let header_len_without_length =
         1 + 4 + 1 + destination_cid.as_bytes().len() + 1 + source_cid.as_bytes().len() + 1;
     let padded_plaintext_len = initial_plaintext_len(
@@ -882,7 +937,7 @@ pub fn build_client_initial_packet_from_capture_with_size(
     let payload_len = padded_plaintext_len + AES_GCM_TAG_LEN;
     let header = encode_initial_header(&LongHeaderPacket {
         packet_type: LongHeaderType::Initial,
-        version: QUIC_VERSION_1,
+        version,
         destination_cid: destination_cid.clone(),
         source_cid,
         token: Bytes::new(),
