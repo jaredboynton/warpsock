@@ -1,6 +1,7 @@
 use specter::fingerprint::tls::NativeH3TlsFeatureStatus;
 use specter::fingerprint::{
-    FingerprintProfile, H3Settings, Http3Fingerprint, QuicTransportParams, TlsFingerprint,
+    FingerprintProfile, H3Settings, Http3Fingerprint, QuicEcnCodepoint, QuicTransportParams,
+    TlsFingerprint,
 };
 use specter::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
 use specter::{Client, H3Backend, H3Client};
@@ -19,6 +20,7 @@ fn chrome_http3_fingerprint_exposes_quic_h3_and_grease_knobs() {
     assert_eq!(fingerprint.transport.active_connection_id_limit, 2);
     assert!(fingerprint.transport.disable_active_migration);
     assert!(fingerprint.transport.grease);
+    assert_eq!(fingerprint.transport.ecn_codepoint, None);
 
     assert_eq!(fingerprint.settings.qpack_max_table_capacity, Some(0));
     assert_eq!(fingerprint.settings.qpack_blocked_streams, Some(0));
@@ -29,6 +31,16 @@ fn chrome_http3_fingerprint_exposes_quic_h3_and_grease_knobs() {
         FingerprintProfile::Chrome148.http3_fingerprint(),
         fingerprint
     );
+}
+
+#[test]
+fn h3_pool_key_distinguishes_ecn_socket_marking() {
+    let mut marked = Http3Fingerprint::chrome();
+    marked.transport.ecn_codepoint = Some(QuicEcnCodepoint::Ect0);
+    let unmarked = Http3Fingerprint::chrome();
+
+    assert_ne!(marked.pool_key_string(), unmarked.pool_key_string());
+    assert!(marked.pool_key_string().contains("ecn=Some(Ect0)"));
 }
 
 #[test]
