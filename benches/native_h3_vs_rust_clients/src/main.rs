@@ -16,6 +16,7 @@ use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use specter::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 
 const QUICHE_MAX_DATAGRAM_SIZE: usize = 1350;
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1479,10 +1480,19 @@ impl LocalNativeH3Connection {
             let server_application_ack_delay = server_application_ack_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::ZERO);
+            let server_loss_detection_deadline = self.server_loss_detection_deadline();
+            let server_loss_detection_delay = server_loss_detection_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::ZERO);
             tokio::select! {
                 _ = tokio::time::sleep(server_application_ack_delay), if server_application_ack_deadline.is_some() => {
                     if let Err(error) = self.send_delayed_application_ack().await {
                         eprintln!("local native H3 fixture delayed ACK error: {error}");
+                    }
+                }
+                _ = tokio::time::sleep(server_loss_detection_delay), if server_loss_detection_deadline.is_some() => {
+                    if let Err(error) = self.handle_loss_detection_timeout().await {
+                        eprintln!("local native H3 fixture loss detection error: {error}");
                     }
                 }
                 packet = self.rx.recv() => {
@@ -1596,6 +1606,48 @@ impl LocalNativeH3Connection {
             .server_application_ack_deadline(Duration::from_millis(
                 self.fingerprint.transport.max_ack_delay_ms,
             ))
+    }
+
+    fn server_loss_detection_deadline(&self) -> Option<Instant> {
+        self.handshake.loss_detection_timer()
+    }
+
+    async fn handle_loss_detection_timeout(&mut self) -> anyhow::Result<()> {
+        let Some(timer) = self.handshake.loss_detection_timer() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < timer {
+            return Ok(());
+        }
+        let pto = self.handshake.application_pto();
+        match self.handshake.on_loss_detection_timeout(now) {
+            LossDetectionOutcome::Pto {
+                space: PacketNumberSpace::Application,
+            } => {
+                for packet in self
+                    .handshake
+                    .retransmit_pto_server_application_stream_packets(now, pto)?
+                {
+                    self.send_packet(packet.packet).await?;
+                }
+            }
+            LossDetectionOutcome::Loss {
+                space: PacketNumberSpace::Application,
+                ..
+            } => {
+                let retransmits = self
+                    .handshake
+                    .retransmit_lost_server_application_stream_packets()?;
+                for packet in retransmits {
+                    self.send_packet(packet.packet).await?;
+                }
+            }
+            LossDetectionOutcome::Pto { .. }
+            | LossDetectionOutcome::Loss { .. }
+            | LossDetectionOutcome::Idle => {}
+        }
+        Ok(())
     }
 
     async fn send_delayed_application_ack(&mut self) -> anyhow::Result<()> {
