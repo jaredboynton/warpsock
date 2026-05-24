@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -68,6 +69,7 @@ impl H3BodyState {
 /// bounds total in-flight bytes.
 pub struct H3BodyShared {
     state: Mutex<H3BodyState>,
+    released_recv_bytes: AtomicUsize,
     driver_notify: Arc<Notify>,
 }
 
@@ -87,6 +89,7 @@ impl H3BodyShared {
     pub(crate) fn new_with_capacity(driver_notify: Arc<Notify>, capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(H3BodyState::with_capacity(capacity)),
+            released_recv_bytes: AtomicUsize::new(0),
             driver_notify,
         })
     }
@@ -146,6 +149,10 @@ impl H3BodyShared {
     pub(crate) fn is_slot_available(&self) -> bool {
         let state = self.state.lock().expect("h3 body state poisoned");
         !state.closed && state.slots.len() < state.cap
+    }
+
+    pub(crate) fn take_released_recv_bytes(&self) -> usize {
+        self.released_recv_bytes.swap(0, Ordering::Relaxed)
     }
 
     fn close(&self) {
@@ -260,6 +267,9 @@ impl HttpBody for H3Body {
             StatePoll::Pending => {}
             StatePoll::Item(item) => match item {
                 Ok(bytes) => {
+                    self.shared
+                        .released_recv_bytes
+                        .fetch_add(bytes.len(), Ordering::Relaxed);
                     self.shared.driver_notify.notify_one();
                     self.reset_read_idle();
                     if bytes.is_empty() {
@@ -323,5 +333,30 @@ mod tests {
             shared.push(Ok(Bytes::from_static(b"three"))),
             H3BodyPush::Full
         ));
+    }
+
+    #[test]
+    fn h3_body_reports_released_recv_bytes_when_consumer_takes_data() {
+        struct NoopWake;
+
+        impl std::task::Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let shared = H3BodyShared::new_with_capacity(Arc::new(Notify::new()), 2);
+        assert!(matches!(
+            shared.push(Ok(Bytes::from_static(b"hello"))),
+            H3BodyPush::Accepted
+        ));
+
+        let mut body = H3Body::new(shared.clone(), H3BodyTimeouts::default());
+        let waker = std::task::Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+
+        assert_eq!(shared.take_released_recv_bytes(), 0);
+        let frame = Pin::new(&mut body).poll_frame(&mut context);
+        assert!(matches!(frame, Poll::Ready(Some(Ok(_)))));
+        assert_eq!(shared.take_released_recv_bytes(), 5);
+        assert_eq!(shared.take_released_recv_bytes(), 0);
     }
 }
