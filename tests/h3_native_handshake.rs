@@ -1239,11 +1239,22 @@ fn native_h3_client_emits_max_data_after_receive_connection_window_threshold() {
         completed_native_server_handshake_with_fingerprints(client_fingerprint, server_fingerprint);
 
     let packet = server
-        .build_server_h3_raw_stream_packet(0, Bytes::from_static(b"five!"), false)
+        .build_server_h3_raw_stream_packet(0, Bytes::from_static(b"eight!!!"), false)
         .expect("server send credit should not block receive-window update test");
     client
         .open_server_application_packet(packet.packet.as_ref())
         .expect("client should accept data below the advertised receive limit");
+
+    assert!(
+        client
+            .build_client_receive_flow_control_update_packets()
+            .expect("client should packetize receive-window updates")
+            .is_empty(),
+        "receive credit must not be advertised before public body consumption"
+    );
+    client
+        .record_client_stream_consumed(0, 8)
+        .expect("public body consumption should release receive credit");
 
     let updates = client
         .build_client_receive_flow_control_update_packets()
@@ -1277,12 +1288,23 @@ fn native_h3_server_emits_max_stream_data_after_receive_stream_window_threshold(
         completed_native_server_handshake_with_fingerprints(client_fingerprint, server_fingerprint);
 
     let packet = client
-        .build_client_application_stream_packet(0, Bytes::from_static(b"five!"), false)
+        .build_client_application_stream_packet(0, Bytes::from_static(b"eight!!!"), false)
         .expect("client send credit should not block receive-window update test")
         .expect("client should emit a packet");
     server
         .open_client_application_packet(packet.packet.as_ref())
         .expect("server should accept data below the advertised receive limit");
+
+    assert!(
+        server
+            .build_server_receive_flow_control_update_packets()
+            .expect("server should packetize receive-window updates")
+            .is_empty(),
+        "receive credit must not be advertised before public body consumption"
+    );
+    server
+        .record_server_stream_consumed(0, 8)
+        .expect("public body consumption should release receive credit");
 
     let updates = server
         .build_server_receive_flow_control_update_packets()
