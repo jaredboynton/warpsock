@@ -32,6 +32,7 @@
 //! # }
 //! ```
 
+mod body;
 mod connection;
 mod driver;
 mod frame;
@@ -54,6 +55,7 @@ pub use handle::H2Handle;
 pub use hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};
 pub use tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
 
+pub(crate) use body::{H2Body, H2BodyTimeouts};
 use handle::H2InlineState;
 
 // Re-export wrapper types for convenience
@@ -185,6 +187,7 @@ impl H2PooledConnection {
         let (inline_register_tx, inline_register_rx) = tokio::sync::mpsc::unbounded_channel();
         let inline_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inline_eligible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let body_progress_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         let write_half = conn.inner.write_half_arc();
         let peer_max_frame_size = conn.inner.peer_max_frame_size_arc();
@@ -197,6 +200,7 @@ impl H2PooledConnection {
             register_tx: inline_register_tx,
             inline_active: inline_active.clone(),
             inline_eligible: inline_eligible.clone(),
+            body_progress_notify: body_progress_notify.clone(),
         });
 
         let driver = H2Driver::new_with_inline(
@@ -208,6 +212,7 @@ impl H2PooledConnection {
             inline_register_rx,
             inline_active,
             inline_eligible,
+            body_progress_notify,
         );
 
         // Spawn driver task
@@ -244,10 +249,11 @@ impl H2PooledConnection {
         method: Method,
         uri: &Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
-    ) -> Result<(Response, tokio::sync::mpsc::Receiver<Result<Bytes>>)> {
+        body: crate::request::RequestBody,
+        body_timeouts: H2BodyTimeouts,
+    ) -> Result<Response> {
         self.handle
-            .send_streaming_request(method, uri, headers, body)
+            .send_streaming_request(method, uri, headers, body, body_timeouts)
             .await
     }
 

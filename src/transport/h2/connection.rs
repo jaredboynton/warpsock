@@ -707,6 +707,17 @@ where
         Ok(sent)
     }
 
+    /// Current outbound DATA capacity for a stream, bounded by both
+    /// connection-level and stream-level HTTP/2 flow-control windows.
+    pub(crate) async fn available_send_window(&self, stream_id: u32) -> Result<i32> {
+        let stream_send_window = match self.streams.get(&stream_id) {
+            Some(stream) => stream.send_window,
+            None => return Err(Error::HttpProtocol("Stream not found for DATA".into())),
+        };
+        let conn_send_window = self.write_half.conn_send_window().await;
+        Ok(conn_send_window.min(stream_send_window))
+    }
+
     /// Read the next frame from the connection.
     /// Returns (FrameHeader, Payload).
     pub async fn read_next_frame(&mut self) -> Result<(FrameHeader, Bytes)> {

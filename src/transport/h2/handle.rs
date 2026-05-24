@@ -12,8 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
-use crate::response::Response;
+use crate::request::RequestBody;
+use crate::response::{Body, Response};
 use crate::transport::connector::MaybeHttpsStream;
+use crate::transport::h2::body::{H2Body, H2BodyShared, H2BodyTimeouts};
 use crate::transport::h2::driver::{DriverCommand, InlineRegistration, StreamingHeadersResult};
 use crate::transport::h2::tunnel::H2Tunnel;
 use crate::transport::h2::write_half::H2WriteHalf;
@@ -36,6 +38,7 @@ pub(crate) struct H2InlineState {
     /// Disabled while any RFC 8441 tunnel or pending body is in flight; the
     /// driver toggles this flag.
     pub(crate) inline_eligible: Arc<AtomicBool>,
+    pub(crate) body_progress_notify: Arc<tokio::sync::Notify>,
 }
 
 /// HTTP/2 connection handle for sending requests
@@ -122,15 +125,17 @@ impl H2Handle {
         method: Method,
         uri: &Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
-    ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
+        body: RequestBody,
+        body_timeouts: H2BodyTimeouts,
+    ) -> Result<Response> {
+        let body_is_empty = body.is_empty();
         if let Some(result) = self
-            .try_send_streaming_inline(&method, uri, &headers, &body)
+            .try_send_streaming_inline(&method, uri, &headers, body_is_empty, body_timeouts)
             .await
         {
             return result;
         }
-        self.send_streaming_request_command_path(method, uri, headers, body)
+        self.send_streaming_request_command_path(method, uri, headers, body, body_timeouts)
             .await
     }
 
@@ -139,17 +144,18 @@ impl H2Handle {
         method: Method,
         uri: &Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
-    ) -> Result<(Response, mpsc::Receiver<Result<Bytes>>)> {
+        body: RequestBody,
+        body_timeouts: H2BodyTimeouts,
+    ) -> Result<Response> {
         let (headers_tx, headers_rx) = oneshot::channel();
-        let (body_tx, body_rx) = mpsc::channel(32);
+        let body_shared = H2BodyShared::new(self.body_progress_notify());
 
         let command = DriverCommand::SendStreamingRequest {
             method,
             uri: uri.clone(),
             headers,
             body,
-            body_tx,
+            body_shared: body_shared.clone(),
             headers_tx,
         };
 
@@ -162,14 +168,11 @@ impl H2Handle {
             .await
             .map_err(|_| Error::HttpProtocol("Headers channel closed".into()))??;
 
-        Ok((
-            Response::new(
-                status,
-                Headers::from(regular_headers),
-                Bytes::new(),
-                "HTTP/2".to_string(),
-            ),
-            body_rx,
+        Ok(Response::with_body(
+            status,
+            Headers::from(regular_headers),
+            Body::from_h2(H2Body::new(body_shared, body_timeouts)),
+            "HTTP/2".to_string(),
         ))
     }
 
@@ -182,13 +185,14 @@ impl H2Handle {
         method: &Method,
         uri: &Uri,
         headers: &[(String, String)],
-        body: &Option<Bytes>,
-    ) -> Option<Result<(Response, mpsc::Receiver<Result<Bytes>>)>> {
+        body_is_empty: bool,
+        body_timeouts: H2BodyTimeouts,
+    ) -> Option<Result<Response>> {
         let inline = self.inline.as_ref()?;
         if !self.is_alive() {
             return None;
         }
-        if body.as_ref().is_some_and(|b| !b.is_empty()) {
+        if !body_is_empty {
             return None;
         }
         if !inline.inline_eligible.load(Ordering::Relaxed) {
@@ -204,7 +208,7 @@ impl H2Handle {
         }
 
         let (headers_tx, headers_rx) = oneshot::channel::<StreamingHeadersResult>();
-        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes>>(32);
+        let body_shared = H2BodyShared::new(inline.body_progress_notify.clone());
 
         let max_frame_size = inline.peer_max_frame_size.load(Ordering::Relaxed) as usize;
         let stream_id = match inline
@@ -222,7 +226,7 @@ impl H2Handle {
         let registration = InlineRegistration {
             stream_id,
             headers_tx,
-            body_tx,
+            body_shared: body_shared.clone(),
             recv_window: inline.initial_window_size as i32,
         };
 
@@ -232,20 +236,24 @@ impl H2Handle {
         }
 
         let result = match headers_rx.await {
-            Ok(Ok((status, regular_headers))) => Ok((
-                Response::new(
-                    status,
-                    Headers::from(regular_headers),
-                    Bytes::new(),
-                    "HTTP/2".to_string(),
-                ),
-                body_rx,
+            Ok(Ok((status, regular_headers))) => Ok(Response::with_body(
+                status,
+                Headers::from(regular_headers),
+                Body::from_h2(H2Body::new(body_shared, body_timeouts)),
+                "HTTP/2".to_string(),
             )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::HttpProtocol("Headers channel closed".into())),
         };
 
         Some(result)
+    }
+
+    fn body_progress_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.inline
+            .as_ref()
+            .map(|inline| inline.body_progress_notify.clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()))
     }
 
     /// Open an RFC 8441 WebSocket tunnel through the background H2 driver.

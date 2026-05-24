@@ -34,6 +34,7 @@ enum BodyInner {
     Buffered(Option<Bytes>),
     Channel(mpsc::Receiver<std::result::Result<Bytes, Error>>),
     H1(crate::transport::h1::H1Body),
+    H2(crate::transport::h2::H2Body),
 }
 
 impl Body {
@@ -71,6 +72,13 @@ impl Body {
         }
     }
 
+    /// Wrap an HTTP/2 wakeable-slot response body.
+    pub(crate) fn from_h2(body: crate::transport::h2::H2Body) -> Self {
+        Self {
+            inner: BodyInner::H2(body),
+        }
+    }
+
     /// `true` for an empty buffered body. Streaming bodies report `false`
     /// because the buffered length is unknown until the body is drained.
     pub fn is_empty(&self) -> bool {
@@ -78,13 +86,16 @@ impl Body {
             BodyInner::Empty => true,
             BodyInner::Buffered(Some(b)) => b.is_empty(),
             BodyInner::Buffered(None) => true,
-            BodyInner::Channel(_) | BodyInner::H1(_) => false,
+            BodyInner::Channel(_) | BodyInner::H1(_) | BodyInner::H2(_) => false,
         }
     }
 
     /// `true` if the body was created from a streaming transport channel.
     pub fn is_streaming(&self) -> bool {
-        matches!(self.inner, BodyInner::Channel(_) | BodyInner::H1(_))
+        matches!(
+            self.inner,
+            BodyInner::Channel(_) | BodyInner::H1(_) | BodyInner::H2(_)
+        )
     }
 
     /// Return a reference to the buffered bytes when the body is fully
@@ -102,7 +113,7 @@ impl Body {
             BodyInner::Empty => Some(0),
             BodyInner::Buffered(Some(b)) => Some(b.len()),
             BodyInner::Buffered(None) => Some(0),
-            BodyInner::Channel(_) | BodyInner::H1(_) => None,
+            BodyInner::Channel(_) | BodyInner::H1(_) | BodyInner::H2(_) => None,
         }
     }
 
@@ -152,6 +163,7 @@ impl fmt::Debug for Body {
             BodyInner::Buffered(None) => f.debug_struct("Body::Buffered").field("len", &0).finish(),
             BodyInner::Channel(_) => f.debug_struct("Body::Streaming").finish(),
             BodyInner::H1(_) => f.debug_struct("Body::H1Streaming").finish(),
+            BodyInner::H2(_) => f.debug_struct("Body::H2Streaming").finish(),
         }
     }
 }
@@ -166,7 +178,7 @@ impl Clone for Body {
             BodyInner::Buffered(None) => Self {
                 inner: BodyInner::Buffered(None),
             },
-            BodyInner::Channel(_) | BodyInner::H1(_) => {
+            BodyInner::Channel(_) | BodyInner::H1(_) | BodyInner::H2(_) => {
                 panic!("specter::Body::clone is not supported for streaming bodies")
             }
         }
@@ -200,6 +212,7 @@ impl HttpBody for Body {
                 Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
             },
             BodyInner::H1(body) => Pin::new(body).poll_frame(cx),
+            BodyInner::H2(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -210,6 +223,7 @@ impl HttpBody for Body {
             BodyInner::Buffered(Some(b)) => b.is_empty(),
             BodyInner::Channel(_) => false,
             BodyInner::H1(body) => body.is_terminal(),
+            BodyInner::H2(body) => body.is_terminal(),
         }
     }
 
@@ -220,6 +234,7 @@ impl HttpBody for Body {
             BodyInner::Buffered(None) => SizeHint::with_exact(0),
             BodyInner::Channel(_) => SizeHint::default(),
             BodyInner::H1(body) => body.size_hint(),
+            BodyInner::H2(body) => body.size_hint(),
         }
     }
 }

@@ -7,16 +7,21 @@
 use bytes::{Bytes, BytesMut};
 use http::{Method, Uri};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tracing;
 
 pub type StreamingHeadersResult = Result<(u16, Vec<(String, String)>)>;
 
 use crate::error::{Error, Result};
+use crate::request::{RequestBody, RequestBodyStream};
+use crate::transport::h2::body::{H2BodyPush, H2BodyShared};
 use crate::transport::h2::connection::{
     ControlAction, H2Connection as RawH2Connection, StreamResponse,
 };
@@ -25,7 +30,6 @@ use crate::transport::h2::tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
 use crate::transport::h2::H2TransportConfig;
 
 /// Command sent from handle to driver
-#[derive(Debug)]
 pub enum DriverCommand {
     /// Send a request and get response via oneshot
     /// Driver allocates stream_id
@@ -41,8 +45,8 @@ pub enum DriverCommand {
         method: Method,
         uri: Uri,
         headers: Vec<(String, String)>,
-        body: Option<bytes::Bytes>,
-        body_tx: mpsc::Sender<Result<Bytes>>,
+        body: RequestBody,
+        body_shared: Arc<H2BodyShared>,
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
     },
     /// Open an RFC 8441 WebSocket tunnel on a pooled HTTP/2 stream.
@@ -58,17 +62,98 @@ pub enum DriverCommand {
     },
 }
 
+impl fmt::Debug for DriverCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DriverCommand::SendRequest {
+                method,
+                uri,
+                headers,
+                body,
+                ..
+            } => f
+                .debug_struct("SendRequest")
+                .field("method", method)
+                .field("uri", uri)
+                .field("headers_len", &headers.len())
+                .field("body_len", &body.as_ref().map(Bytes::len))
+                .finish(),
+            DriverCommand::SendStreamingRequest {
+                method,
+                uri,
+                headers,
+                body,
+                ..
+            } => f
+                .debug_struct("SendStreamingRequest")
+                .field("method", method)
+                .field("uri", uri)
+                .field("headers_len", &headers.len())
+                .field("body", body)
+                .finish(),
+            DriverCommand::OpenWebSocketTunnel { uri, headers, .. } => f
+                .debug_struct("OpenWebSocketTunnel")
+                .field("uri", uri)
+                .field("headers_len", &headers.len())
+                .finish(),
+            DriverCommand::SendTunnelData {
+                stream_id,
+                outbound,
+            } => f
+                .debug_struct("SendTunnelData")
+                .field("stream_id", stream_id)
+                .field("outbound", outbound)
+                .finish(),
+        }
+    }
+}
+
 /// Inline-registered streaming stream sent from `H2Handle` to the driver.
 ///
 /// The handle has already written HEADERS via the shared write half and
 /// allocated `stream_id`. The driver only needs to register the response
 /// routing channels and the seed `recv_window`.
-#[derive(Debug)]
 pub struct InlineRegistration {
     pub stream_id: u32,
     pub headers_tx: oneshot::Sender<StreamingHeadersResult>,
-    pub body_tx: mpsc::Sender<Result<Bytes>>,
+    pub body_shared: Arc<H2BodyShared>,
     pub recv_window: i32,
+}
+
+struct NotifyWake(Arc<Notify>);
+
+impl Wake for NotifyWake {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify_one();
+    }
+}
+
+struct DriverStreamingRequestBody {
+    stream: RequestBodyStream,
+    content_length: Option<u64>,
+    current_chunk: Option<Bytes>,
+    current_offset: usize,
+    sent: u64,
+    finished: bool,
+    end_stream_sent: bool,
+}
+
+impl DriverStreamingRequestBody {
+    fn new(stream: RequestBodyStream, content_length: Option<u64>) -> Self {
+        Self {
+            stream,
+            content_length,
+            current_chunk: None,
+            current_offset: 0,
+            sent: 0,
+            finished: false,
+            end_stream_sent: false,
+        }
+    }
 }
 
 /// Per-stream state tracked by driver
@@ -77,8 +162,8 @@ struct DriverStreamState {
     response_tx: Option<oneshot::Sender<Result<StreamResponse>>>,
     /// Oneshot sender for streaming response headers
     streaming_headers_tx: Option<oneshot::Sender<StreamingHeadersResult>>,
-    /// Streaming response body sender
-    streaming_body_tx: Option<mpsc::Sender<Result<Bytes>>>,
+    /// Streaming response body state shared with the public Body poller.
+    streaming_body: Option<Arc<H2BodyShared>>,
     /// Accumulated response status
     status: Option<u16>,
     /// Accumulated response headers
@@ -89,6 +174,8 @@ struct DriverStreamState {
     pending_body: Bytes,
     /// Offset of pending body already sent
     body_offset: usize,
+    /// Streaming request body producer and partially sent chunk.
+    request_stream: Option<DriverStreamingRequestBody>,
     /// Streaming response chunks waiting for downstream receiver capacity.
     pending_streaming_body: VecDeque<Result<Bytes>>,
     /// Whether END_STREAM arrived while streaming body chunks are still pending.
@@ -112,12 +199,13 @@ impl DriverStreamState {
         Self {
             response_tx: Some(response_tx),
             streaming_headers_tx: None,
-            streaming_body_tx: None,
+            streaming_body: None,
             status: None,
             headers: Vec::new(),
             body: BytesMut::new(),
             pending_body,
             body_offset: 0,
+            request_stream: None,
             pending_streaming_body: VecDeque::new(),
             pending_streaming_end: false,
             recv_window,
@@ -127,19 +215,21 @@ impl DriverStreamState {
 
     fn streaming(
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        body_tx: mpsc::Sender<Result<Bytes>>,
+        body_shared: Arc<H2BodyShared>,
         pending_body: Bytes,
+        request_stream: Option<DriverStreamingRequestBody>,
         recv_window: i32,
     ) -> Self {
         Self {
             response_tx: None,
             streaming_headers_tx: Some(headers_tx),
-            streaming_body_tx: Some(body_tx),
+            streaming_body: Some(body_shared),
             status: None,
             headers: Vec::new(),
             body: BytesMut::new(),
             pending_body,
             body_offset: 0,
+            request_stream,
             pending_streaming_body: VecDeque::new(),
             pending_streaming_end: false,
             recv_window,
@@ -149,10 +239,10 @@ impl DriverStreamState {
 
     fn streaming_inline(
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        body_tx: mpsc::Sender<Result<Bytes>>,
+        body_shared: Arc<H2BodyShared>,
         recv_window: i32,
     ) -> Self {
-        let mut state = Self::streaming(headers_tx, body_tx, Bytes::new(), recv_window);
+        let mut state = Self::streaming(headers_tx, body_shared, Bytes::new(), None, recv_window);
         state.inline = true;
         state
     }
@@ -194,6 +284,10 @@ pub struct H2Driver<S> {
     /// Toggle that disables future inline streaming when an RFC 8441 tunnel
     /// or other ineligible state is in effect.
     inline_eligible: Arc<AtomicBool>,
+    /// Woken when public H2 bodies consume a slot/drop or request-body
+    /// producers become ready after returning Pending.
+    body_progress_notify: Arc<Notify>,
+    request_body_waker: Arc<NotifyWake>,
 }
 
 impl<S> H2Driver<S>
@@ -209,6 +303,7 @@ where
         config: H2TransportConfig,
     ) -> Self {
         let (_, inline_register_rx) = mpsc::unbounded_channel();
+        let body_progress_notify = Arc::new(Notify::new());
         Self::new_with_inline(
             connection,
             command_tx,
@@ -218,6 +313,7 @@ where
             inline_register_rx,
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
+            body_progress_notify,
         )
     }
 
@@ -234,7 +330,9 @@ where
         inline_register_rx: mpsc::UnboundedReceiver<InlineRegistration>,
         inline_active: Arc<AtomicUsize>,
         inline_eligible: Arc<AtomicBool>,
+        body_progress_notify: Arc<Notify>,
     ) -> Self {
+        let request_body_waker = Arc::new(NotifyWake(body_progress_notify.clone()));
         Self {
             command_rx,
             command_tx,
@@ -248,6 +346,8 @@ where
             inline_register_rx,
             inline_active,
             inline_eligible,
+            body_progress_notify,
+            request_body_waker,
         }
     }
 
@@ -262,6 +362,7 @@ where
             // Try to flush any pending data (flow control)
             self.flush_pending_data().await?;
             self.flush_tunnel_data().await?;
+            self.apply_released_body_credits().await?;
             self.flush_pending_streaming_bodies().await?;
             self.check_keepalive_timeout()?;
             self.refresh_inline_eligibility();
@@ -276,9 +377,12 @@ where
             }
 
             let keepalive_delay = self.keepalive_delay();
-            let retry_streaming_backpressure = self.has_pending_streaming_body();
+            let retry_streaming_backpressure =
+                self.has_pending_streaming_body() || self.has_request_body_work();
+            let wait_for_body_progress = self.has_body_progress_work();
 
             tokio::select! {
+                biased;
                 // Handle incoming commands (send requests)
                 command = self.command_rx.recv() => {
                     match command {
@@ -349,6 +453,8 @@ where
                         std::future::pending::<()>().await;
                     }
                 } => {}
+
+                _ = self.body_progress_notify.notified(), if wait_for_body_progress => {}
             }
         }
         Ok(())
@@ -368,7 +474,7 @@ where
     fn register_inline_stream(&mut self, reg: InlineRegistration) {
         self.streams.insert(
             reg.stream_id,
-            DriverStreamState::streaming_inline(reg.headers_tx, reg.body_tx, reg.recv_window),
+            DriverStreamState::streaming_inline(reg.headers_tx, reg.body_shared, reg.recv_window),
         );
     }
 
@@ -412,9 +518,10 @@ where
         }
 
         let (stream_id, stream) = self.streams.iter().next()?;
-        if stream.streaming_body_tx.is_none()
+        if stream.streaming_body.is_none()
             || !stream.pending_streaming_body.is_empty()
             || stream.body_offset < stream.pending_body.len()
+            || stream.request_stream.is_some()
         {
             return None;
         }
@@ -430,14 +537,11 @@ where
     /// `Ok(false)` when the conditions changed before any frame was processed
     /// (so the caller falls through to the regular `select!`).
     async fn run_single_stream_streaming_fast_path(&mut self, stream_id: u32) -> Result<bool> {
-        // Hoist the body_tx Sender once so per-frame DATA delivery does not
-        // re-enter the streams HashMap. Each chunk would otherwise pay one
-        // HashMap lookup to read the sender plus one HashMap get_mut to push
-        // backpressured items; in the unbackpressured case the cached Sender
-        // alone is enough.
-        let body_tx = match self.streams.get(&stream_id) {
-            Some(stream) => match stream.streaming_body_tx.as_ref() {
-                Some(tx) => tx.clone(),
+        // Hoist the shared body slot once so per-frame DATA delivery does
+        // not re-enter the streams HashMap in the unbackpressured case.
+        let body_shared = match self.streams.get(&stream_id) {
+            Some(stream) => match stream.streaming_body.as_ref() {
+                Some(shared) => shared.clone(),
                 None => return Ok(false),
             },
             None => return Ok(false),
@@ -462,7 +566,7 @@ where
                 return Ok(true);
             }
 
-            if body_tx.is_closed() {
+            if body_shared.is_closed() {
                 self.cancel_stream_for_dropped_receiver(stream_id).await;
                 return Ok(true);
             }
@@ -486,28 +590,16 @@ where
                     .apply_conn_inbound_flow_control(data_len)
                     .await?;
 
-                let refresh_threshold = self.connection.flow_control_refresh_threshold();
-                let refresh_increment = self.connection.flow_control_refresh_increment();
-                let mut needs_stream_window_update = false;
                 if data_len > 0 {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         stream.recv_window -= data_len as i32;
-                        if stream.recv_window < refresh_threshold {
-                            stream.recv_window += refresh_increment as i32;
-                            needs_stream_window_update = true;
-                        }
                     }
-                }
-                if needs_stream_window_update {
-                    self.connection
-                        .send_stream_window_update(stream_id, refresh_increment)
-                        .await?;
                 }
 
                 if !data.is_empty() {
-                    match body_tx.try_send(Ok(data)) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(item)) => {
+                    match body_shared.push(Ok(data)) {
+                        H2BodyPush::Accepted => {}
+                        H2BodyPush::Full(item) => {
                             if let Some(stream) = self.streams.get_mut(&stream_id) {
                                 stream.pending_streaming_body.push_back(item);
                                 if end_stream {
@@ -516,7 +608,7 @@ where
                             }
                             return Ok(true);
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        H2BodyPush::Closed => {
                             self.cancel_stream_for_dropped_receiver(stream_id).await;
                             return Ok(true);
                         }
@@ -524,7 +616,12 @@ where
                 }
 
                 if end_stream {
-                    self.complete_stream(stream_id);
+                    if body_shared.is_slot_available() {
+                        body_shared.finish();
+                        self.complete_stream(stream_id);
+                    } else if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.pending_streaming_end = true;
+                    }
                     return Ok(true);
                 }
             } else {
@@ -563,7 +660,24 @@ where
 
     fn has_pending_streaming_body(&self) -> bool {
         self.streams.values().any(|stream| {
-            stream.streaming_body_tx.is_some() && !stream.pending_streaming_body.is_empty()
+            stream.streaming_body.is_some()
+                && (!stream.pending_streaming_body.is_empty() || stream.pending_streaming_end)
+        })
+    }
+
+    fn has_request_body_work(&self) -> bool {
+        self.streams
+            .values()
+            .any(|stream| stream.request_stream.is_some())
+    }
+
+    fn has_body_progress_work(&self) -> bool {
+        self.streams.values().any(|stream| {
+            stream
+                .streaming_body
+                .as_ref()
+                .is_some_and(|body| body.is_closed() || body.has_released_recv_bytes())
+                || stream.request_stream.is_some()
         })
     }
 
@@ -674,12 +788,40 @@ where
             uri,
             headers,
             body,
-            body_tx,
+            body_shared,
             headers_tx,
         } = cmd
         {
-            let body_bytes = body.unwrap_or_default();
-            let end_stream = body_bytes.is_empty();
+            let (body_bytes, request_stream, end_stream) = match body {
+                RequestBody::Empty => (Bytes::new(), None, true),
+                RequestBody::Bytes(bytes) => {
+                    let end_stream = bytes.is_empty();
+                    (bytes, None, end_stream)
+                }
+                RequestBody::Text(text) => {
+                    let bytes = Bytes::from(text.into_bytes());
+                    let end_stream = bytes.is_empty();
+                    (bytes, None, end_stream)
+                }
+                RequestBody::Json(bytes) => {
+                    let bytes = Bytes::from(bytes);
+                    let end_stream = bytes.is_empty();
+                    (bytes, None, end_stream)
+                }
+                RequestBody::Form(text) => {
+                    let bytes = Bytes::from(text.into_bytes());
+                    let end_stream = bytes.is_empty();
+                    (bytes, None, end_stream)
+                }
+                RequestBody::Stream {
+                    stream,
+                    content_length,
+                } => (
+                    Bytes::new(),
+                    Some(DriverStreamingRequestBody::new(stream, content_length)),
+                    false,
+                ),
+            };
 
             let initial_recv_window = self.connection.local_initial_window_size() as i32;
             match self
@@ -692,8 +834,9 @@ where
                         stream_id,
                         DriverStreamState::streaming(
                             headers_tx,
-                            body_tx,
+                            body_shared,
                             body_bytes,
+                            request_stream,
                             initial_recv_window,
                         ),
                     );
@@ -802,11 +945,9 @@ where
 
     /// Iterate all active streams and try to send pending body data
     async fn flush_pending_data(&mut self) -> Result<()> {
-        if !self
-            .streams
-            .values()
-            .any(|stream| stream.body_offset < stream.pending_body.len())
-        {
+        if !self.streams.values().any(|stream| {
+            stream.body_offset < stream.pending_body.len() || stream.request_stream.is_some()
+        }) {
             return Ok(());
         }
 
@@ -856,8 +997,151 @@ where
                     break;
                 }
             }
+
+            self.flush_streaming_request_body(stream_id).await?;
         }
         Ok(())
+    }
+
+    async fn flush_streaming_request_body(&mut self, stream_id: u32) -> Result<()> {
+        loop {
+            let has_stream = self
+                .streams
+                .get(&stream_id)
+                .and_then(|stream| stream.request_stream.as_ref())
+                .is_some();
+            if !has_stream {
+                return Ok(());
+            }
+
+            let has_current = self
+                .streams
+                .get(&stream_id)
+                .and_then(|stream| stream.request_stream.as_ref())
+                .and_then(|body| body.current_chunk.as_ref())
+                .is_some();
+
+            if !has_current {
+                let can_send = self.connection.available_send_window(stream_id).await? > 0;
+                if !can_send {
+                    return Ok(());
+                }
+
+                let poll_result = {
+                    let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                    let body = stream
+                        .request_stream
+                        .as_mut()
+                        .expect("request stream exists");
+                    if body.finished {
+                        Poll::Ready(None)
+                    } else {
+                        let waker = Waker::from(self.request_body_waker.clone());
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        body.stream.as_mut().poll_next(&mut cx)
+                    }
+                };
+
+                match poll_result {
+                    Poll::Pending => return Ok(()),
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                        let body = stream
+                            .request_stream
+                            .as_mut()
+                            .expect("request stream exists");
+                        body.current_chunk = Some(chunk);
+                        body.current_offset = 0;
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        self.fail_stream(
+                            stream_id,
+                            format!("request body stream error: {}", error),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Poll::Ready(None) => {
+                        let (valid_len, sent, expected, already_sent_end) = {
+                            let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+                            let body = stream
+                                .request_stream
+                                .as_mut()
+                                .expect("request stream exists");
+                            body.finished = true;
+                            (
+                                body.content_length
+                                    .map(|expected| expected == body.sent)
+                                    .unwrap_or(true),
+                                body.sent,
+                                body.content_length,
+                                body.end_stream_sent,
+                            )
+                        };
+                        if !valid_len {
+                            self.fail_stream(
+                                stream_id,
+                                format!(
+                                    "sized streaming request body length mismatch: sent {} bytes, Content-Length is {}",
+                                    sent,
+                                    expected.unwrap_or_default()
+                                ),
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        if already_sent_end {
+                            return Ok(());
+                        }
+                        let sent = self.connection.send_data(stream_id, &[], true).await?;
+                        debug_assert_eq!(sent, 0);
+                        if let Some(stream) = self.streams.get_mut(&stream_id) {
+                            if let Some(body) = stream.request_stream.as_mut() {
+                                body.end_stream_sent = true;
+                            }
+                            stream.request_stream = None;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            let (chunk, offset) = {
+                let stream = self.streams.get(&stream_id).expect("stream exists");
+                let body = stream
+                    .request_stream
+                    .as_ref()
+                    .expect("request stream exists");
+                (
+                    body.current_chunk.as_ref().expect("current chunk").clone(),
+                    body.current_offset,
+                )
+            };
+            let remaining = &chunk[offset..];
+            let sent = self
+                .connection
+                .send_data(stream_id, remaining, false)
+                .await?;
+            if sent == 0 {
+                return Ok(());
+            }
+
+            let stream = self.streams.get_mut(&stream_id).expect("stream exists");
+            let body = stream
+                .request_stream
+                .as_mut()
+                .expect("request stream exists");
+            body.current_offset += sent;
+            body.sent += sent as u64;
+            if body.current_offset >= chunk.len() {
+                body.current_chunk = None;
+                body.current_offset = 0;
+            }
+            return Ok(());
+        }
     }
 
     async fn flush_tunnel_data(&mut self) -> Result<()> {
@@ -908,6 +1192,36 @@ where
         Ok(())
     }
 
+    async fn apply_released_body_credits(&mut self) -> Result<()> {
+        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+        for stream_id in stream_ids {
+            let (released, closed) = self
+                .streams
+                .get(&stream_id)
+                .and_then(|stream| stream.streaming_body.as_ref())
+                .map(|body| (body.take_released_recv_bytes(), body.is_closed()))
+                .unwrap_or((0, false));
+
+            if closed {
+                self.cancel_stream_for_dropped_receiver(stream_id).await;
+                continue;
+            }
+
+            if released == 0 {
+                continue;
+            }
+
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.recv_window = stream.recv_window.saturating_add(released as i32);
+                self.connection
+                    .send_stream_window_update(stream_id, released as u32)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn fail_stream(&mut self, stream_id: u32, message: String) {
         self.connection.remove_stream(stream_id);
         if let Some(mut stream) = self.streams.remove(&stream_id) {
@@ -918,8 +1232,8 @@ where
             if let Some(tx) = stream.streaming_headers_tx.take() {
                 let _ = tx.send(Err(Error::HttpProtocol(message.clone())));
             }
-            if let Some(tx) = stream.streaming_body_tx.take() {
-                let _ = tx.try_send(Err(Error::HttpProtocol(message)));
+            if let Some(body) = stream.streaming_body.take() {
+                let _ = body.fail(Error::HttpProtocol(message));
             }
         }
     }
@@ -946,7 +1260,9 @@ where
             .streams
             .iter()
             .filter_map(|(stream_id, stream)| {
-                if stream.streaming_body_tx.is_some() && !stream.pending_streaming_body.is_empty() {
+                if stream.streaming_body.is_some()
+                    && (!stream.pending_streaming_body.is_empty() || stream.pending_streaming_end)
+                {
                     Some(*stream_id)
                 } else {
                     None
@@ -959,21 +1275,21 @@ where
             let mut should_complete = false;
 
             if let Some(stream) = self.streams.get_mut(&stream_id) {
-                let Some(tx) = stream.streaming_body_tx.as_ref() else {
+                let Some(body) = stream.streaming_body.as_ref() else {
                     continue;
                 };
 
-                if tx.is_closed() {
+                if body.is_closed() {
                     should_cancel = true;
                 } else {
                     while let Some(item) = stream.pending_streaming_body.pop_front() {
-                        match tx.try_send(item) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(item)) => {
+                        match body.push(item) {
+                            H2BodyPush::Accepted => {}
+                            H2BodyPush::Full(item) => {
                                 stream.pending_streaming_body.push_front(item);
                                 break;
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                            H2BodyPush::Closed => {
                                 should_cancel = true;
                                 break;
                             }
@@ -988,6 +1304,13 @@ where
             if should_cancel {
                 self.cancel_stream_for_dropped_receiver(stream_id).await;
             } else if should_complete {
+                if let Some(body) = self
+                    .streams
+                    .get(&stream_id)
+                    .and_then(|stream| stream.streaming_body.as_ref())
+                {
+                    body.finish();
+                }
                 self.complete_stream(stream_id);
             }
         }
@@ -1005,8 +1328,8 @@ where
         // If dropped, send RST_STREAM(CANCEL) and evict.
         if header.stream_id != 0 {
             if let Some(stream) = self.streams.get(&header.stream_id) {
-                if let Some(ref tx) = stream.streaming_body_tx {
-                    if tx.is_closed() {
+                if let Some(ref body) = stream.streaming_body {
+                    if body.is_closed() {
                         let stream_id = header.stream_id;
                         self.cancel_stream_for_dropped_receiver(stream_id).await;
                         return Ok(());
@@ -1047,6 +1370,21 @@ where
                 ControlAction::GoAway(last_sid) => {
                     self.goaway_received
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+                    for sid in stream_ids {
+                        if let Some(stream) = self.streams.get(&sid) {
+                            if stream.streaming_body.is_some()
+                                && stream
+                                    .streaming_body
+                                    .as_ref()
+                                    .is_some_and(|body| body.is_slot_available())
+                            {
+                                if let Some(body) = stream.streaming_body.as_ref() {
+                                    body.finish();
+                                }
+                            }
+                        }
+                    }
                     let tunnel_ids: Vec<u32> = self.tunnels.keys().copied().collect();
                     for sid in tunnel_ids {
                         if sid > last_sid {
@@ -1147,8 +1485,15 @@ where
 
                 if let Some(stream) = self.streams.get_mut(&stream_id) {
                     if status >= 200 {
+                        let header_end_stream = (header.flags & flags::END_STREAM) != 0
+                            || self.goaway_received.load(Ordering::Relaxed);
                         if let Some(tx) = stream.streaming_headers_tx.take() {
                             let _ = tx.send(Ok((status, regular_headers)));
+                            if header_end_stream {
+                                if let Some(body) = stream.streaming_body.as_ref() {
+                                    body.finish();
+                                }
+                            }
                         } else {
                             stream.status = Some(status);
                             stream.headers = regular_headers;
@@ -1159,6 +1504,11 @@ where
                     } else {
                         // status == 0, likely trailers HEADERS frame (no :status)
                         tracing::debug!("H2Driver: Received trailers for stream {}", stream_id);
+                        if (header.flags & flags::END_STREAM) != 0 {
+                            if let Some(body) = stream.streaming_body.as_ref() {
+                                body.finish();
+                            }
+                        }
                     }
 
                     if (header.flags & flags::END_STREAM) != 0 {
@@ -1189,31 +1539,23 @@ where
                     return Ok(());
                 }
 
-                let refresh_threshold = self.connection.flow_control_refresh_threshold();
-                let refresh_increment = self.connection.flow_control_refresh_increment();
-
                 let mut should_cancel = false;
                 let mut should_complete = false;
-                let mut needs_stream_window_update = false;
 
                 if let Some(stream) = self.streams.get_mut(&stream_id) {
                     if data_len > 0 {
                         stream.recv_window -= data_len as i32;
-                        if stream.recv_window < refresh_threshold {
-                            stream.recv_window += refresh_increment as i32;
-                            needs_stream_window_update = true;
-                        }
                     }
 
-                    if let Some(tx) = stream.streaming_body_tx.as_ref() {
+                    if let Some(body) = stream.streaming_body.as_ref() {
                         if !data.is_empty() {
                             if stream.pending_streaming_body.is_empty() {
-                                match tx.try_send(Ok(data)) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(item)) => {
+                                match body.push(Ok(data)) {
+                                    H2BodyPush::Accepted => {}
+                                    H2BodyPush::Full(item) => {
                                         stream.pending_streaming_body.push_back(item);
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    H2BodyPush::Closed => {
                                         should_cancel = true;
                                     }
                                 }
@@ -1235,18 +1577,19 @@ where
                     }
                 }
 
-                if needs_stream_window_update {
-                    self.connection
-                        .send_stream_window_update(stream_id, refresh_increment)
-                        .await?;
-                }
-
                 if should_cancel {
                     self.cancel_stream_for_dropped_receiver(stream_id).await;
                     return Ok(());
                 }
 
                 if should_complete {
+                    if let Some(body) = self
+                        .streams
+                        .get(&stream_id)
+                        .and_then(|stream| stream.streaming_body.as_ref())
+                    {
+                        body.finish();
+                    }
                     self.complete_stream(stream_id);
                 }
             }

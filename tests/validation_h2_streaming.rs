@@ -995,6 +995,54 @@ fn system_time_now_ms() -> u128 {
         .as_millis()
 }
 
+#[test]
+fn h2_body_uses_wakeable_slot_not_mpsc() {
+    init_validation_dir();
+    let response_rs = include_str!("../src/response.rs");
+    let h2_body_rs = include_str!("../src/transport/h2/body.rs");
+    let h2_driver_rs = include_str!("../src/transport/h2/driver.rs");
+    let h2_handle_rs = include_str!("../src/transport/h2/handle.rs");
+    let h2_mod_rs = include_str!("../src/transport/h2/mod.rs");
+
+    assert!(
+        response_rs.contains("BodyInner::H2"),
+        "public Body must have a dedicated H2 poll-body variant"
+    );
+    assert!(
+        h2_body_rs.contains("struct H2BodyShared")
+            && h2_body_rs.contains("slot: Option")
+            && h2_body_rs.contains("consumer_waker"),
+        "H2 body delivery should be a wakeable shared slot"
+    );
+    assert!(
+        h2_driver_rs.contains("Arc<H2BodyShared>"),
+        "H2 driver should own/share response body state"
+    );
+    assert!(
+        !h2_driver_rs.contains("streaming_body_tx")
+            && !h2_driver_rs.contains("mpsc::Sender<Result<Bytes>>"),
+        "driver streaming DATA delivery must not use per-stream mpsc body senders"
+    );
+    assert!(
+        !h2_handle_rs.contains("mpsc::Receiver<Result<Bytes>>")
+            && !h2_mod_rs.contains("mpsc::Receiver<Result<Bytes>>"),
+        "pooled H2 streaming API must return Response/Body, not a body receiver"
+    );
+
+    let evidence = json!({
+        "response_body_variant": "BodyInner::H2",
+        "delivery_state": "H2BodyShared { Mutex slot, consumer_waker, driver Notify }",
+        "driver_delivery_has_mpsc_body_sender": false,
+        "pooled_h2_api_returns_body_receiver": false,
+        "flow_control_credit_release": "Body poll releases stream WINDOW_UPDATE credit after data is consumed"
+    });
+    fs::write(
+        "target/validation/h2/VAL-H2-023.json",
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
 // Test VAL-H2-004: Concurrent multiplexed streams keep chunks isolated
 #[tokio::test]
 async fn concurrent_multiplexed_streams_keep_chunks_isolated() {

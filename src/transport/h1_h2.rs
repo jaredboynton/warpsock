@@ -32,7 +32,8 @@ use crate::transport::connector::{BoringConnector, MaybeHttpsStream};
 use crate::transport::dns::{DnsConfig, Resolve};
 use crate::transport::h1::{H1Connection, H1StreamingOptions};
 use crate::transport::h2::{
-    H2Connection, H2PooledConnection, H2TransportConfig, H2Tunnel, PseudoHeaderOrder,
+    H2BodyTimeouts, H2Connection, H2PooledConnection, H2TransportConfig, H2Tunnel,
+    PseudoHeaderOrder,
 };
 use crate::transport::h3::{H3Client, H3Tunnel};
 use crate::version::HttpVersion;
@@ -812,7 +813,7 @@ impl<'a> RequestBuilder<'a> {
         };
         let pool_key = client.make_pool_key(&uri);
 
-        let (response, rx) = if !prefer_http2 {
+        let response = if !prefer_http2 {
             let pooled_h1_stream = client.h1_pool.get_h1(&pool_key).await;
             let connector = client.connector_for_uri(&uri);
             let connect_fut = connector.connect_h1_only(&uri);
@@ -863,11 +864,17 @@ impl<'a> RequestBuilder<'a> {
             reject_compressed_streaming(&response)?;
             return Ok(response);
         } else {
-            if request.body.is_streaming() {
-                return Err(Error::HttpProtocol(
-                    "HTTP/2 streaming request bodies are not implemented yet".into(),
-                ));
+            if let Some(content_length) = request.body.content_length() {
+                if content_length > 0 && !request.headers.contains("content-length") {
+                    request
+                        .headers
+                        .insert("Content-Length", content_length.to_string());
+                }
             }
+            let body_timeouts = H2BodyTimeouts {
+                read_idle: timeouts.read_idle,
+                total: timeouts.total,
+            };
             // Check for existing pooled connection
             let pooled = {
                 let mut pool = client.h2_pool.write().await;
@@ -884,17 +891,19 @@ impl<'a> RequestBuilder<'a> {
             };
 
             if let Some(conn) = pooled {
-                let body_bytes = if request.body.is_empty() {
-                    None
+                let streaming_body = request.body.is_streaming();
+                let body = if streaming_body {
+                    std::mem::take(&mut request.body)
                 } else {
-                    Some(request.body.clone().into_bytes()?)
+                    request.body.clone()
                 };
 
                 let send_fut = conn.send_streaming_request(
                     request.method.clone(),
                     &uri,
                     request.headers.to_vec(),
-                    body_bytes,
+                    body,
+                    body_timeouts,
                 );
                 let res = if let Some(ttfb_timeout) = timeouts.ttfb {
                     tokio_timeout(ttfb_timeout, send_fut)
@@ -905,16 +914,19 @@ impl<'a> RequestBuilder<'a> {
                 };
 
                 match res {
-                    Ok((response, rx)) => {
+                    Ok(response) => {
                         let response = response.with_url(request_url.clone());
                         if let Some(jar) = &client.cookie_store {
                             jar.write()
                                 .await
                                 .store_from_headers(response.headers(), request_url.as_str());
                         }
-                        (response, rx)
+                        response
                     }
                     Err(e) => {
+                        if streaming_body {
+                            return Err(e);
+                        }
                         tracing::debug!(
                             "Pooled HTTP/2 connection failed for streaming, creating new: {}",
                             e
@@ -963,19 +975,14 @@ impl<'a> RequestBuilder<'a> {
                             pool.insert(pool_key.clone(), pooled_conn.clone());
                         }
 
-                        let body_bytes = if request.body.is_empty() {
-                            None
-                        } else {
-                            Some(request.body.clone().into_bytes()?)
-                        };
-
                         let send_fut = pooled_conn.send_streaming_request(
                             request.method.clone(),
                             &uri,
                             request.headers.to_vec(),
-                            body_bytes,
+                            request.body.clone(),
+                            body_timeouts,
                         );
-                        let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+                        let response = if let Some(ttfb_timeout) = timeouts.ttfb {
                             tokio_timeout(ttfb_timeout, send_fut)
                                 .await
                                 .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
@@ -989,7 +996,7 @@ impl<'a> RequestBuilder<'a> {
                                 .await
                                 .store_from_headers(response.headers(), request_url.as_str());
                         }
-                        (response, rx)
+                        response
                     }
                 }
             } else {
@@ -1033,19 +1040,16 @@ impl<'a> RequestBuilder<'a> {
                     pool.insert(pool_key.clone(), pooled_conn.clone());
                 }
 
-                let body_bytes = if request.body.is_empty() {
-                    None
-                } else {
-                    Some(request.body.clone().into_bytes()?)
-                };
+                let body = std::mem::take(&mut request.body);
 
                 let send_fut = pooled_conn.send_streaming_request(
                     request.method.clone(),
                     &uri,
                     request.headers.to_vec(),
-                    body_bytes,
+                    body,
+                    body_timeouts,
                 );
-                let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+                let response = if let Some(ttfb_timeout) = timeouts.ttfb {
                     tokio_timeout(ttfb_timeout, send_fut)
                         .await
                         .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
@@ -1059,14 +1063,12 @@ impl<'a> RequestBuilder<'a> {
                         .await
                         .store_from_headers(response.headers(), request_url.as_str());
                 }
-                (response, rx)
+                response
             }
         };
 
         reject_compressed_streaming(&response)?;
-
-        let body = wrap_streaming_receiver(rx, &timeouts);
-        Ok(attach_streaming_body(response, body))
+        Ok(response)
     }
 }
 
