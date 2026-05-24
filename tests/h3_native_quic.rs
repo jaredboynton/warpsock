@@ -3,17 +3,17 @@ use specter::fingerprint::QuicTransportParams;
 use specter::transport::h3::quic::{
     build_initial_crypto_packet, decode_frame, decode_frames, decode_long_header,
     decode_retry_packet, decode_transport_parameters, decode_version_negotiation_packet,
-    derive_initial_key_material,
-    derive_packet_key_material_from_secret, encode_frame, encode_initial_header,
-    encode_long_header, encode_server_transport_parameters, encode_short_header,
-    encode_transport_parameters, encode_transport_parameters_with_initial_source_connection_id,
-    header_protection_mask, initial_crypto_plaintext, open_initial_packet, open_long_header_packet,
-    open_packet_payload, open_protected_initial_packet, open_short_header_packet,
-    protect_initial_packet, protect_long_header, protect_long_header_packet,
-    protect_short_header_packet, recover_packet_number, retry_integrity_tag_v1,
-    seal_packet_payload, split_long_header_datagram, validate_retry_integrity_tag_v1, ConnectionId,
-    LongHeaderPacket, LongHeaderType, QuicAckRange, QuicAckTracker, QuicCryptoAssembler,
-    QuicFrame, QuicLossDetector, QuicPathValidator, ShortHeaderPacket, TransportParameter,
+    derive_initial_key_material, derive_packet_key_material_from_secret, encode_frame,
+    encode_initial_header, encode_long_header, encode_server_transport_parameters,
+    encode_short_header, encode_transport_parameters,
+    encode_transport_parameters_with_initial_source_connection_id, header_protection_mask,
+    initial_crypto_plaintext, open_initial_packet, open_long_header_packet, open_packet_payload,
+    open_protected_initial_packet, open_short_header_packet, protect_initial_packet,
+    protect_long_header, protect_long_header_packet, protect_short_header_packet,
+    recover_packet_number, retry_integrity_tag_v1, seal_packet_payload, split_long_header_datagram,
+    validate_retry_integrity_tag_v1, ConnectionId, LongHeaderPacket, LongHeaderType, QuicAckRange,
+    QuicAckTracker, QuicCryptoAssembler, QuicFrame, QuicLossDetector, QuicPathValidator,
+    ShortHeaderPacket, TransportParameter,
 };
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,10 @@ fn native_quic_decodes_version_negotiation_packet_without_fixed_bit() {
 
     let decoded = decode_version_negotiation_packet(&packet).unwrap();
 
-    assert_eq!(decoded.destination_cid, ConnectionId::from_static(b"clientid"));
+    assert_eq!(
+        decoded.destination_cid,
+        ConnectionId::from_static(b"clientid")
+    );
     assert_eq!(decoded.source_cid, ConnectionId::from_static(b"server1"));
     assert_eq!(decoded.supported_versions, vec![1, 0xff00_001d]);
 }
@@ -860,18 +863,27 @@ fn native_quic_loss_detector_reports_pto_expired_unacked_packets_by_send_time() 
     detector.on_packet_sent_at(2, sent_at + Duration::from_millis(10));
 
     assert_eq!(
-        detector.pto_expired_packets(sent_at + Duration::from_millis(49), Duration::from_millis(50)),
+        detector.pto_expired_packets(
+            sent_at + Duration::from_millis(49),
+            Duration::from_millis(50)
+        ),
         Vec::<u64>::new()
     );
     assert_eq!(
-        detector.pto_expired_packets(sent_at + Duration::from_millis(50), Duration::from_millis(50)),
+        detector.pto_expired_packets(
+            sent_at + Duration::from_millis(50),
+            Duration::from_millis(50)
+        ),
         vec![1]
     );
 
     detector.on_ack_received(1);
 
     assert_eq!(
-        detector.pto_expired_packets(sent_at + Duration::from_millis(60), Duration::from_millis(50)),
+        detector.pto_expired_packets(
+            sent_at + Duration::from_millis(60),
+            Duration::from_millis(50)
+        ),
         vec![2]
     );
 }

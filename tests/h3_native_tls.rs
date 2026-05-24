@@ -19,11 +19,13 @@ fn clienthello_extension_ids(crypto_data: &[u8]) -> Vec<u16> {
     let mut offset = 4 + 2 + 32;
     let session_id_len = crypto_data[offset] as usize;
     offset += 1 + session_id_len;
-    let cipher_suites_len = u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
+    let cipher_suites_len =
+        u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
     offset += 2 + cipher_suites_len;
     let compression_methods_len = crypto_data[offset] as usize;
     offset += 1 + compression_methods_len;
-    let extensions_len = u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
+    let extensions_len =
+        u16::from_be_bytes([crypto_data[offset], crypto_data[offset + 1]]) as usize;
     offset += 2;
 
     let extensions_end = offset + extensions_len;
