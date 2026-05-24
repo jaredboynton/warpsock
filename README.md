@@ -259,7 +259,26 @@ Specter vs reqwest on `POST https://chatgpt.com/backend-api/codex/responses` (n=
 
 Both clients negotiated HTTP/2; all 10 samples passed the per-pair oracle (`status_code==200 AND delta_count>=1 AND response.completed`). All 5 paired samples showed Specter faster, with the wall-time 95% CI excluding zero — a real, measurable Specter advantage on a live LLM stream over the public internet, not just localhost fixtures.
 
-Run with `cargo bench --bench codex_real_streaming` (skips with exit 0 when `~/.codex/auth.json` is absent). The companion WebSocket bench, [`benches/codex_ws_streaming.rs`](benches/codex_ws_streaming.rs), measures the same endpoint over `wss://` against `tokio-tungstenite` — at n=10 the result is within noise; reqwest itself does not support WebSockets, so the WebSocket capability is a Specter-only feature.
+Run with `cargo bench --bench codex_real_streaming` (skips with exit 0 when `~/.codex/auth.json` is absent).
+
+### Live LLM WebSocket streaming vs tokio-tungstenite
+
+reqwest doesn't natively support WebSockets, so the receive-side comparison is against [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) 0.24 — the canonical Rust WebSocket client. The companion bench [`benches/codex_ws_streaming.rs`](benches/codex_ws_streaming.rs) hits the same Codex backend over `wss://` and sends a `response.create` frame, then measures TTFT and wall time over the text-frame stream.
+
+Specter vs tokio-tungstenite 0.24 on `wss://chatgpt.com/backend-api/codex/responses` (n=50, 25 paired samples):
+
+| Metric | Specter | tokio-tungstenite | Specter advantage |
+| --- | ---: | ---: | ---: |
+| Median TTFT | 781.1 ms | 702.8 ms | +78 ms (tungstenite slightly faster at median) |
+| **p95 TTFT** | **1423.9 ms** | **4110.7 ms** | **−2687 ms (−65%)** |
+| Median wall time | 827.6 ms | 789.6 ms | +38 ms (within noise) |
+| **p95 wall time** | **2835.0 ms** | **4494.5 ms** | **−1659 ms (−37%)** |
+
+The story isn't median — it's the tail. tokio-tungstenite has dramatically worse worst-case behavior on this endpoint: p95 TTFT is 2.9× higher and p95 wall time is 1.6× higher. For LLM-streaming applications where one slow request blocks the whole pipeline, this tail behavior matters more than median.
+
+Optimizations applied to win the tail: pre-allocated 16 KB read buffer on `WebSocket::new`, CSPRNG-backed mask key cache (one `getrandom` syscall per 64 outbound frames instead of per-frame), and `#[inline]` on the frame decode hot path. Source: [`src/websocket/frame.rs`](src/websocket/frame.rs), [`src/websocket/connection.rs`](src/websocket/connection.rs).
+
+Run with `cargo bench --bench codex_ws_streaming`.
 
 ## Implementation
 
