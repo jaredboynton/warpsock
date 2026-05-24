@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn release_send_bytes_is_capped_at_send_budget() {
         let budget = 16 * 1024;
-        let credit = H3TunnelCredit::new(Arc::new(Notify::new()), budget);
+        let credit = H3TunnelCredit::new(Arc::new(Notify::new()), budget, budget);
         // Drain everything.
         let permit = credit
             .send_semaphore
@@ -513,13 +513,12 @@ mod tests {
     async fn recv_event_releases_encoded_data_frame_credit() {
         let (_outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         drop(outbound_rx);
-        let (inbound_tx, inbound_rx) = mpsc::channel(1);
-        let credit = H3TunnelCredit::new(Arc::new(Notify::new()), 1024);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let credit = H3TunnelCredit::new(Arc::new(Notify::new()), 1024, 1024);
         let mut tunnel = H3Tunnel::new_with_credit(_outbound_tx, inbound_rx, credit.clone());
 
         inbound_tx
             .send(Ok(H3TunnelEvent::Data(Bytes::from(vec![0x42; 64]))))
-            .await
             .expect("queue inbound data");
 
         let event = tunnel.recv_event().await.expect("inbound event");

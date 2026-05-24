@@ -1596,6 +1596,7 @@ impl NativeH3Driver {
                         response_tx,
                         self.body_progress_notify.clone(),
                         self.transport_config.tunnel_outbound_byte_budget,
+                        self.transport_config.tunnel_inbound_byte_budget,
                     ),
                 );
                 self.socket
