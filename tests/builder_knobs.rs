@@ -309,6 +309,20 @@ fn client_builder_exposes_h2_stream_capacity_knob() {
 }
 
 #[test]
+fn client_builder_exposes_h2_streaming_body_buffer_slots() {
+    let client = Client::builder()
+        .h2_streaming_body_buffer_slots(4)
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        client.h2_streaming_body_buffer_slots(),
+        4,
+        "ClientBuilder must expose the H2 response-body queue slot cap"
+    );
+}
+
+#[test]
 fn client_builder_exposes_h3_streaming_body_buffer_slots() {
     let client = Client::builder()
         .h3_streaming_body_buffer_slots(3)
