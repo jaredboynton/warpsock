@@ -50,6 +50,12 @@ impl Http3Fingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RawQuicTransportParameter {
+    pub id: u64,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuicTransportParams {
     pub max_idle_timeout_ms: u64,
     pub max_recv_udp_payload_size: usize,
@@ -69,6 +75,7 @@ pub struct QuicTransportParams {
     pub disable_dcid_reuse: bool,
     pub grease: bool,
     pub additional_transport_parameters: Vec<(u64, Vec<u8>)>,
+    pub raw_ordered_transport_parameters: Option<Vec<RawQuicTransportParameter>>,
     pub max_datagram_frame_size: Option<u64>,
     pub destination_connection_id_len: usize,
     pub source_connection_id_len: usize,
@@ -103,6 +110,7 @@ impl QuicTransportParams {
             disable_dcid_reuse: false,
             grease: true,
             additional_transport_parameters: Vec::new(),
+            raw_ordered_transport_parameters: None,
             max_datagram_frame_size: None,
             destination_connection_id_len: 16,
             source_connection_id_len: 16,
@@ -140,8 +148,26 @@ impl QuicTransportParams {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let raw_ordered_transport_parameters = self
+            .raw_ordered_transport_parameters
+            .as_ref()
+            .map(|parameters| {
+                parameters
+                    .iter()
+                    .map(|parameter| {
+                        let value_hex = parameter
+                            .value
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        format!("{}:{value_hex}", parameter.id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|| "none".to_string());
         format!(
-            "idle={};recv_udp={};send_udp={};initial_dgram={};max_data={};bidi_local={};bidi_remote={};uni_data={};bidi_streams={};uni_streams={};ack_exp={};ack_delay={};ack_threshold={};cid_limit={};disable_migration={};disable_dcid_reuse={};grease={};additional={additional_transport_parameters};max_datagram={:?};dcid_len={};scid_len={};amp={};rtt={};cwnd={};pacing={};max_pacing={:?};relaxed_loss={};conn_win={};stream_win={}",
+            "idle={};recv_udp={};send_udp={};initial_dgram={};max_data={};bidi_local={};bidi_remote={};uni_data={};bidi_streams={};uni_streams={};ack_exp={};ack_delay={};ack_threshold={};cid_limit={};disable_migration={};disable_dcid_reuse={};grease={};additional={additional_transport_parameters};raw_ordered={raw_ordered_transport_parameters};max_datagram={:?};dcid_len={};scid_len={};amp={};rtt={};cwnd={};pacing={};max_pacing={:?};relaxed_loss={};conn_win={};stream_win={}",
             self.max_idle_timeout_ms,
             self.max_recv_udp_payload_size,
             self.max_send_udp_payload_size,

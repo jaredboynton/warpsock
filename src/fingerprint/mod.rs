@@ -8,7 +8,7 @@ pub mod tls;
 pub use http2::PriorityTree;
 pub use http3::{
     H3Settings, H3StreamFingerprint, Http3Fingerprint, QpackHeaderBlockStrategy,
-    QpackStringEncodingStrategy, QuicTransportParams,
+    QpackStringEncodingStrategy, QuicTransportParams, RawQuicTransportParameter,
 };
 pub use profiles::FingerprintProfile;
 pub use tls::{CertCompression, TlsFingerprint};
