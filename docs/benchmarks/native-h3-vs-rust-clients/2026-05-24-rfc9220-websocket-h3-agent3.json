@@ -1,0 +1,347 @@
+{
+  "benchmark": "native_h3_vs_rust_clients",
+  "benchmark_version": "matrix-1",
+  "audited_at": "2026-05-24",
+  "competitors": [
+    {
+      "id": "specter_native",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "candidate",
+      "required_for_superiority": true,
+      "invocation_notes": "Specter native H3 backend; no quiche in the package graph."
+    },
+    {
+      "id": "specter_native_rfc9220_tunnel",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "h3_tunnel_workload",
+      "required_for_superiority": false,
+      "invocation_notes": "Specter native RFC 9220 WebSocket-over-H3 tunnel echo workload."
+    },
+    {
+      "id": "specter_native_rfc9220_tunnel_close",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "h3_tunnel_workload",
+      "required_for_superiority": false,
+      "invocation_notes": "Specter native RFC 9220 tunnel echo with client FIN and server FIN timing."
+    },
+    {
+      "id": "specter_native_rfc9220_tunnel_mixed",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "h3_tunnel_workload",
+      "required_for_superiority": false,
+      "invocation_notes": "Specter native RFC 9220 slow-consumer tunnel plus concurrent H3 streaming workload."
+    },
+    {
+      "id": "quiche_direct_rfc9220_tunnel",
+      "crate_name": "quiche",
+      "version": "0.29.0",
+      "role": "h3_tunnel_comparator",
+      "required_for_superiority": false,
+      "invocation_notes": "Pending low-level quiche Extended CONNECT/WebSocket-over-H3 tunnel comparator adapter."
+    },
+    {
+      "id": "tokio_quiche_rfc9220_tunnel",
+      "crate_name": "tokio-quiche",
+      "version": "0.19.0",
+      "role": "h3_tunnel_comparator",
+      "required_for_superiority": false,
+      "invocation_notes": "Pending tokio-quiche Extended CONNECT/WebSocket-over-H3 tunnel comparator adapter."
+    },
+    {
+      "id": "h3_quinn_rfc9220_tunnel",
+      "crate_name": "h3+h3-quinn",
+      "version": "h3 0.0.8 / h3-quinn 0.0.10",
+      "role": "unsupported_h3_tunnel_comparator",
+      "required_for_superiority": false,
+      "invocation_notes": "Unsupported in this harness: h3 0.0.8 has no WebSocket protocol surface for RFC 9220."
+    },
+    {
+      "id": "reqwest_h3_rfc9220_tunnel",
+      "crate_name": "reqwest",
+      "version": "0.13.3",
+      "role": "unsupported_h3_tunnel_comparator",
+      "required_for_superiority": false,
+      "invocation_notes": "Unsupported in this harness: reqwest H3 exposes request/response APIs, not an RFC 9220 tunnel API."
+    },
+    {
+      "id": "quiche_direct",
+      "crate_name": "quiche",
+      "version": "0.29.0",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Direct Cloudflare quiche H3 client adapter."
+    },
+    {
+      "id": "tokio_quiche",
+      "crate_name": "tokio-quiche",
+      "version": "0.19.0",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Async Cloudflare quiche wrapper adapter."
+    },
+    {
+      "id": "h3_quinn",
+      "crate_name": "h3+h3-quinn",
+      "version": "h3 0.0.8 / h3-quinn 0.0.10",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "hyperium h3 client over Quinn."
+    },
+    {
+      "id": "reqwest_h3",
+      "crate_name": "reqwest",
+      "version": "0.13.3",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Run with --features reqwest-h3 and RUSTFLAGS='--cfg reqwest_unstable'."
+    },
+    {
+      "id": "tokio_tungstenite_rfc9220",
+      "crate_name": "tokio-tungstenite",
+      "version": "0.24.0",
+      "role": "unsupported_h3_websocket_client",
+      "required_for_superiority": false,
+      "invocation_notes": "RFC 6455-over-H1 WebSocket client; no RFC 9220/H3 transport in this harness."
+    },
+    {
+      "id": "reqwest_rfc9220",
+      "crate_name": "reqwest",
+      "version": "0.13.3",
+      "role": "unsupported_h3_websocket_client",
+      "required_for_superiority": false,
+      "invocation_notes": "HTTP client with H3 support; no native WebSocket/RFC 9220 API."
+    },
+    {
+      "id": "quinn_transport",
+      "crate_name": "quinn",
+      "version": "0.11.9",
+      "role": "quic_transport_baseline",
+      "required_for_superiority": false,
+      "invocation_notes": "QUIC transport-only baseline, not an H3 superiority gate member."
+    },
+    {
+      "id": "s2n_quic_transport",
+      "crate_name": "s2n-quic",
+      "version": "1.80.0",
+      "role": "quic_transport_baseline",
+      "required_for_superiority": false,
+      "invocation_notes": "Optional QUIC transport-only baseline via --features s2n-quic-transport."
+    }
+  ],
+  "rows": [
+    {
+      "competitor_id": "specter_native",
+      "status": "pending_measurement",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3",
+      "workload": "http3_streaming_get",
+      "payload_bytes": 81920
+    },
+    {
+      "competitor_id": "specter_native_rfc9220_tunnel",
+      "status": "measured_pass",
+      "p50_ttft_ns": 578833.0,
+      "p95_ttft_ns": 829208.0,
+      "bytes_per_sec": 1730826.114515107,
+      "source": "specter_native_rfc9220_tunnel_adapter",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "sample_count": 5,
+      "notes": "Measured Specter raw byte tunnel over RFC9220 Extended CONNECT; not RFC6455 frame parsing."
+    },
+    {
+      "competitor_id": "specter_native_rfc9220_tunnel_close",
+      "status": "measured_pass",
+      "p50_ttft_ns": 721334.0,
+      "p95_ttft_ns": 891041.0,
+      "bytes_per_sec": 1483180.5300110865,
+      "source": "specter_native_rfc9220_tunnel_close_adapter",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_close_fin",
+      "payload_bytes": 1024,
+      "sample_count": 5,
+      "notes": "Measures client DATA+FIN through echoed DATA and server FIN delivery on an RFC9220 tunnel."
+    },
+    {
+      "competitor_id": "specter_native_rfc9220_tunnel_mixed",
+      "status": "measured_pass",
+      "p50_ttft_ns": 10984375.0,
+      "p95_ttft_ns": 18303667.0,
+      "bytes_per_sec": 999039.4846746204,
+      "source": "specter_native_rfc9220_tunnel_mixed_adapter",
+      "protocol": "h3_rfc9220",
+      "workload": "slow_consumer_tunnel_plus_http3_streaming",
+      "payload_bytes": 122880,
+      "sample_count": 5,
+      "notes": "Measures a delayed-reader RFC9220 tunnel while a same-origin H3 streaming response completes."
+    },
+    {
+      "competitor_id": "quiche_direct_rfc9220_tunnel",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "Explicit RFC9220 comparator slot; adapter is pending and excluded from the HTTP/3 superiority gate."
+    },
+    {
+      "competitor_id": "tokio_quiche_rfc9220_tunnel",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "Explicit RFC9220 comparator slot; adapter is pending and excluded from the HTTP/3 superiority gate."
+    },
+    {
+      "competitor_id": "h3_quinn_rfc9220_tunnel",
+      "status": "unsupported_by_client",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "capability_audit",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "h3/h3-quinn is tracked as unsupported for RFC9220 WebSocket tunnels until its public protocol surface exposes websocket Extended CONNECT."
+    },
+    {
+      "competitor_id": "reqwest_h3_rfc9220_tunnel",
+      "status": "unsupported_by_client",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "capability_audit",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "reqwest_h3 is tracked as unsupported for RFC9220 WebSocket tunnels because reqwest does not expose a bidirectional H3 tunnel API."
+    },
+    {
+      "competitor_id": "quiche_direct",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3",
+      "workload": "http3_streaming_get",
+      "payload_bytes": 81920
+    },
+    {
+      "competitor_id": "tokio_quiche",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3",
+      "workload": "http3_streaming_get",
+      "payload_bytes": 81920
+    },
+    {
+      "competitor_id": "h3_quinn",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3",
+      "workload": "http3_streaming_get",
+      "payload_bytes": 81920
+    },
+    {
+      "competitor_id": "reqwest_h3",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "h3",
+      "workload": "http3_streaming_get",
+      "payload_bytes": 81920
+    },
+    {
+      "competitor_id": "tokio_tungstenite_rfc9220",
+      "status": "unsupported_by_client",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "capability_audit",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "tokio-tungstenite is an RFC6455-over-H1 client and has no RFC9220/H3 transport here; not a throughput comparator."
+    },
+    {
+      "competitor_id": "reqwest_rfc9220",
+      "status": "unsupported_by_client",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "capability_audit",
+      "protocol": "h3_rfc9220",
+      "workload": "websocket_over_h3_raw_tunnel_echo",
+      "payload_bytes": 1024,
+      "notes": "reqwest can measure H3 HTTP rows but does not expose a native WebSocket/RFC9220 API; not a throughput comparator."
+    },
+    {
+      "competitor_id": "quinn_transport",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "quic",
+      "workload": "bidirectional_echo_transport",
+      "payload_bytes": 1024,
+      "notes": "QUIC transport-only echo baseline; not an H3 HTTP or RFC9220 comparator."
+    },
+    {
+      "competitor_id": "s2n_quic_transport",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness",
+      "protocol": "quic",
+      "workload": "bidirectional_echo_transport",
+      "payload_bytes": 1024,
+      "notes": "QUIC transport-only echo baseline; not an H3 HTTP or RFC9220 comparator."
+    }
+  ],
+  "fixture_events": [],
+  "superiority_gate": {
+    "status": "incomplete",
+    "pass": false,
+    "reason": "no_h3_superiority_claim_without_all_required_rows",
+    "fastest_non_specter_h3_client": null,
+    "no_h3_superiority_claim_without_all_required_rows": true,
+    "required_h3_clients": [
+      "quiche_direct",
+      "tokio_quiche",
+      "h3_quinn",
+      "reqwest_h3"
+    ],
+    "missing_required_rows": [
+      "quiche_direct",
+      "tokio_quiche",
+      "h3_quinn",
+      "reqwest_h3"
+    ]
+  }
+}

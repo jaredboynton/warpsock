@@ -1,0 +1,152 @@
+{
+  "benchmark": "native_h3_vs_rust_clients",
+  "benchmark_version": "matrix-1",
+  "audited_at": "2026-05-24",
+  "competitors": [
+    {
+      "id": "specter_native",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "candidate",
+      "required_for_superiority": true,
+      "invocation_notes": "Specter native H3 backend; no quiche in the package graph."
+    },
+    {
+      "id": "specter_native_rfc9220_tunnel",
+      "crate_name": "specters",
+      "version": "4.0.1",
+      "role": "h3_tunnel_workload",
+      "required_for_superiority": false,
+      "invocation_notes": "Specter native RFC 9220 WebSocket-over-H3 tunnel echo workload."
+    },
+    {
+      "id": "quiche_direct",
+      "crate_name": "quiche",
+      "version": "0.29.0",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Direct Cloudflare quiche H3 client adapter."
+    },
+    {
+      "id": "tokio_quiche",
+      "crate_name": "tokio-quiche",
+      "version": "0.19.0",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Async Cloudflare quiche wrapper adapter."
+    },
+    {
+      "id": "h3_quinn",
+      "crate_name": "h3+h3-quinn",
+      "version": "h3 0.0.8 / h3-quinn 0.0.10",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "hyperium h3 client over Quinn."
+    },
+    {
+      "id": "reqwest_h3",
+      "crate_name": "reqwest",
+      "version": "0.13.3",
+      "role": "h3_client",
+      "required_for_superiority": true,
+      "invocation_notes": "Run with --features reqwest-h3 and RUSTFLAGS='--cfg reqwest_unstable'."
+    },
+    {
+      "id": "quinn_transport",
+      "crate_name": "quinn",
+      "version": "0.11.9",
+      "role": "quic_transport_baseline",
+      "required_for_superiority": false,
+      "invocation_notes": "QUIC transport-only baseline, not an H3 superiority gate member."
+    },
+    {
+      "id": "s2n_quic_transport",
+      "crate_name": "s2n-quic",
+      "version": "1.80.0",
+      "role": "quic_transport_baseline",
+      "required_for_superiority": false,
+      "invocation_notes": "Optional QUIC transport-only baseline via --features s2n-quic-transport."
+    }
+  ],
+  "rows": [
+    {
+      "competitor_id": "specter_native",
+      "status": "measured_pass",
+      "p50_ttft_ns": 154125.0,
+      "p95_ttft_ns": 172041.0,
+      "bytes_per_sec": 10228067.680542188,
+      "source": "specter_native_adapter"
+    },
+    {
+      "competitor_id": "specter_native_rfc9220_tunnel",
+      "status": "measured_pass",
+      "p50_ttft_ns": 344875.0,
+      "p95_ttft_ns": 406708.0,
+      "bytes_per_sec": 2724915.2788181743,
+      "source": "specter_native_rfc9220_tunnel_adapter"
+    },
+    {
+      "competitor_id": "quiche_direct",
+      "status": "measured_pass",
+      "p50_ttft_ns": 2969917.0,
+      "p95_ttft_ns": 3057666.0,
+      "bytes_per_sec": 7257331.537131966,
+      "source": "quiche_direct_adapter"
+    },
+    {
+      "competitor_id": "tokio_quiche",
+      "status": "measured_pass",
+      "p50_ttft_ns": 3068375.0,
+      "p95_ttft_ns": 3109833.0,
+      "bytes_per_sec": 6351475.225486287,
+      "source": "tokio_quiche_adapter"
+    },
+    {
+      "competitor_id": "h3_quinn",
+      "status": "measured_pass",
+      "p50_ttft_ns": 309500.0,
+      "p95_ttft_ns": 426375.0,
+      "bytes_per_sec": 8666414.248888373,
+      "source": "h3_quinn_adapter"
+    },
+    {
+      "competitor_id": "reqwest_h3",
+      "status": "measured_pass",
+      "p50_ttft_ns": 316500.0,
+      "p95_ttft_ns": 328333.0,
+      "bytes_per_sec": 9570140.414240351,
+      "source": "reqwest_h3_adapter"
+    },
+    {
+      "competitor_id": "quinn_transport",
+      "status": "measured_pass",
+      "p50_ttft_ns": 288625.0,
+      "p95_ttft_ns": 367709.0,
+      "bytes_per_sec": 3120362.498362114,
+      "source": "quinn_transport_adapter"
+    },
+    {
+      "competitor_id": "s2n_quic_transport",
+      "status": "pending_adapter",
+      "p50_ttft_ns": null,
+      "p95_ttft_ns": null,
+      "bytes_per_sec": null,
+      "source": "native_h3_vs_rust_clients_harness"
+    }
+  ],
+  "fixture_events": [],
+  "superiority_gate": {
+    "status": "pass",
+    "pass": true,
+    "reason": "specter_native_is_faster_than_required_h3_competitors",
+    "fastest_non_specter_h3_client": "h3_quinn",
+    "no_h3_superiority_claim_without_all_required_rows": true,
+    "required_h3_clients": [
+      "quiche_direct",
+      "tokio_quiche",
+      "h3_quinn",
+      "reqwest_h3"
+    ],
+    "missing_required_rows": []
+  }
+}
