@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use specter::{Client, HttpVersion};
+use std::fs;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -264,7 +265,7 @@ async fn h1_streams_fixed_content_length_incrementally() {
     assert_eq!(body, b"one-two-three");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h1_streams_chunked_transfer_incrementally() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
@@ -468,5 +469,69 @@ async fn h1_compressed_streaming_decodes_incrementally() {
         matches!(err, specter::Error::Decompression(_)),
         "Expected Decompression error, got {:?}",
         err
+    );
+}
+
+#[tokio::test]
+async fn h1_body_polls_socket_with_reusable_buffer() {
+    let source = fs::read_to_string("src/transport/h1.rs").unwrap();
+    assert!(
+        source.contains("STREAM_READ_BUF_SIZE: usize = 16 * 1024"),
+        "H1 response body must keep a reusable 16KiB read buffer"
+    );
+    assert!(
+        !source.contains("tokio::spawn"),
+        "H1 response streaming must not spawn a body-pump task"
+    );
+    assert!(
+        !source.contains("tokio::sync::mpsc") && !source.contains("mpsc::"),
+        "H1 response streaming must not route chunks through mpsc"
+    );
+
+    let fixture = H1Fixture::start().await;
+    let client = Client::builder().prefer_http2(false).build().unwrap();
+
+    let response = client
+        .get(fixture.endpoint("/fixed"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    assert_eq!(collect(response).await, b"one-two-three");
+
+    let response = client
+        .get(fixture.endpoint("/fixed"))
+        .version(HttpVersion::Http1_1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes_raw().unwrap().as_ref(), b"one-two-three");
+    let logs = fixture.logs().await;
+    assert_eq!(
+        logs[0].connection_id, logs[1].connection_id,
+        "fully drained H1 streaming body should return the socket to the pool"
+    );
+
+    let mut response = client
+        .get(fixture.endpoint("/fixed"))
+        .version(HttpVersion::Http1_1)
+        .send_streaming()
+        .await
+        .unwrap();
+    let first = next_data(response.body_mut()).await;
+    assert_eq!(first, Bytes::from_static(b"one-"));
+    drop(response);
+
+    let response = client
+        .get(fixture.endpoint("/fixed"))
+        .version(HttpVersion::Http1_1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes_raw().unwrap().as_ref(), b"one-two-three");
+    let logs = fixture.logs().await;
+    assert_ne!(
+        logs[2].connection_id, logs[3].connection_id,
+        "partially dropped H1 streaming body must discard rather than reuse the socket"
     );
 }

@@ -233,6 +233,27 @@ impl ConnectionPool {
         );
     }
 
+    /// Try to return an HTTP/1.1 connection to the pool without awaiting.
+    ///
+    /// This is used by poll-based response bodies, where parking the caller on
+    /// an async pool lock would couple body EOF to an unrelated task wake. If
+    /// the pool lock is temporarily unavailable, the connection is safely
+    /// discarded instead of being returned late or through a spawned shim.
+    pub fn try_put_h1(&self, key: PoolKey, stream: MaybeHttpsStream) -> bool {
+        if self.max_connections_per_host == 0 {
+            return false;
+        }
+        let Ok(mut pool) = self.h1_idle.try_write() else {
+            return false;
+        };
+        let entries = pool.entry(key).or_default();
+        while entries.len() >= self.max_connections_per_host {
+            entries.remove(0);
+        }
+        entries.push(H1PoolEntry::new(stream));
+        true
+    }
+
     /// Get an existing connection or signal that a new one should be created
     ///
     /// Returns:

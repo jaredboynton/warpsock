@@ -64,10 +64,10 @@ pub type RequestBodyStream =
 
 /// Public request body model.
 ///
-/// Streaming variants are non-cloneable: the redirect/retry path that
-/// previously cloned `Body` for retry now treats a streaming body as
-/// already consumed and replaces it with [`RequestBody::Empty`] on clone.
-/// Cloning of in-memory variants remains cheap.
+/// Streaming variants are non-cloneable and cannot be replayed implicitly.
+/// Redirect/retry paths must fail closed when replay would be required instead
+/// of cloning a stream into an empty request body. Cloning of in-memory
+/// variants remains cheap.
 #[derive(Default)]
 pub enum RequestBody {
     #[default]
@@ -164,7 +164,9 @@ impl Clone for RequestBody {
             RequestBody::Text(t) => RequestBody::Text(t.clone()),
             RequestBody::Json(b) => RequestBody::Json(b.clone()),
             RequestBody::Form(t) => RequestBody::Form(t.clone()),
-            RequestBody::Stream { .. } => RequestBody::Empty,
+            RequestBody::Stream { .. } => {
+                panic!("RequestBody::Stream cannot be cloned or replayed")
+            }
         }
     }
 }

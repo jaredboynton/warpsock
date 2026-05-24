@@ -30,7 +30,7 @@ use crate::response::{Body, Response};
 use crate::timeouts::Timeouts;
 use crate::transport::connector::{BoringConnector, MaybeHttpsStream};
 use crate::transport::dns::{DnsConfig, Resolve};
-use crate::transport::h1::H1Connection;
+use crate::transport::h1::{H1Connection, H1StreamingOptions};
 use crate::transport::h2::{
     H2Connection, H2PooledConnection, H2TransportConfig, H2Tunnel, PseudoHeaderOrder,
 };
@@ -649,6 +649,11 @@ impl<'a> RequestBuilder<'a> {
     pub async fn send(self) -> Result<Response> {
         let client = self.client.clone();
         let request = self.build()?;
+        if request.body.is_streaming() {
+            return Err(Error::HttpProtocol(
+                "streaming request bodies require send_streaming()".into(),
+            ));
+        }
         client.execute(request).await
     }
 
@@ -659,6 +664,18 @@ impl<'a> RequestBuilder<'a> {
         let policy = self.client.redirect_policy.clone();
         if matches!(policy, RedirectPolicy::None) {
             return self.send_streaming_once().await;
+        }
+
+        if self.body.is_streaming() {
+            let mut response = self.send_streaming_once().await?;
+            if response.is_redirect() {
+                drain_streaming_body(response.body_mut()).await?;
+                return Err(Error::HttpProtocol(
+                    "redirect would require replaying a non-replayable streaming request body"
+                        .into(),
+                ));
+            }
+            return Ok(response);
         }
 
         let client = self.client;
@@ -697,7 +714,7 @@ impl<'a> RequestBuilder<'a> {
             drain_streaming_body(response.body_mut()).await?;
 
             let next_url = request.url.join(&location).map_err(Error::from)?;
-            request = client.redirect_request(&request, &response, next_url);
+            request = client.redirect_request(&request, &response, next_url)?;
             redirects += 1;
         }
     }
@@ -723,6 +740,11 @@ impl<'a> RequestBuilder<'a> {
         let version = request.version.unwrap_or(client.default_version);
 
         if matches!(version, HttpVersion::Http3 | HttpVersion::Http3Only) {
+            if request.body.is_streaming() {
+                return Err(Error::HttpProtocol(
+                    "HTTP/3 streaming request bodies are not implemented yet".into(),
+                ));
+            }
             let body = if request.body.is_empty() {
                 None
             } else {
@@ -804,25 +826,27 @@ impl<'a> RequestBuilder<'a> {
                 connect_fut.await?
             };
 
-            let body_bytes = if request.body.is_empty() {
-                None
-            } else {
-                Some(request.body.clone().into_bytes()?)
-            };
             let h1_pool = client.h1_pool.clone();
             let pool_key_for_reuse = pool_key.clone();
             let on_reusable: crate::transport::h1::H1ReuseHook = Box::new(move |stream| {
-                Box::pin(async move { h1_pool.put_h1(pool_key_for_reuse, stream).await })
+                let _ = h1_pool.try_put_h1(pool_key_for_reuse, stream);
             });
             let conn = H1Connection::new(stream);
+            let method = request.method.clone();
+            let headers = request.headers.to_vec();
+            let body = request.body;
             let send_fut = conn.send_request_streaming(
-                request.method.clone(),
+                method,
                 &uri,
-                request.headers.to_vec(),
-                body_bytes,
-                on_reusable,
+                headers,
+                body,
+                H1StreamingOptions {
+                    on_reusable,
+                    read_idle_timeout: timeouts.read_idle,
+                    total_timeout: timeouts.total,
+                },
             );
-            let (response, rx) = if let Some(ttfb_timeout) = timeouts.ttfb {
+            let response = if let Some(ttfb_timeout) = timeouts.ttfb {
                 tokio_timeout(ttfb_timeout, send_fut)
                     .await
                     .map_err(|_| Error::TtfbTimeout(ttfb_timeout))??
@@ -836,8 +860,14 @@ impl<'a> RequestBuilder<'a> {
                     .await
                     .store_from_headers(response.headers(), request_url.as_str());
             }
-            (response, rx)
+            reject_compressed_streaming(&response)?;
+            return Ok(response);
         } else {
+            if request.body.is_streaming() {
+                return Err(Error::HttpProtocol(
+                    "HTTP/2 streaming request bodies are not implemented yet".into(),
+                ));
+            }
             // Check for existing pooled connection
             let pooled = {
                 let mut pool = client.h2_pool.write().await;
@@ -1033,22 +1063,27 @@ impl<'a> RequestBuilder<'a> {
             }
         };
 
-        if let Some(enc) = response.content_encoding() {
-            let enc_lc = enc.to_lowercase();
-            if enc_lc.contains("gzip")
-                || enc_lc.contains("deflate")
-                || enc_lc.contains("br")
-                || enc_lc.contains("zstd")
-            {
-                return Err(Error::Decompression(
-                    "Compressed streaming is unsupported".into(),
-                ));
-            }
-        }
+        reject_compressed_streaming(&response)?;
 
         let body = wrap_streaming_receiver(rx, &timeouts);
         Ok(attach_streaming_body(response, body))
     }
+}
+
+fn reject_compressed_streaming(response: &Response) -> Result<()> {
+    if let Some(enc) = response.content_encoding() {
+        let enc_lc = enc.to_lowercase();
+        if enc_lc.contains("gzip")
+            || enc_lc.contains("deflate")
+            || enc_lc.contains("br")
+            || enc_lc.contains("zstd")
+        {
+            return Err(Error::Decompression(
+                "Compressed streaming is unsupported".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn attach_streaming_body(response: Response, body: Body) -> Response {
@@ -1156,7 +1191,7 @@ impl Client {
             }
 
             let next_url = request.url.join(location).map_err(Error::from)?;
-            let mut next_request = self.redirect_request(&request, &response, next_url);
+            let mut next_request = self.redirect_request(&request, &response, next_url)?;
 
             if cookie_injected {
                 next_request.headers.remove("cookie");
@@ -1547,34 +1582,44 @@ impl Client {
         Ok(response.with_url(request_url))
     }
 
-    fn redirect_request(&self, request: &Request, response: &Response, next_url: Url) -> Request {
+    fn redirect_request(
+        &self,
+        request: &Request,
+        response: &Response,
+        next_url: Url,
+    ) -> Result<Request> {
         let status = response.status().as_u16();
         let mut method = request.method.clone();
-        let mut body = request.body.clone();
         let mut headers = request.headers.clone();
 
         let should_switch = status == 303
             || ((status == 301 || status == 302) && !matches!(method, Method::GET | Method::HEAD));
 
-        if should_switch {
+        let body = if should_switch {
             method = Method::GET;
-            body = RequestBody::Empty;
             headers.remove("content-length");
             headers.remove("content-type");
-        }
+            RequestBody::Empty
+        } else if request.body.is_streaming() {
+            return Err(Error::HttpProtocol(
+                "redirect would require replaying a non-replayable streaming request body".into(),
+            ));
+        } else {
+            request.body.clone()
+        };
 
         if Self::is_cross_origin(&request.url, &next_url) {
             headers.remove("authorization");
         }
 
-        Request {
+        Ok(Request {
             method,
             url: next_url,
             headers,
             body,
             version: request.version,
             timeout: request.timeout,
-        }
+        })
     }
 
     async fn apply_cookie_header(&self, request: &Request, headers: &mut Headers) -> bool {

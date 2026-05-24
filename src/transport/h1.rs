@@ -3,24 +3,33 @@
 //! Uses httparse for response parsing and raw I/O for maximum control
 //! over request formatting and header order.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use http::{Method, Uri};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::future::Future;
 use std::pin::Pin;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::time::{Instant, Sleep};
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
+use crate::request::RequestBody;
 use crate::response::Response;
 use crate::transport::connector::MaybeHttpsStream;
 
-/// Callback invoked by the streaming body task when the underlying connection
-/// is safe to return to the pool. Ownership of the stream is transferred to
-/// this hook so the body task can perform the pool insertion inline, avoiding
-/// an extra `tokio::spawn` and an additional channel hop per request.
-pub type H1ReuseHook =
-    Box<dyn FnOnce(MaybeHttpsStream) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+/// Callback invoked by the H1 poll body when the underlying connection is safe
+/// to return to the pool. The future is polled by `H1Body::poll_frame` after
+/// EOF/full drain, so the response path does not need a body-pump task,
+/// response channel, or oneshot reuse shim.
+pub type H1ReuseHook = Box<dyn FnOnce(MaybeHttpsStream) + Send>;
+
+pub struct H1StreamingOptions {
+    pub on_reusable: H1ReuseHook,
+    pub read_idle_timeout: Option<Duration>,
+    pub total_timeout: Option<Duration>,
+}
 
 /// Maximum response header size (64KB).
 const MAX_HEADERS_SIZE: usize = 64 * 1024;
@@ -40,11 +49,384 @@ pub struct H1Connection {
     should_close: bool,
 }
 
-enum H1BodyMode {
+pub(crate) enum H1BodyMode {
     Empty,
-    Fixed { remaining: usize, buffer: Vec<u8> },
-    Chunked { buffer: Vec<u8> },
-    CloseDelimited { buffer: Vec<u8> },
+    Fixed { remaining: usize, buffer: BytesMut },
+    Chunked { buffer: BytesMut },
+    CloseDelimited { buffer: BytesMut },
+}
+
+#[derive(Clone, Copy)]
+enum H1RequestBodyKind {
+    None,
+    ContentLength(u64),
+    Chunked,
+}
+
+/// HTTP/1.1 response body that polls the socket directly.
+///
+/// The body owns the socket until it reaches a terminal state. Fixed-length and
+/// chunked responses return the socket to the pool only after the body is fully
+/// drained and the protocol permits reuse. Close-delimited responses and
+/// dropped/errored bodies discard the socket.
+pub struct H1Body {
+    stream: Option<MaybeHttpsStream>,
+    mode: H1BodyMode,
+    should_close: bool,
+    on_reusable: Option<H1ReuseHook>,
+    read_buf: Box<[u8; STREAM_READ_BUF_SIZE]>,
+    terminal: bool,
+    read_idle_timeout: Option<Duration>,
+    read_idle_sleep: Option<Pin<Box<Sleep>>>,
+    total_timeout: Option<Duration>,
+    total_sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl H1Body {
+    fn new(
+        stream: MaybeHttpsStream,
+        mode: H1BodyMode,
+        should_close: bool,
+        on_reusable: H1ReuseHook,
+        read_idle_timeout: Option<Duration>,
+        total_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            stream: Some(stream),
+            mode,
+            should_close,
+            on_reusable: Some(on_reusable),
+            read_buf: Box::new([0; STREAM_READ_BUF_SIZE]),
+            terminal: false,
+            read_idle_timeout,
+            read_idle_sleep: None,
+            total_timeout,
+            total_sleep: total_timeout.map(|duration| Box::pin(tokio::time::sleep(duration))),
+        }
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.mode {
+            H1BodyMode::Empty => SizeHint::with_exact(0),
+            H1BodyMode::Fixed { remaining, buffer } => {
+                SizeHint::with_exact((*remaining + buffer.len()) as u64)
+            }
+            H1BodyMode::Chunked { .. } | H1BodyMode::CloseDelimited { .. } => SizeHint::default(),
+        }
+    }
+
+    fn poll_return_to_pool(&mut self, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>>>> {
+        if !self.should_close {
+            if let (Some(stream), Some(on_reusable)) = (self.stream.take(), self.on_reusable.take())
+            {
+                on_reusable(stream);
+            }
+        }
+
+        self.stream = None;
+        self.on_reusable = None;
+        self.terminal = true;
+        Poll::Ready(None)
+    }
+
+    fn fail(&mut self, err: Error) -> Poll<Option<Result<Frame<Bytes>>>> {
+        self.stream = None;
+        self.on_reusable = None;
+        self.terminal = true;
+        Poll::Ready(Some(Err(err)))
+    }
+
+    fn reset_read_idle(&mut self) {
+        self.read_idle_sleep = None;
+    }
+
+    fn poll_timeouts(&mut self, cx: &mut Context<'_>) -> Option<Error> {
+        if let Some(total) = self.total_sleep.as_mut() {
+            if total.as_mut().poll(cx).is_ready() {
+                return Some(Error::TotalTimeout(self.total_timeout.unwrap_or_else(
+                    || total.deadline().saturating_duration_since(Instant::now()),
+                )));
+            }
+        }
+
+        if let Some(read_idle) = self.read_idle_timeout {
+            let sleep = self
+                .read_idle_sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(read_idle)));
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Some(Error::ReadIdleTimeout(read_idle));
+            }
+        }
+
+        None
+    }
+
+    fn poll_read_into_internal_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
+        self.poll_read_into_internal_buffer_limited(cx, STREAM_READ_BUF_SIZE)
+    }
+
+    fn poll_read_into_internal_buffer_limited(
+        &mut self,
+        cx: &mut Context<'_>,
+        limit: usize,
+    ) -> Poll<Result<usize>> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Err(Error::HttpProtocol(
+                "H1 response body stream is no longer available".into(),
+            )));
+        };
+
+        let limit = limit.min(STREAM_READ_BUF_SIZE);
+        let mut read = ReadBuf::new(&mut self.read_buf[..limit]);
+        match Pin::new(stream).poll_read(cx, &mut read) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let n = read.filled().len();
+                self.reset_read_idle();
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(Error::HttpProtocol(format!(
+                "Failed to read H1 response body: {}",
+                err
+            )))),
+        }
+    }
+
+    fn poll_read_more(
+        &mut self,
+        cx: &mut Context<'_>,
+        target: &mut BytesMut,
+    ) -> Poll<Result<usize>> {
+        match self.poll_read_into_internal_buffer(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
+            Poll::Ready(Ok(n)) => {
+                target.extend_from_slice(&self.read_buf[..n]);
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_fixed_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut remaining: usize,
+        mut buffer: BytesMut,
+    ) -> Poll<Option<Result<Frame<Bytes>>>> {
+        if remaining == 0 {
+            self.mode = H1BodyMode::Empty;
+            return self.poll_return_to_pool(cx);
+        }
+
+        if !buffer.is_empty() {
+            let n = remaining.min(buffer.len());
+            let chunk = buffer.split_to(n).freeze();
+            remaining -= n;
+            self.mode = H1BodyMode::Fixed { remaining, buffer };
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+
+        match self.poll_read_into_internal_buffer_limited(cx, remaining) {
+            Poll::Pending => {
+                self.mode = H1BodyMode::Fixed { remaining, buffer };
+                Poll::Pending
+            }
+            Poll::Ready(Ok(0)) => self.fail(Error::HttpProtocol(format!(
+                "Connection closed before receiving full body ({} bytes remaining)",
+                remaining
+            ))),
+            Poll::Ready(Ok(n)) => {
+                let take = remaining.min(n);
+                let chunk = Bytes::copy_from_slice(&self.read_buf[..take]);
+                remaining -= take;
+                self.mode = H1BodyMode::Fixed { remaining, buffer };
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            Poll::Ready(Err(err)) => self.fail(err),
+        }
+    }
+
+    fn poll_close_delimited(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut buffer: BytesMut,
+    ) -> Poll<Option<Result<Frame<Bytes>>>> {
+        if !buffer.is_empty() {
+            let chunk = buffer.split_to(buffer.len()).freeze();
+            self.mode = H1BodyMode::CloseDelimited { buffer };
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+
+        match self.poll_read_into_internal_buffer(cx) {
+            Poll::Pending => {
+                self.mode = H1BodyMode::CloseDelimited { buffer };
+                Poll::Pending
+            }
+            Poll::Ready(Ok(0)) => {
+                self.should_close = true;
+                self.mode = H1BodyMode::Empty;
+                self.poll_return_to_pool(cx)
+            }
+            Poll::Ready(Ok(n)) => {
+                let chunk = Bytes::copy_from_slice(&self.read_buf[..n]);
+                self.mode = H1BodyMode::CloseDelimited { buffer };
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            Poll::Ready(Err(err)) => self.fail(err),
+        }
+    }
+
+    fn poll_consume_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut BytesMut,
+    ) -> Poll<Result<()>> {
+        loop {
+            if let Some(pos) = find_crlf(buffer) {
+                if pos == 0 {
+                    buffer.advance(2);
+                    return Poll::Ready(Ok(()));
+                }
+                buffer.advance(pos + 2);
+                continue;
+            }
+
+            let mut scratch = BytesMut::new();
+            match self.poll_read_more(cx, &mut scratch) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(_)) => buffer.extend_from_slice(&scratch),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+
+    fn poll_chunked_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut buffer: BytesMut,
+    ) -> Poll<Option<Result<Frame<Bytes>>>> {
+        let (chunk_size, line_end) = loop {
+            if let Some((size, end)) = find_chunk_size(&buffer) {
+                break (size, end);
+            }
+            let mut scratch = BytesMut::new();
+            match self.poll_read_more(cx, &mut scratch) {
+                Poll::Pending => {
+                    self.mode = H1BodyMode::Chunked { buffer };
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(0)) => {
+                    return self.fail(Error::HttpProtocol(
+                        "Connection closed while reading chunk size".into(),
+                    ));
+                }
+                Poll::Ready(Ok(_)) => buffer.extend_from_slice(&scratch),
+                Poll::Ready(Err(err)) => return self.fail(err),
+            }
+        };
+
+        buffer.advance(line_end);
+
+        if chunk_size == 0 {
+            match self.poll_consume_trailers(cx, &mut buffer) {
+                Poll::Pending => {
+                    self.mode = H1BodyMode::Chunked { buffer };
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(())) => {
+                    self.mode = H1BodyMode::Empty;
+                    return self.poll_return_to_pool(cx);
+                }
+                Poll::Ready(Err(err)) => return self.fail(err),
+            }
+        }
+
+        let chunk_end = chunk_size + 2;
+        while buffer.len() < chunk_end {
+            let mut scratch = BytesMut::new();
+            match self.poll_read_more(cx, &mut scratch) {
+                Poll::Pending => {
+                    self.mode = H1BodyMode::Chunked { buffer };
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(0)) => {
+                    return self.fail(Error::HttpProtocol(
+                        "Connection closed while reading chunk data".into(),
+                    ));
+                }
+                Poll::Ready(Ok(_)) => buffer.extend_from_slice(&scratch),
+                Poll::Ready(Err(err)) => return self.fail(err),
+            }
+        }
+
+        if &buffer[chunk_size..chunk_end] != b"\r\n" {
+            return self.fail(Error::HttpProtocol(
+                "Malformed chunk: missing trailing CRLF".into(),
+            ));
+        }
+        let chunk = buffer.split_to(chunk_size).freeze();
+        buffer.advance(2);
+        self.mode = H1BodyMode::Chunked { buffer };
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+}
+
+impl HttpBody for H1Body {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>>>> {
+        let this = &mut *self;
+        if this.terminal {
+            return Poll::Ready(None);
+        }
+
+        if let Some(err) = this.poll_timeouts(cx) {
+            return this.fail(err);
+        }
+
+        match std::mem::replace(&mut this.mode, H1BodyMode::Empty) {
+            H1BodyMode::Empty => this.poll_return_to_pool(cx),
+            H1BodyMode::Fixed { remaining, buffer } => this.poll_fixed_body(cx, remaining, buffer),
+            H1BodyMode::Chunked { buffer } => this.poll_chunked_body(cx, buffer),
+            H1BodyMode::CloseDelimited { buffer } => this.poll_close_delimited(cx, buffer),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint()
+    }
+}
+
+fn h1_request_body_kind(body: &RequestBody) -> H1RequestBodyKind {
+    match body {
+        RequestBody::Empty => H1RequestBodyKind::None,
+        RequestBody::Bytes(bytes) => H1RequestBodyKind::ContentLength(bytes.len() as u64),
+        RequestBody::Text(text) => H1RequestBodyKind::ContentLength(text.len() as u64),
+        RequestBody::Json(bytes) => H1RequestBodyKind::ContentLength(bytes.len() as u64),
+        RequestBody::Form(text) => H1RequestBodyKind::ContentLength(text.len() as u64),
+        RequestBody::Stream {
+            content_length: Some(len),
+            ..
+        } => H1RequestBodyKind::ContentLength(*len),
+        RequestBody::Stream {
+            content_length: None,
+            ..
+        } => H1RequestBodyKind::Chunked,
+    }
 }
 
 impl H1Connection {
@@ -75,7 +457,14 @@ impl H1Connection {
         body: Option<Bytes>,
     ) -> Result<Response> {
         // Build and send the request
-        let request_bytes = self.build_request(&method, uri, &headers, body.as_ref())?;
+        let request_bytes = self.build_request(
+            &method,
+            uri,
+            &headers,
+            body.as_ref()
+                .map(|bytes| H1RequestBodyKind::ContentLength(bytes.len() as u64))
+                .unwrap_or(H1RequestBodyKind::None),
+        )?;
         self.stream
             .write_all(&request_bytes)
             .await
@@ -111,21 +500,17 @@ impl H1Connection {
         method: Method,
         uri: &Uri,
         headers: Vec<(String, String)>,
-        body: Option<Bytes>,
-        on_reusable: H1ReuseHook,
-    ) -> Result<(Response, mpsc::Receiver<std::result::Result<Bytes, Error>>)> {
-        let request_bytes = self.build_request(&method, uri, &headers, body.as_ref())?;
+        body: RequestBody,
+        options: H1StreamingOptions,
+    ) -> Result<Response> {
+        let body_kind = h1_request_body_kind(&body);
+        let request_bytes = self.build_request(&method, uri, &headers, body_kind)?;
         self.stream
             .write_all(&request_bytes)
             .await
             .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
 
-        if let Some(body) = body {
-            self.stream
-                .write_all(&body)
-                .await
-                .map_err(|e| Error::HttpProtocol(format!("Failed to write body: {}", e)))?;
-        }
+        self.write_request_body(body).await?;
 
         self.stream
             .flush()
@@ -133,15 +518,22 @@ impl H1Connection {
             .map_err(|e| Error::HttpProtocol(format!("Failed to flush: {}", e)))?;
 
         let (response, mode) = self.read_streaming_response_headers(&method).await?;
-        let (body_tx, body_rx) = mpsc::channel(32);
+        let should_close = self.should_close;
+        let body = crate::response::Body::from_h1(H1Body::new(
+            self.stream,
+            mode,
+            should_close,
+            options.on_reusable,
+            options.read_idle_timeout,
+            options.total_timeout,
+        ));
 
-        tokio::spawn(async move {
-            if let Some(stream) = self.stream_body(mode, body_tx).await {
-                on_reusable(stream).await;
-            }
-        });
-
-        Ok((response, body_rx))
+        Ok(Response::with_body(
+            response.status_code(),
+            response.headers().clone(),
+            body,
+            response.http_version().to_string(),
+        ))
     }
 
     /// Build the HTTP/1.1 request as bytes.
@@ -155,7 +547,7 @@ impl H1Connection {
         method: &Method,
         uri: &Uri,
         headers: &[(String, String)],
-        body: Option<&Bytes>,
+        body_kind: H1RequestBodyKind,
     ) -> Result<Vec<u8>> {
         let mut request = Vec::with_capacity(1024);
 
@@ -202,10 +594,12 @@ impl H1Connection {
         // If no host, we still emit "Host: \r\n" (empty value)
         request.extend_from_slice(b"\r\n");
 
-        // Check if user provided Transfer-Encoding
-        let has_transfer_encoding = headers
+        let user_has_transfer_encoding = headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+        let user_has_content_length = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
 
         // User-provided headers (preserving order)
         let mut has_connection_header = false;
@@ -217,6 +611,16 @@ impl H1Connection {
             // Track if user provided Connection header
             if name.eq_ignore_ascii_case("connection") {
                 has_connection_header = true;
+            }
+            if matches!(body_kind, H1RequestBodyKind::Chunked)
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                continue;
+            }
+            if matches!(body_kind, H1RequestBodyKind::ContentLength(_))
+                && name.eq_ignore_ascii_case("transfer-encoding")
+            {
+                continue;
             }
             request.extend_from_slice(name.as_bytes());
             request.extend_from_slice(b": ");
@@ -230,17 +634,18 @@ impl H1Connection {
             request.extend_from_slice(b"Connection: keep-alive\r\n");
         }
 
-        // Content-Length if body present, not already set, and no Transfer-Encoding
-        // Per RFC 9112: MUST NOT send Content-Length when Transfer-Encoding is present
-        if let Some(body) = body {
-            if !has_transfer_encoding {
-                let has_content_length = headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
-                if !has_content_length {
+        match body_kind {
+            H1RequestBodyKind::None => {}
+            H1RequestBodyKind::ContentLength(len) => {
+                if !user_has_content_length {
                     request.extend_from_slice(b"Content-Length: ");
-                    request.extend_from_slice(body.len().to_string().as_bytes());
+                    request.extend_from_slice(len.to_string().as_bytes());
                     request.extend_from_slice(b"\r\n");
+                }
+            }
+            H1RequestBodyKind::Chunked => {
+                if !user_has_transfer_encoding {
+                    request.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
                 }
             }
         }
@@ -249,6 +654,118 @@ impl H1Connection {
         request.extend_from_slice(b"\r\n");
 
         Ok(request)
+    }
+
+    async fn write_request_body(&mut self, body: RequestBody) -> Result<()> {
+        match body {
+            RequestBody::Empty => Ok(()),
+            RequestBody::Bytes(bytes) => self.write_sized_request_bytes(bytes, None).await,
+            RequestBody::Text(text) => {
+                self.write_sized_request_bytes(Bytes::from(text.into_bytes()), None)
+                    .await
+            }
+            RequestBody::Json(bytes) => {
+                self.write_sized_request_bytes(Bytes::from(bytes), None)
+                    .await
+            }
+            RequestBody::Form(text) => {
+                self.write_sized_request_bytes(Bytes::from(text.into_bytes()), None)
+                    .await
+            }
+            RequestBody::Stream {
+                mut stream,
+                content_length,
+            } => {
+                if let Some(expected_len) = content_length {
+                    let mut sent = 0u64;
+                    while let Some(chunk) =
+                        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+                    {
+                        let chunk = chunk?;
+                        sent += chunk.len() as u64;
+                        self.stream.write_all(&chunk).await.map_err(|e| {
+                            Error::HttpProtocol(format!(
+                                "Failed to write sized streaming request body: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    if sent != expected_len {
+                        return Err(Error::HttpProtocol(format!(
+                            "sized streaming request body length mismatch: sent {} bytes, Content-Length is {}",
+                            sent, expected_len
+                        )));
+                    }
+                    Ok(())
+                } else {
+                    while let Some(chunk) =
+                        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+                    {
+                        let chunk = chunk?;
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let prefix = format!("{:x}\r\n", chunk.len());
+                        self.stream
+                            .write_all(prefix.as_bytes())
+                            .await
+                            .map_err(|e| {
+                                Error::HttpProtocol(format!(
+                                    "Failed to write chunked request body header: {}",
+                                    e
+                                ))
+                            })?;
+                        self.stream.write_all(&chunk).await.map_err(|e| {
+                            Error::HttpProtocol(format!(
+                                "Failed to write chunked request body data: {}",
+                                e
+                            ))
+                        })?;
+                        self.stream.write_all(b"\r\n").await.map_err(|e| {
+                            Error::HttpProtocol(format!(
+                                "Failed to write chunked request body delimiter: {}",
+                                e
+                            ))
+                        })?;
+                        self.stream.flush().await.map_err(|e| {
+                            Error::HttpProtocol(format!(
+                                "Failed to flush chunked request body: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    self.stream.write_all(b"0\r\n\r\n").await.map_err(|e| {
+                        Error::HttpProtocol(format!(
+                            "Failed to write final chunked request body marker: {}",
+                            e
+                        ))
+                    })
+                }
+            }
+        }
+    }
+
+    async fn write_sized_request_bytes(
+        &mut self,
+        bytes: Bytes,
+        expected_len: Option<u64>,
+    ) -> Result<()> {
+        if let Some(expected_len) = expected_len {
+            if bytes.len() as u64 != expected_len {
+                return Err(Error::HttpProtocol(format!(
+                    "request body length mismatch: got {} bytes, Content-Length is {}",
+                    bytes.len(),
+                    expected_len
+                )));
+            }
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| Error::HttpProtocol(format!("Failed to write body: {}", e)))
     }
 
     /// Read and parse an HTTP/1.1 response.
@@ -409,7 +926,7 @@ impl H1Connection {
 
         let has_body = !matches!(status, 100..=199 | 204 | 304) && *request_method != Method::HEAD;
         let response = Response::new(status, response_headers.clone(), Bytes::new(), version);
-        let initial = buffer[headers_len..].to_vec();
+        let initial = BytesMut::from(&buffer[headers_len..]);
 
         if !has_body {
             return Ok((response, H1BodyMode::Empty));
@@ -442,169 +959,6 @@ impl H1Connection {
         };
 
         Ok((response, mode))
-    }
-
-    async fn stream_body(
-        mut self,
-        mode: H1BodyMode,
-        tx: mpsc::Sender<std::result::Result<Bytes, Error>>,
-    ) -> Option<MaybeHttpsStream> {
-        let result = match mode {
-            H1BodyMode::Empty => Ok(true),
-            H1BodyMode::Fixed { remaining, buffer } => self
-                .stream_fixed_body(buffer, remaining, &tx)
-                .await
-                .map(|_| true),
-            H1BodyMode::Chunked { buffer } => {
-                self.stream_chunked_body(buffer, &tx).await.map(|_| true)
-            }
-            H1BodyMode::CloseDelimited { buffer } => {
-                self.stream_until_close(buffer, &tx).await.map(|_| false)
-            }
-        };
-
-        match result {
-            Ok(true) if !self.should_close => Some(self.stream),
-            Ok(_) => None,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                None
-            }
-        }
-    }
-
-    async fn stream_until_close(
-        &mut self,
-        initial: Vec<u8>,
-        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
-    ) -> Result<()> {
-        if !initial.is_empty() {
-            Self::send_body_chunk(tx, Bytes::from(initial)).await?;
-        }
-
-        let mut read_buf = BytesMut::with_capacity(STREAM_READ_BUF_SIZE);
-        loop {
-            read_buf.clear();
-            let n = self.stream.read_buf(&mut read_buf).await.map_err(|e| {
-                Error::HttpProtocol(format!("Failed to read body (close-delimited): {}", e))
-            })?;
-            if n == 0 {
-                return Ok(());
-            }
-            Self::send_body_chunk(tx, read_buf.split_to(n).freeze()).await?;
-        }
-    }
-
-    async fn stream_fixed_body(
-        &mut self,
-        initial: Vec<u8>,
-        content_length: usize,
-        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
-    ) -> Result<()> {
-        let initial_len = initial.len().min(content_length);
-        if initial_len > 0 {
-            let initial_chunk = if initial_len == initial.len() {
-                Bytes::from(initial)
-            } else {
-                Bytes::copy_from_slice(&initial[..initial_len])
-            };
-            Self::send_body_chunk(tx, initial_chunk).await?;
-        }
-
-        let mut received = initial_len;
-        let mut chunk = BytesMut::with_capacity(STREAM_READ_BUF_SIZE);
-        while received < content_length {
-            let remaining = content_length - received;
-            chunk.clear();
-            chunk.reserve(remaining.min(STREAM_READ_BUF_SIZE));
-            let n = self
-                .stream
-                .read_buf(&mut chunk)
-                .await
-                .map_err(|e| Error::HttpProtocol(format!("Failed to read body: {}", e)))?;
-
-            if n == 0 {
-                return Err(Error::HttpProtocol(format!(
-                    "Connection closed before receiving full body (got {} of {} bytes)",
-                    received, content_length
-                )));
-            }
-            received += n;
-            Self::send_body_chunk(tx, chunk.split_to(n).freeze()).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn stream_chunked_body(
-        &mut self,
-        mut buffer: Vec<u8>,
-        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
-    ) -> Result<()> {
-        let mut read_buf = vec![0u8; STREAM_READ_BUF_SIZE];
-
-        loop {
-            let (chunk_size, line_end) = loop {
-                if let Some((size, end)) = find_chunk_size(&buffer) {
-                    break (size, end);
-                }
-                let n = self.stream.read(&mut read_buf).await.map_err(|e| {
-                    Error::HttpProtocol(format!("Failed to read chunk size: {}", e))
-                })?;
-                if n == 0 {
-                    return Err(Error::HttpProtocol(
-                        "Connection closed while reading chunk size".into(),
-                    ));
-                }
-                buffer.extend_from_slice(&read_buf[..n]);
-            };
-
-            buffer = buffer[line_end..].to_vec();
-
-            if chunk_size == 0 {
-                self.consume_trailers(&mut buffer).await?;
-                return Ok(());
-            }
-
-            let chunk_end = chunk_size + 2;
-            while buffer.len() < chunk_end {
-                let n = self.stream.read(&mut read_buf).await.map_err(|e| {
-                    Error::HttpProtocol(format!("Failed to read chunk data: {}", e))
-                })?;
-                if n == 0 {
-                    return Err(Error::HttpProtocol(
-                        "Connection closed while reading chunk data".into(),
-                    ));
-                }
-                buffer.extend_from_slice(&read_buf[..n]);
-            }
-
-            if &buffer[chunk_size..chunk_end] != b"\r\n" {
-                return Err(Error::HttpProtocol(
-                    "Malformed chunk: missing trailing CRLF".into(),
-                ));
-            }
-            if chunk_size > 0 {
-                Self::send_body_chunk(tx, Bytes::copy_from_slice(&buffer[..chunk_size])).await?;
-            }
-            buffer = buffer[chunk_end..].to_vec();
-        }
-    }
-
-    async fn send_body_chunk(
-        tx: &mpsc::Sender<std::result::Result<Bytes, Error>>,
-        chunk: Bytes,
-    ) -> Result<()> {
-        match tx.try_send(Ok(chunk)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(item)) => tx
-                .send(item)
-                .await
-                .map_err(|_| Error::HttpProtocol("Streaming receiver dropped".into())),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(Error::HttpProtocol("Streaming receiver dropped".into()))
-            }
-        }
     }
 
     /// Parse the response headers and body, returning the response and total bytes consumed.
