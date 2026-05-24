@@ -83,8 +83,8 @@ What it does well:
 - Backpressure is first-class (`bufferedAmount`, max-backpressure policies, drain semantics).
 
 Specter status:
-- Fixed: H3/RFC9220 tunnel outbound sends now acquire byte permits and release them per emitted wire chunk.
-- Remaining: RFC9220 tunnel inbound delivery is still item-slot bounded (`mpsc::channel(32)` plus `pending_inbound.len()`), not byte-budgeted; no public `buffered_amount`, drain notification API, or H1/H2/H3-unified max-pending policy.
+- Fixed: H3/RFC9220 tunnel outbound sends now acquire byte permits and release them per emitted wire chunk, and inbound tunnel delivery now reserves receive-side byte credit before driver-to-handle delivery.
+- Remaining: no public `buffered_amount`, drain notification API, or H1/H2/H3-unified max-pending policy.
 
 ## Benchmark/comparator status
 
@@ -127,6 +127,7 @@ Specter status:
 - Retry/VN is no longer only packet parsing: the native client handshake now drives Retry-driven Initial restart (validate QUIC v1 integrity, swap DCID to the Retry SCID, regenerate Initial keys, replay CRYPTO from offset zero with the Retry token), VN-driven Initial restart (RFC9000 § 6.1–6.3 supported-version selection via `set_supported_versions`, regenerated source connection ID, full per-attempt state reset, `version_negotiation_failed` error on no overlap), RFC9000 § 17.2.5.1/.2 and § 6.1–6.3 loop guards (single Retry per attempt, late Retry discard once Initial/Handshake is observed, single VN response, VN listing the issued version discarded), and validates server CID transport parameters after Retry.
 - H3 scheduling is no longer FIFO-only: the native driver has request-body/tunnel class rotation, stream rotation, RTT/loss/BDP-aware adaptive DATA budgets, and H3Client slow-path admission now acquires origin-fair dispatcher tickets before fresh connects.
 - Outbound RFC9220 tunnel backpressure is no longer item-count-only: public sends acquire a byte budget, the driver tracks acquired credit, and permits are released per emitted DATA chunk or drained on completion. Slow-consumer mixed RFC9220 coverage remains green after this outbound backpressure change.
+- RFC9220 tunnel inbound backpressure is no longer item-count-only: native H3 uses an unbounded driver-to-handle event channel gated by per-tunnel receive byte credit, queues additional DATA when the byte budget is exhausted, and releases credit when public tunnel reads consume DATA.
 - Receive-window credit is no longer driven only by buffered inbound bytes: active streaming-response and RFC9220 tunnel reads now feed `record_client_stream_consumed` from public body/tunnel byte release, include encoded H3 DATA frame type/length overhead, and emit absolute MAX_DATA/MAX_STREAM_DATA from consumed-byte totals.
 - Client/server CONNECTION_CLOSE handling is no longer fire-and-forget: local idle/client-shutdown closes and fixture/mock server closes retain the protected close packet, replay it for inbound peer packets during bounded drain windows, and same-fixture peer-close handling suppresses ACK/flow-control/retransmit sends after draining.
 - Native QUIC key update is no longer header-only: client/server 1-RTT read/write key phases rotate through derived next traffic secrets, retain previous keys for reordered old-phase packets, and enforce the RFC9001 local-update ACK gate.
@@ -148,7 +149,6 @@ Specter status:
 2. **Path validation/migration:** client PATH_CHALLENGE packetization and matching PATH_RESPONSE validation exist, but CID inventory, per-address migration/path state, server-side lifecycle, and anti-amplification behavior remain incomplete.
 3. **Browser ACK parity:** threshold+timer support and ACK Delay encoding now have focused test coverage; browser/version capture parity for the tuned threshold remains open.
 4. **Fingerprinting capture gaps:** capture-derived raw transport-parameter presets, explicit extension-list ordering beyond BoringSSL permutation policy, and full H3 0-RTT request replay-policy integration remain open.
-5. **RFC9220 inbound byte-shaped backpressure:** outbound send backpressure and receive-credit release are byte-aware, but the public inbound tunnel channel and driver pending queue are still item-slot bounded, so chunk size does not shape inbound pressure before application reads.
 
 ## Recommended next execution plan
 
@@ -171,7 +171,7 @@ Specter status:
 5. **Expand RFC9220 benchmark rows**
    - Raw byte tunnel: echo RTT, close/FIN latency, and slow-consumer mixed workload are now measured for Specter locally at n=30; next add a statistically meaningful p99 by raising samples to n>=100.
    - Framed mode: RFC6455 codec over RFC9220 if/when a high-level adapter is added.
-   - Slow-consumer mixed workload: the n=30 Specter row proves the active H3 streaming response completes while a delayed-reader RFC9220 tunnel holds inbound bytes; next make this a regression gate and add byte-level inbound pending/backpressure counters.
+   - Slow-consumer mixed workload: the n=30 Specter row proves the active H3 streaming response completes while a delayed-reader RFC9220 tunnel holds inbound bytes; next make this a regression gate and add public byte-level pending/backpressure metrics.
    - Third-party RFC9220 comparators: low-level `quiche` and `tokio-quiche` Extended CONNECT tunnel adapters are now measured; keep `reqwest`, `h3-quinn`, and `tokio-tungstenite` as unsupported capability rows unless their public APIs grow RFC9220/H3 tunnel support.
 
 6. **Close native QUIC production gaps**
