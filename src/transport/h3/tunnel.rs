@@ -516,6 +516,7 @@ mod tests {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let credit = H3TunnelCredit::new(Arc::new(Notify::new()), 1024, 1024);
         let mut tunnel = H3Tunnel::new_with_credit(_outbound_tx, inbound_rx, credit.clone());
+        assert!(credit.try_reserve_inbound_bytes(64));
 
         inbound_tx
             .send(Ok(H3TunnelEvent::Data(Bytes::from(vec![0x42; 64]))))
@@ -528,5 +529,6 @@ mod tests {
             67,
             "64 payload bytes must release DATA frame type + two-byte length overhead"
         );
+        assert_eq!(credit.available_inbound_permits(), 1024);
     }
 }

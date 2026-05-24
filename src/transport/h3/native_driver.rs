@@ -2771,17 +2771,18 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_inbound_queues_when_public_channel_is_full() {
+    fn tunnel_inbound_queues_when_public_byte_budget_is_full() {
         let (response_tx, _response_rx) = oneshot::channel();
         let mut tunnel = NativeDriverTunnelState::new(response_tx);
         let mut inbound_rx = tunnel.inbound_rx.take().expect("inbound rx");
+        let budget = H3TransportConfig::default().tunnel_inbound_byte_budget;
+        let large_payload = Bytes::from(vec![0x42; budget]);
 
-        for i in 0..32 {
-            tunnel
-                .inbound_tx
-                .try_send(Ok(H3TunnelEvent::Data(Bytes::from(vec![i]))))
-                .expect("fill inbound channel");
-        }
+        assert_eq!(
+            tunnel.push_inbound(H3TunnelEvent::Data(large_payload.clone())),
+            TunnelInboundStatus::Open
+        );
+        assert!(tunnel.is_inbound_backpressured(1));
 
         assert_eq!(
             tunnel.push_inbound(H3TunnelEvent::Data(Bytes::from_static(b"queued"))),
@@ -2789,16 +2790,22 @@ mod tests {
         );
         assert_eq!(tunnel.pending_inbound.len(), 1);
 
+        assert_eq!(
+            inbound_rx
+                .try_recv()
+                .expect("drain large inbound item")
+                .unwrap(),
+            H3TunnelEvent::Data(large_payload)
+        );
+        tunnel.credit.release_inbound_bytes(budget);
+
         inbound_rx
             .try_recv()
-            .expect("free one inbound slot")
-            .unwrap();
+            .expect_err("queued item must wait for flush");
+
         assert_eq!(tunnel.flush_inbound(), TunnelInboundStatus::Open);
         assert!(tunnel.pending_inbound.is_empty());
 
-        for _ in 0..31 {
-            inbound_rx.try_recv().expect("drain original item").unwrap();
-        }
         assert_eq!(
             inbound_rx
                 .try_recv()
@@ -2812,18 +2819,14 @@ mod tests {
     fn tunnel_inbound_backpressure_reports_full_public_and_pending_queue() {
         let (response_tx, _response_rx) = oneshot::channel();
         let mut tunnel = NativeDriverTunnelState::new(response_tx);
+        let budget = H3TransportConfig::default().tunnel_inbound_byte_budget;
 
-        for i in 0..32 {
-            tunnel
-                .inbound_tx
-                .try_send(Ok(H3TunnelEvent::Data(Bytes::from(vec![i]))))
-                .expect("fill inbound channel");
-        }
+        tunnel.push_inbound(H3TunnelEvent::Data(Bytes::from(vec![0x42; budget])));
         tunnel.push_inbound(H3TunnelEvent::Data(Bytes::from_static(b"queued")));
 
         assert!(
             tunnel.is_inbound_backpressured(1),
-            "full public inbound channel plus full pending queue should pause socket reads"
+            "exhausted public inbound byte budget plus pending queue should pause socket reads"
         );
     }
 
@@ -2852,7 +2855,7 @@ mod tests {
         let large_payload = Bytes::from(vec![
             0x42;
             H3TransportConfig::default()
-                .tunnel_outbound_byte_budget
+                .tunnel_inbound_byte_budget
                 + 1
         ]);
 
@@ -2868,19 +2871,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_on_full_tunnel_inbound_is_queued_until_public_reader_frees_capacity() {
+    async fn reset_after_full_tunnel_inbound_budget_is_delivered_after_prior_data() {
         let stream_id = 0;
         let (response_tx, _response_rx) = oneshot::channel();
         let mut tunnel = NativeDriverTunnelState::new(response_tx);
         let mut inbound_rx = tunnel.inbound_rx.take().expect("inbound rx");
         tunnel.opened = true;
-
-        for i in 0..32 {
-            tunnel
-                .inbound_tx
-                .try_send(Ok(H3TunnelEvent::Data(Bytes::from(vec![i]))))
-                .expect("fill inbound channel");
-        }
+        let budget = H3TransportConfig::default().tunnel_inbound_byte_budget;
+        let large_payload = Bytes::from(vec![0x42; budget]);
+        assert_eq!(
+            tunnel.push_inbound(H3TunnelEvent::Data(large_payload.clone())),
+            TunnelInboundStatus::Open
+        );
 
         let (command_tx, command_rx) = mpsc::channel(1);
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("socket"));
@@ -2926,28 +2928,13 @@ mod tests {
         driver.apply_reset_event(stream_id, 0x010c);
 
         assert!(
-            driver.pending_tunnels.contains_key(&stream_id),
-            "reset must not drop an opened tunnel while its public inbound channel is full"
+            !driver.pending_tunnels.contains_key(&stream_id),
+            "reset should retire the tunnel once it is queued behind already-delivered inbound data"
         );
         assert_eq!(
-            driver
-                .pending_tunnels
-                .get(&stream_id)
-                .expect("tunnel")
-                .pending_inbound
-                .len(),
-            1
+            inbound_rx.try_recv().expect("drain prior data").unwrap(),
+            H3TunnelEvent::Data(large_payload)
         );
-
-        inbound_rx
-            .try_recv()
-            .expect("free one inbound slot")
-            .unwrap();
-        driver.flush_tunnel_inbound();
-
-        for _ in 0..31 {
-            inbound_rx.try_recv().expect("drain original item").unwrap();
-        }
         assert_eq!(
             inbound_rx
                 .try_recv()
