@@ -704,7 +704,11 @@ async fn buffer_response_body(mut resp: RustResponse) -> PyResult<RustResponse> 
     let headers = resp.headers().clone();
     let http_version = resp.http_version().to_string();
     let effective_url = resp.url().cloned();
-    let bytes = resp.body_mut().collect_to_bytes().await.map_err(to_py_err)?;
+    let bytes = resp
+        .body_mut()
+        .collect_to_bytes()
+        .await
+        .map_err(to_py_err)?;
     let mut buffered = RustResponse::new(status, headers, bytes, http_version);
     if let Some(url) = effective_url {
         buffered = buffered.with_url(url);
@@ -1172,28 +1176,94 @@ mod tests {
     #[test]
     fn fingerprint_profile_mapping_covers_firefox_versions_and_esr() {
         let cases = [
-            (FingerprintProfile::Chrome142, RustFingerprintProfile::Chrome142),
-            (FingerprintProfile::Chrome148, RustFingerprintProfile::Chrome148),
-            (FingerprintProfile::Firefox133, RustFingerprintProfile::Firefox133),
-            (FingerprintProfile::NoFingerprint, RustFingerprintProfile::None),
-            (FingerprintProfile::Firefox134, RustFingerprintProfile::Firefox134),
-            (FingerprintProfile::Firefox135, RustFingerprintProfile::Firefox135),
-            (FingerprintProfile::Firefox136, RustFingerprintProfile::Firefox136),
-            (FingerprintProfile::Firefox137, RustFingerprintProfile::Firefox137),
-            (FingerprintProfile::Firefox138, RustFingerprintProfile::Firefox138),
-            (FingerprintProfile::Firefox139, RustFingerprintProfile::Firefox139),
-            (FingerprintProfile::Firefox140, RustFingerprintProfile::Firefox140),
-            (FingerprintProfile::Firefox141, RustFingerprintProfile::Firefox141),
-            (FingerprintProfile::Firefox142, RustFingerprintProfile::Firefox142),
-            (FingerprintProfile::Firefox143, RustFingerprintProfile::Firefox143),
-            (FingerprintProfile::Firefox144, RustFingerprintProfile::Firefox144),
-            (FingerprintProfile::Firefox145, RustFingerprintProfile::Firefox145),
-            (FingerprintProfile::Firefox146, RustFingerprintProfile::Firefox146),
-            (FingerprintProfile::Firefox147, RustFingerprintProfile::Firefox147),
-            (FingerprintProfile::Firefox148, RustFingerprintProfile::Firefox148),
-            (FingerprintProfile::Firefox149, RustFingerprintProfile::Firefox149),
-            (FingerprintProfile::Firefox150, RustFingerprintProfile::Firefox150),
-            (FingerprintProfile::Firefox151, RustFingerprintProfile::Firefox151),
+            (
+                FingerprintProfile::Chrome142,
+                RustFingerprintProfile::Chrome142,
+            ),
+            (
+                FingerprintProfile::Chrome148,
+                RustFingerprintProfile::Chrome148,
+            ),
+            (
+                FingerprintProfile::Firefox133,
+                RustFingerprintProfile::Firefox133,
+            ),
+            (
+                FingerprintProfile::NoFingerprint,
+                RustFingerprintProfile::None,
+            ),
+            (
+                FingerprintProfile::Firefox134,
+                RustFingerprintProfile::Firefox134,
+            ),
+            (
+                FingerprintProfile::Firefox135,
+                RustFingerprintProfile::Firefox135,
+            ),
+            (
+                FingerprintProfile::Firefox136,
+                RustFingerprintProfile::Firefox136,
+            ),
+            (
+                FingerprintProfile::Firefox137,
+                RustFingerprintProfile::Firefox137,
+            ),
+            (
+                FingerprintProfile::Firefox138,
+                RustFingerprintProfile::Firefox138,
+            ),
+            (
+                FingerprintProfile::Firefox139,
+                RustFingerprintProfile::Firefox139,
+            ),
+            (
+                FingerprintProfile::Firefox140,
+                RustFingerprintProfile::Firefox140,
+            ),
+            (
+                FingerprintProfile::Firefox141,
+                RustFingerprintProfile::Firefox141,
+            ),
+            (
+                FingerprintProfile::Firefox142,
+                RustFingerprintProfile::Firefox142,
+            ),
+            (
+                FingerprintProfile::Firefox143,
+                RustFingerprintProfile::Firefox143,
+            ),
+            (
+                FingerprintProfile::Firefox144,
+                RustFingerprintProfile::Firefox144,
+            ),
+            (
+                FingerprintProfile::Firefox145,
+                RustFingerprintProfile::Firefox145,
+            ),
+            (
+                FingerprintProfile::Firefox146,
+                RustFingerprintProfile::Firefox146,
+            ),
+            (
+                FingerprintProfile::Firefox147,
+                RustFingerprintProfile::Firefox147,
+            ),
+            (
+                FingerprintProfile::Firefox148,
+                RustFingerprintProfile::Firefox148,
+            ),
+            (
+                FingerprintProfile::Firefox149,
+                RustFingerprintProfile::Firefox149,
+            ),
+            (
+                FingerprintProfile::Firefox150,
+                RustFingerprintProfile::Firefox150,
+            ),
+            (
+                FingerprintProfile::Firefox151,
+                RustFingerprintProfile::Firefox151,
+            ),
             (
                 FingerprintProfile::FirefoxEsr115,
                 RustFingerprintProfile::FirefoxEsr115,
