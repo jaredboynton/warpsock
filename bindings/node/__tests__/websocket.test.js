@@ -184,6 +184,7 @@ describe('WebSocket RFC 6455 binding', () => {
         .headers({ Connection: 'close', Upgrade: 'h2c', Origin: 'https://example.test' })
         .subprotocols(['chat.v1', 'chat.v2'])
         .connect();
+      wsPromise.catch(() => {});
 
       const socket = await connectionReady;
       const handshake = await completeHandshake(socket);

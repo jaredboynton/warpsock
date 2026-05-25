@@ -7,13 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.1.2] - 2026-05-25
+## [4.1.3] - 2026-05-25
 
 ### Fixed
 - **Release CI stability**: Made public HTTP/3 example checks optional for remote UDP/CDN variance while keeping HTTP/1.1 and HTTP/2 example failures release-blocking, and kept protocol example output visible in CI logs.
 - **Python release ARM wheels**: Override the aarch64 Linux Cargo linker inside the maturin manylinux container so ARM wheel builds use the native container `gcc` instead of the host cross-linker configured for local zig/cross workflows.
 - **Node release test hangs**: Added release job timeouts, open-handle diagnostics, forced Jest process exit for napi-rs `CustomGC`, deterministic HTTP fixture socket teardown, and staged npm package dry-run verification before publish.
 - **Release preflight guards**: Validate Python package metadata versions, enforce tag-to-manifest version matching, and restrict npm/PyPI publishing to tag-push release events.
+- **Release test isolation**: Run Linux wheel tests from a copied test directory so pytest imports the installed wheel instead of the repository source package, and observe the Node RFC 6455 connect promise before waiting on the local test socket.
 
 
 ## [4.1.0] - 2026-05-25

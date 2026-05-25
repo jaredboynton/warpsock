@@ -230,13 +230,15 @@ jobs:
           set -euo pipefail
           python -m venv .venv
           . .venv/bin/activate
+          unset PYTHONPATH
           pip install --upgrade pip pytest pytest-asyncio
           pip install dist/*.whl
           # Distribution name is `specters` (pyproject.toml project.name);
           # module name is `specter` ([tool.maturin] module-name = "specter").
           python -c "import specter; print('loaded:', specter.__file__)"
-          cd bindings/python
-          pytest tests/ -v
+          test_dir="$(mktemp -d)"
+          cp -R bindings/python/tests "$test_dir/tests"
+          (cd "$test_dir" && python -m pytest tests/ -v)
 
   release:
     name: Release
