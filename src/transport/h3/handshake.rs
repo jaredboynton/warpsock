@@ -3842,12 +3842,19 @@ impl NativeQuicHandshake {
         connection_id_sequence: u64,
         data: [u8; 8],
     ) -> Result<ClientApplicationControlPacket> {
+        let destination_cid = self
+            .client_path_validator
+            .connection_id(connection_id_sequence)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Quic("native QUIC path migration requires an available connection id".into())
+            })?;
         let frame = self.client_path_validator.path_challenge_for_address(
             remote_address,
             connection_id_sequence,
             data,
         )?;
-        self.build_client_application_control_packet(frame)
+        self.build_client_application_control_packet_to(frame, &destination_cid)
     }
 
     pub fn build_client_pmtu_probe_packet(
@@ -3947,9 +3954,20 @@ impl NativeQuicHandshake {
         &mut self,
         frame: QuicFrame,
     ) -> Result<ClientApplicationControlPacket> {
-        self.build_client_application_payload_packet(padded_short_header_payload(encode_frame(
-            &frame,
-        )))
+        let destination_cid = self.destination_cid.clone();
+        self.build_client_application_control_packet_to(frame, &destination_cid)
+    }
+
+    fn build_client_application_control_packet_to(
+        &mut self,
+        frame: QuicFrame,
+        destination_cid: &ConnectionId,
+    ) -> Result<ClientApplicationControlPacket> {
+        self.build_client_application_payload_packet_at_to(
+            padded_short_header_payload(encode_frame(&frame)),
+            Instant::now(),
+            destination_cid,
+        )
     }
 
     fn build_client_application_probe_packet(
@@ -3971,17 +3989,20 @@ impl NativeQuicHandshake {
         self.build_client_application_payload_packet_at(Bytes::from(payload), now)
     }
 
-    fn build_client_application_payload_packet(
-        &mut self,
-        payload: Bytes,
-    ) -> Result<ClientApplicationControlPacket> {
-        self.build_client_application_payload_packet_at(payload, Instant::now())
-    }
-
     fn build_client_application_payload_packet_at(
         &mut self,
         payload: Bytes,
         now: Instant,
+    ) -> Result<ClientApplicationControlPacket> {
+        let destination_cid = self.destination_cid.clone();
+        self.build_client_application_payload_packet_at_to(payload, now, &destination_cid)
+    }
+
+    fn build_client_application_payload_packet_at_to(
+        &mut self,
+        payload: Bytes,
+        now: Instant,
+        destination_cid: &ConnectionId,
     ) -> Result<ClientApplicationControlPacket> {
         let Some(client_application_keys) = &self.client_application_keys else {
             return Err(Error::Quic(
@@ -3993,7 +4014,7 @@ impl NativeQuicHandshake {
         let packet_number_len = 2;
         let packet = protect_short_header_packet(
             client_application_keys,
-            &self.destination_cid,
+            destination_cid,
             packet_number,
             packet_number_len,
             self.write_key_phase,
@@ -4012,7 +4033,7 @@ impl NativeQuicHandshake {
         Ok(ClientApplicationControlPacket {
             packet,
             packet_number,
-            packet_number_offset: 1 + self.destination_cid.as_bytes().len(),
+            packet_number_offset: 1 + destination_cid.as_bytes().len(),
         })
     }
 

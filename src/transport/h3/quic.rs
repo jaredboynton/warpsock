@@ -324,6 +324,12 @@ impl QuicPathValidator {
             .map(|entry| &entry.connection_id)
     }
 
+    pub fn connection_id(&self, sequence_number: u64) -> Option<&ConnectionId> {
+        self.connection_ids
+            .get(&sequence_number)
+            .map(|entry| &entry.connection_id)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }

@@ -3757,9 +3757,15 @@ fn native_h3_client_path_migration_promotes_validated_connection_id_for_future_p
         .unwrap()
         .is_empty());
 
-    handshake
+    let challenge_packet = handshake
         .build_client_path_challenge_packet_for_address(migrated_address, 3, challenge)
         .unwrap();
+    assert_eq!(
+        &challenge_packet.packet[1..1 + migrated_cid.as_bytes().len()],
+        migrated_cid.as_bytes(),
+        "path validation probes for a migrated address must use that path's peer-issued CID"
+    );
+
     let matching_response = protect_short_header_packet(
         &server_keys,
         &ConnectionId::from_static(b"client-scid"),
