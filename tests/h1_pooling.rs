@@ -19,9 +19,6 @@ async fn test_h1_connection_reuse() {
     let url = server.url();
     let _server_handle = server.start_with_request_limit(2);
 
-    // Give server time to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     // Client
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
@@ -50,8 +47,6 @@ async fn test_h1_connection_expiration() {
     let server = MockHttpServer::new().await.unwrap();
     let url = server.url();
     let _server_handle = server.start_with_request_limit(3);
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
@@ -83,8 +78,6 @@ async fn test_h1_multiple_sequential_requests() {
     let server = MockHttpServer::new().await.unwrap();
     let url = server.url();
     let _server_handle = server.start_with_request_limit(10);
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
