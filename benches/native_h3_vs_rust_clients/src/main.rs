@@ -5357,6 +5357,29 @@ mod tests {
     }
 
     #[test]
+    fn specter_native_rfc9220_mixed_starts_stream_before_tunnel_data_loop() {
+        let source = include_str!("main.rs");
+        let function_start = source
+            .find("async fn measure_specter_native_rfc9220_tunnel_mixed_once")
+            .expect("Specter mixed measurement function should exist");
+        let function_end = source[function_start..]
+            .find("async fn measure_specter_native_http3_stream_with_client")
+            .expect("next Specter helper should delimit the mixed measurement function");
+        let function = &source[function_start..function_start + function_end];
+        let stream_start = function
+            .find("measure_specter_native_http3_stream_with_client")
+            .expect("mixed workload must start the concurrent H3 stream");
+        let tunnel_data_loop = function
+            .find("for index in 0..LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES")
+            .expect("mixed workload must send tunnel DATA frames");
+
+        assert!(
+            stream_start < tunnel_data_loop,
+            "Specter mixed workload should start /stream before queuing all tunnel DATA, matching quiche's request ordering"
+        );
+    }
+
+    #[test]
     fn quiche_direct_rfc9220_tunnel_adapter_row_uses_measured_samples() {
         let samples = vec![
             super::AdapterSample::new(40.0, 400.0, 4_000),
