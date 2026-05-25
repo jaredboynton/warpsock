@@ -42,6 +42,7 @@ pub mod hpack_impl;
 mod tunnel;
 mod write_half;
 
+pub use body::H2BodyTimeouts;
 pub use connection::{
     H2Connection as RawH2Connection, H2Error, StreamResponse, CHROME_WINDOW_UPDATE,
 };
@@ -54,11 +55,8 @@ pub use frame::{
 pub use handle::H2Handle;
 pub use hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};
 pub use tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
-pub use body::H2BodyTimeouts;
 
-pub(crate) use body::{
-    H2Body, H2DirectBody, H2DirectReuseHook, DEFAULT_H2_BODY_SLOT_CAPACITY,
-};
+pub(crate) use body::{H2Body, H2DirectBody, H2DirectReuseHook, DEFAULT_H2_BODY_SLOT_CAPACITY};
 use handle::H2InlineState;
 
 // Re-export wrapper types for convenience

@@ -330,7 +330,9 @@ pub enum NativeH3StreamingResponseEvent {
     },
     Data(Bytes),
     Finished,
-    GoAway { id: u64 },
+    GoAway {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,7 +343,9 @@ pub enum NativeH3TunnelEvent {
     },
     Data(Bytes),
     Finished,
-    GoAway { id: u64 },
+    GoAway {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Default)]

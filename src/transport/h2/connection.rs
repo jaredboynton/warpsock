@@ -38,7 +38,7 @@ pub const CHROME_WINDOW_UPDATE: u32 = 15663105;
 /// Initial window size per RFC 9113.
 const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65535;
 const DEFAULT_READ_BUFFER_CAPACITY: usize =
-    (DEFAULT_MAX_FRAME_SIZE as usize + FRAME_HEADER_SIZE) * 2;
+    (DEFAULT_MAX_FRAME_SIZE as usize + FRAME_HEADER_SIZE) * 4;
 
 /// Threshold for sending WINDOW_UPDATE frames (16KB).
 /// When receive window drops below this, send WINDOW_UPDATE.

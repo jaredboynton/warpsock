@@ -96,12 +96,7 @@ impl SessionCache {
 
     /// Legacy host-only store API retained for compatibility.
     pub fn store_ticket(&self, host: &str, ticket_data: Vec<u8>, max_age: Option<Duration>) {
-        self.store_session(
-            SessionCacheKey::new(host, 443),
-            ticket_data,
-            false,
-            max_age,
-        );
+        self.store_session(SessionCacheKey::new(host, 443), ticket_data, false, max_age);
     }
 
     /// Load a cached session if still valid.
