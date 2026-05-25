@@ -399,7 +399,7 @@ where
     pub async fn open_extended_connect_websocket(
         &mut self,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
     ) -> Result<u32> {
         let (stream_id, _end_stream) = self
             .open_extended_connect_websocket_with_end_stream(uri, headers)
@@ -411,13 +411,14 @@ where
     pub async fn open_extended_connect_websocket_with_end_stream(
         &mut self,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
     ) -> Result<(u32, bool)> {
         self.ensure_enable_connect_protocol().await?;
 
         let scheme = uri.scheme_str().unwrap_or("https");
         let authority = uri.authority().map(|a| a.as_str()).unwrap_or("");
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let headers = headers.into();
 
         let header_block =
             Self::encode_extended_connect_websocket_headers(authority, scheme, path, &headers)?;

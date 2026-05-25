@@ -122,15 +122,16 @@ impl H2Handle {
         &self,
         method: Method,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
         body: Option<Bytes>,
     ) -> Result<Response> {
         let (response_tx, response_rx) = oneshot::channel();
+        let headers = headers.into();
 
         let command = DriverCommand::SendRequest {
             method,
             uri: uri.clone(),
-            headers: headers.clone(),
+            headers,
             body,
             response_tx,
         };
@@ -159,10 +160,11 @@ impl H2Handle {
         &self,
         method: Method,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
         body: RequestBody,
         body_timeouts: H2BodyTimeouts,
     ) -> Result<Response> {
+        let headers = headers.into();
         let body_is_empty = body.is_empty();
         if let Some(result) = self
             .try_send_streaming_inline(&method, uri, &headers, body_is_empty, body_timeouts)
@@ -305,13 +307,18 @@ impl H2Handle {
     }
 
     /// Open an RFC 8441 WebSocket tunnel through the background H2 driver.
-    pub async fn open_websocket_tunnel(&self, uri: Uri, headers: &Headers) -> Result<H2Tunnel> {
+    pub async fn open_websocket_tunnel(
+        &self,
+        uri: Uri,
+        headers: impl Into<Headers>,
+    ) -> Result<H2Tunnel> {
         let (response_tx, response_rx) = oneshot::channel();
+        let headers = headers.into();
 
         self.command_tx
             .send(DriverCommand::OpenWebSocketTunnel {
                 uri,
-                headers: headers.clone(),
+                headers,
                 response_tx,
             })
             .await

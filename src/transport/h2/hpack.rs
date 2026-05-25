@@ -102,8 +102,9 @@ impl HpackEncoder {
         scheme: &str,
         authority: &str,
         path: &str,
-        headers: &Headers,
+        headers: impl Into<Headers>,
     ) -> Bytes {
+        let headers = headers.into();
         // Build pseudo-headers in configured order
         let pseudo_headers: [(&[u8], &[u8]); 4] = [
             (b":method", method.as_bytes()),

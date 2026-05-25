@@ -54,9 +54,10 @@ pub use frame::{
 pub use handle::H2Handle;
 pub use hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};
 pub use tunnel::{H2Tunnel, H2TunnelEvent, H2TunnelOutbound};
+pub use body::H2BodyTimeouts;
 
 pub(crate) use body::{
-    H2Body, H2BodyTimeouts, H2DirectBody, H2DirectReuseHook, DEFAULT_H2_BODY_SLOT_CAPACITY,
+    H2Body, H2DirectBody, H2DirectReuseHook, DEFAULT_H2_BODY_SLOT_CAPACITY,
 };
 use handle::H2InlineState;
 
@@ -146,10 +147,11 @@ impl H2Connection {
         &mut self,
         method: Method,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
         body: Option<Bytes>,
     ) -> Result<Response> {
-        self.inner.send_request(method, uri, headers, body).await
+        let headers = headers.into();
+        self.inner.send_request(method, uri, &headers, body).await
     }
 
     /// Send an HTTP/2 request with streaming response body.
@@ -273,7 +275,7 @@ impl H2PooledConnection {
         &self,
         method: Method,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
         body: Option<Bytes>,
     ) -> Result<Response> {
         self.handle.send_request(method, uri, headers, body).await
@@ -284,7 +286,7 @@ impl H2PooledConnection {
         &self,
         method: Method,
         uri: &Uri,
-        headers: &Headers,
+        headers: impl Into<Headers>,
         body: crate::request::RequestBody,
         body_timeouts: H2BodyTimeouts,
     ) -> Result<Response> {
@@ -294,7 +296,11 @@ impl H2PooledConnection {
     }
 
     /// Open an RFC 8441 WebSocket tunnel on this pooled HTTP/2 connection.
-    pub async fn open_websocket_tunnel(&self, uri: Uri, headers: &Headers) -> Result<H2Tunnel> {
+    pub async fn open_websocket_tunnel(
+        &self,
+        uri: Uri,
+        headers: impl Into<Headers>,
+    ) -> Result<H2Tunnel> {
         self.handle.open_websocket_tunnel(uri, headers).await
     }
 
