@@ -44,6 +44,7 @@ pub struct CapturedFrame {
 pub struct WsExchange {
     pub request: WsRequest,
     pub client_frame: Option<CapturedFrame>,
+    pub client_frames: Vec<CapturedFrame>,
     pub selected_alpn: Option<Vec<u8>>,
 }
 
@@ -172,14 +173,16 @@ where
         .expect("write websocket handshake response");
     stream.flush().await.expect("flush websocket response");
 
-    let client_frame = timeout(Duration::from_millis(500), read_frame(&mut stream))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let mut client_frames = Vec::new();
+    while let Ok(Ok(frame)) = timeout(Duration::from_millis(100), read_frame(&mut stream)).await {
+        client_frames.push(frame);
+    }
+    let client_frame = client_frames.first().cloned();
 
     WsExchange {
         request,
         client_frame,
+        client_frames,
         selected_alpn,
     }
 }
