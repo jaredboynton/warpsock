@@ -36,6 +36,27 @@ enum BodyInner {
     H3(crate::transport::h3::H3Body),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyCapacityProtocol {
+    Empty,
+    Buffered,
+    H1,
+    H2,
+    H2Direct,
+    H3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyCapacity {
+    pub protocol: BodyCapacityProtocol,
+    pub buffer_capacity: usize,
+    pub buffered_chunks: usize,
+    pub available_slots: usize,
+    pub buffered_bytes: usize,
+    pub closed: bool,
+    pub ended: bool,
+}
+
 impl Body {
     /// Construct an empty body that completes without yielding any frames.
     pub fn empty() -> Self {
@@ -131,6 +152,80 @@ impl Body {
         match &self.inner {
             BodyInner::H3(body) => Some(body.capacity()),
             _ => None,
+        }
+    }
+
+    /// Snapshot protocol-neutral response-body buffer pressure.
+    ///
+    /// H2 and native H3 streaming bodies report their actual bounded driver
+    /// queues. H1 and direct-owned H2 bodies stream directly from the socket
+    /// instead of a public queue, so they report zero queued capacity/bytes.
+    /// Buffered and empty bodies report their materialized byte state.
+    pub fn capacity(&self) -> BodyCapacity {
+        match &self.inner {
+            BodyInner::Empty => BodyCapacity {
+                protocol: BodyCapacityProtocol::Empty,
+                buffer_capacity: 0,
+                buffered_chunks: 0,
+                available_slots: 0,
+                buffered_bytes: 0,
+                closed: false,
+                ended: true,
+            },
+            BodyInner::Buffered(bytes) => {
+                let buffered_bytes = bytes.as_ref().map(Bytes::len).unwrap_or(0);
+                BodyCapacity {
+                    protocol: BodyCapacityProtocol::Buffered,
+                    buffer_capacity: usize::from(buffered_bytes > 0),
+                    buffered_chunks: usize::from(buffered_bytes > 0),
+                    available_slots: usize::from(buffered_bytes == 0),
+                    buffered_bytes,
+                    closed: false,
+                    ended: true,
+                }
+            }
+            BodyInner::H1(_) => BodyCapacity {
+                protocol: BodyCapacityProtocol::H1,
+                buffer_capacity: 0,
+                buffered_chunks: 0,
+                available_slots: 0,
+                buffered_bytes: 0,
+                closed: false,
+                ended: false,
+            },
+            BodyInner::H2(body) => {
+                let capacity = body.capacity();
+                BodyCapacity {
+                    protocol: BodyCapacityProtocol::H2,
+                    buffer_capacity: capacity.buffer_capacity,
+                    buffered_chunks: capacity.buffered_chunks,
+                    available_slots: capacity.available_slots,
+                    buffered_bytes: capacity.buffered_bytes,
+                    closed: capacity.closed,
+                    ended: capacity.ended,
+                }
+            }
+            BodyInner::H2Direct(_) => BodyCapacity {
+                protocol: BodyCapacityProtocol::H2Direct,
+                buffer_capacity: 0,
+                buffered_chunks: 0,
+                available_slots: 0,
+                buffered_bytes: 0,
+                closed: false,
+                ended: false,
+            },
+            BodyInner::H3(body) => {
+                let capacity = body.capacity();
+                BodyCapacity {
+                    protocol: BodyCapacityProtocol::H3,
+                    buffer_capacity: capacity.buffer_capacity,
+                    buffered_chunks: capacity.buffered_chunks,
+                    available_slots: capacity.available_slots,
+                    buffered_bytes: capacity.buffered_bytes,
+                    closed: capacity.closed,
+                    ended: capacity.ended,
+                }
+            }
         }
     }
 

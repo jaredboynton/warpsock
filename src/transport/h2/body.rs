@@ -38,6 +38,16 @@ pub(crate) enum H2BodyDataPush {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct H2BodyCapacity {
+    pub buffer_capacity: usize,
+    pub buffered_chunks: usize,
+    pub available_slots: usize,
+    pub buffered_bytes: usize,
+    pub closed: bool,
+    pub ended: bool,
+}
+
 /// Default bounded in-flight DATA item capacity per H2 stream body.
 ///
 /// H2 stream-level flow control still bounds total in-flight bytes; this cap
@@ -65,6 +75,7 @@ pub struct H2BodyShared {
     consumer_waker: AtomicWaker,
     closed: AtomicBool,
     released_recv_bytes: AtomicUsize,
+    buffered_bytes: AtomicUsize,
     release_notify_bytes: usize,
     driver_notify: Arc<Notify>,
 }
@@ -91,6 +102,7 @@ impl H2BodyShared {
             consumer_waker: AtomicWaker::new(),
             closed: AtomicBool::new(false),
             released_recv_bytes: AtomicUsize::new(0),
+            buffered_bytes: AtomicUsize::new(0),
             release_notify_bytes,
             driver_notify,
         })
@@ -124,12 +136,17 @@ impl H2BodyShared {
             return H2BodyPush::Full(item);
         }
 
+        let buffered_len = item.as_ref().ok().map(Bytes::len).unwrap_or(0);
         let wake_consumer = queued_len == 0 || end_stream;
         let slot = tail % capacity;
         // SAFETY: the producer is single-threaded, and queued_len < capacity
         // means the consumer has released this slot before advancing head.
         unsafe {
             *self.slots[slot].get() = Some(item);
+        }
+        if buffered_len > 0 {
+            self.buffered_bytes
+                .fetch_add(buffered_len, Ordering::Relaxed);
         }
         self.tail.store(tail + 1, Ordering::Release);
         if end_stream {
@@ -156,7 +173,13 @@ impl H2BodyShared {
         // producer initialized this slot before publishing tail.
         let item = unsafe { (*self.slots[slot].get()).take() };
         self.head.store(head + 1, Ordering::Release);
-        item.map(|item| (item, queued_len >= capacity))
+        item.map(|item| {
+            if let Ok(bytes) = &item {
+                self.buffered_bytes
+                    .fetch_sub(bytes.len(), Ordering::Relaxed);
+            }
+            (item, queued_len >= capacity)
+        })
     }
 
     #[inline(always)]
@@ -202,12 +225,17 @@ impl H2BodyShared {
             return H2BodyDataPush::Full(data);
         }
 
+        let buffered_len = data.len();
         let wake_consumer = queued_len == 0 || end_stream;
         let slot = tail % capacity;
         // SAFETY: the producer is single-threaded, and queued_len < capacity
         // means this slot is not currently visible to the consumer.
         unsafe {
             *self.slots[slot].get() = Some(Ok(data));
+        }
+        if buffered_len > 0 {
+            self.buffered_bytes
+                .fetch_add(buffered_len, Ordering::Relaxed);
         }
         self.tail.store(tail + 1, Ordering::Release);
         if end_stream {
@@ -254,6 +282,21 @@ impl H2BodyShared {
         self.released_recv_bytes.swap(0, Ordering::Relaxed)
     }
 
+    pub(crate) fn capacity(&self) -> H2BodyCapacity {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let buffered_chunks = self.queued_len_from(head, tail);
+        let buffer_capacity = self.slot_capacity();
+        H2BodyCapacity {
+            buffer_capacity,
+            buffered_chunks,
+            available_slots: buffer_capacity.saturating_sub(buffered_chunks),
+            buffered_bytes: self.buffered_bytes.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Acquire),
+            ended: self.ended.load(Ordering::Acquire),
+        }
+    }
+
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.consumer_waker.wake();
@@ -288,6 +331,10 @@ impl H2Body {
 
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    pub(crate) fn capacity(&self) -> H2BodyCapacity {
+        self.shared.capacity()
     }
 
     #[inline]
@@ -555,6 +602,28 @@ mod tests {
             shared.push_data(Bytes::from_static(b"three"), false),
             H2BodyDataPush::Full(_)
         ));
+    }
+
+    #[test]
+    fn h2_body_capacity_snapshot_reports_buffer_pressure() {
+        let shared = H2BodyShared::new_with_capacity(Arc::new(Notify::new()), 65_535, 3);
+        assert!(matches!(
+            shared.push_data(Bytes::from_static(b"one"), false),
+            H2BodyDataPush::Accepted { queued_len: 1 }
+        ));
+        assert!(matches!(
+            shared.push_data(Bytes::from_static(b"two-two"), false),
+            H2BodyDataPush::Accepted { queued_len: 2 }
+        ));
+
+        let capacity = shared.capacity();
+
+        assert_eq!(capacity.buffer_capacity, 3);
+        assert_eq!(capacity.buffered_chunks, 2);
+        assert_eq!(capacity.available_slots, 1);
+        assert_eq!(capacity.buffered_bytes, 10);
+        assert!(!capacity.closed);
+        assert!(!capacity.ended);
     }
 }
 
