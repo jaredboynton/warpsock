@@ -163,12 +163,9 @@ impl Url {
             .unwrap_or("")
             .to_string();
         let mut path_and_query = self.path().to_string();
-        match query {
-            Some(q) => {
-                path_and_query.push('?');
-                path_and_query.push_str(q);
-            }
-            None => {}
+        if let Some(q) = query {
+            path_and_query.push('?');
+            path_and_query.push_str(q);
         }
         *self = Self::assemble(scheme, &authority, &path_and_query)?;
         Ok(())
@@ -186,8 +183,7 @@ impl Url {
         let base_path = self.path();
         let base_query = self.query();
 
-        if reference.starts_with("//") {
-            let rest = &reference[2..];
+        if let Some(rest) = reference.strip_prefix("//") {
             let (authority, path, query) = split_authority_reference(rest)?;
             let path = normalize_path(&path);
             return Self::assemble_with_query(base_scheme, &authority, &path, query.as_deref());
@@ -199,12 +195,12 @@ impl Url {
             return Self::assemble_with_query(base_scheme, base_authority, &path, query.as_deref());
         }
 
-        if reference.starts_with('?') {
+        if let Some(query) = reference.strip_prefix('?') {
             return Self::assemble_with_query(
                 base_scheme,
                 base_authority,
                 base_path,
-                Some(&reference[1..]),
+                Some(query),
             );
         }
 
@@ -399,8 +395,8 @@ fn split_authority_reference(input: &str) -> Result<(String, String, Option<Stri
 
     let (path, query) = if rest.is_empty() {
         ("/".to_string(), None)
-    } else if rest.starts_with('?') {
-        ("/".to_string(), Some(rest[1..].to_string()))
+    } else if let Some(query) = rest.strip_prefix('?') {
+        ("/".to_string(), Some(query.to_string()))
     } else {
         let (path, query) = split_path_query(&rest[1..]);
         let path = if path.is_empty() {
