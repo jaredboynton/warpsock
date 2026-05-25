@@ -1,4 +1,4 @@
-use specter::{Client, Message};
+use specter::{Client, Message, PreparedMessage, WebSocketFrameOpcode};
 
 #[path = "helpers/mock_ws_server.rs"]
 mod mock_ws_server;
@@ -92,6 +92,100 @@ async fn split_reader_and_writer_operate_independently() {
     assert_eq!(frame.opcode, 0x1);
     assert!(frame.masked);
     assert_eq!(frame.payload, b"from split writer");
+}
+
+#[tokio::test]
+async fn next_frame_exposes_raw_fragment_boundaries() {
+    let frame = [
+        server_frame_with_fin(false, 0x1, b"he"),
+        server_frame_with_fin(true, 0x0, b"llo"),
+    ]
+    .concat();
+    let server = MockWsServer::new().await.unwrap();
+    let url = server.ws_url("/next-frame");
+    let handle = server.start_once(WsResponse {
+        first_frame: Some(frame),
+        ..WsResponse::default()
+    });
+
+    let mut ws = Client::new()
+        .unwrap()
+        .websocket(url)
+        .connect()
+        .await
+        .expect("websocket handshake should succeed");
+
+    let first = ws
+        .next_frame()
+        .await
+        .expect("first raw frame read")
+        .expect("first raw frame");
+    let second = ws
+        .next_frame()
+        .await
+        .expect("second raw frame read")
+        .expect("second raw frame");
+
+    assert!(!first.fin);
+    assert_eq!(first.opcode, WebSocketFrameOpcode::Text);
+    assert_eq!(first.payload, b"he".as_slice());
+    assert!(second.fin);
+    assert_eq!(second.opcode, WebSocketFrameOpcode::Continuation);
+    assert_eq!(second.payload, b"llo".as_slice());
+
+    let _ = handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_message_sends_fresh_masked_frame() {
+    let server = MockWsServer::new().await.unwrap();
+    let url = server.ws_url("/prepared");
+    let handle = server.start_once(WsResponse::default());
+
+    let mut ws = Client::new()
+        .unwrap()
+        .websocket(url)
+        .connect()
+        .await
+        .expect("websocket handshake should succeed");
+    let prepared = PreparedMessage::text("prepared broadcast");
+    ws.send_prepared(&prepared).await.expect("send prepared");
+
+    let exchange = handle.await.unwrap();
+    let frame = exchange.client_frame.expect("server captured client frame");
+    assert_eq!(frame.opcode, 0x1);
+    assert!(frame.masked);
+    assert_eq!(frame.payload, b"prepared broadcast");
+}
+
+#[tokio::test]
+async fn prepared_batch_writes_multiple_masked_frames() {
+    let server = MockWsServer::new().await.unwrap();
+    let url = server.ws_url("/prepared-batch");
+    let handle = server.start_once(WsResponse::default());
+
+    let prepared = [
+        PreparedMessage::text("first"),
+        PreparedMessage::binary(Vec::from(&b"second"[..])),
+    ];
+    let mut ws = Client::new()
+        .unwrap()
+        .websocket(url)
+        .connect()
+        .await
+        .expect("websocket handshake should succeed");
+    ws.send_prepared_batch(prepared.iter())
+        .await
+        .expect("send prepared batch");
+
+    let exchange = handle.await.unwrap();
+    assert_eq!(exchange.client_frames.len(), 2);
+    assert_eq!(exchange.client_frames[0].opcode, 0x1);
+    assert!(exchange.client_frames[0].masked);
+    assert_eq!(exchange.client_frames[0].payload, b"first");
+    assert_eq!(exchange.client_frames[1].opcode, 0x2);
+    assert!(exchange.client_frames[1].masked);
+    assert_eq!(exchange.client_frames[1].payload, b"second");
 }
 
 #[tokio::test]
