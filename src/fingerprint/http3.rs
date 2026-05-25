@@ -179,7 +179,7 @@ impl QuicTransportParams {
             initial_max_streams_uni: 100,
             ack_delay_exponent: 3,
             max_ack_delay_ms: 25,
-            ack_eliciting_threshold: 16,
+            ack_eliciting_threshold: 10,
             active_connection_id_limit: 2,
             disable_active_migration: true,
             disable_dcid_reuse: false,
@@ -204,6 +204,8 @@ impl QuicTransportParams {
     pub fn firefox() -> Self {
         Self {
             grease: false,
+            max_ack_delay_ms: 20,
+            ack_eliciting_threshold: 2,
             initial_max_stream_data_bidi_local: 4 * 1024 * 1024,
             initial_max_stream_data_bidi_remote: 4 * 1024 * 1024,
             initial_max_stream_data_uni: 4 * 1024 * 1024,
