@@ -1065,7 +1065,8 @@ mod tests {
         recovery.mark_handshake_complete();
         recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(now, 1200));
         assert_eq!(recovery.pto_count(), 0);
-        let outcome = recovery.on_loss_detection_timeout(now);
+        let timeout_at = recovery.loss_detection_timer().expect("timer armed");
+        let outcome = recovery.on_loss_detection_timeout(timeout_at);
         match outcome {
             LossDetectionOutcome::Pto { space } => {
                 assert_eq!(space, PacketNumberSpace::Application);
@@ -1082,7 +1083,8 @@ mod tests {
         recovery.set_peer_completed_address_validation(true);
         recovery.mark_handshake_complete();
         recovery.on_packet_sent(PacketNumberSpace::Application, 1, meta(now, 1200));
-        let _ = recovery.on_loss_detection_timeout(now);
+        let timeout_at = recovery.loss_detection_timer().expect("timer armed");
+        let _ = recovery.on_loss_detection_timeout(timeout_at);
         assert_eq!(recovery.pto_count(), 1);
         recovery.on_packet_sent(PacketNumberSpace::Application, 2, meta(now, 1200));
         let frame = ack_frame(2, 0);
