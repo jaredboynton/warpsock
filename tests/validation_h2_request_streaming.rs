@@ -54,6 +54,22 @@ async fn send_ok_headers(conn: &MockH2Connection, encoder: &mut Encoder, stream_
         .unwrap();
 }
 
+async fn wait_for_stable_counter(counter: &AtomicUsize) -> usize {
+    let mut last = counter.load(Ordering::SeqCst);
+    let mut stable_yields = 0;
+    while stable_yields < 4 {
+        tokio::task::yield_now().await;
+        let current = counter.load(Ordering::SeqCst);
+        if current == last {
+            stable_yields += 1;
+        } else {
+            last = current;
+            stable_yields = 0;
+        }
+    }
+    last
+}
+
 struct CountingChunks {
     chunk: Bytes,
     remaining: usize,
@@ -121,7 +137,7 @@ async fn h2_request_stream_flow_control_window_contention() {
                             first_burst_bytes.store(total, Ordering::SeqCst);
                             polls_at_contention
                                 .store(producer_polls.load(Ordering::SeqCst), Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            wait_for_stable_counter(&producer_polls).await;
                             conn.send_window_update(0, 1_000_000).await.unwrap();
                             conn.send_window_update(stream_id, 1_000_000).await.unwrap();
                         }
@@ -218,7 +234,6 @@ async fn h2_request_stream_10mb_under_backpressure() {
                         if flags & 0x01 != 0 {
                             send_ok_headers(&conn, &mut encoder, stream_id).await;
                             conn.send_data(stream_id, b"uploaded", true).await.unwrap();
-                            tokio::time::sleep(Duration::from_millis(100)).await;
                             break;
                         }
                     }
@@ -364,11 +379,14 @@ async fn h2_request_stream_mid_stream_cancellation() {
     let url = server.url_tls();
     let rst_seen = Arc::new(AtomicBool::new(false));
     let rst_seen_server = rst_seen.clone();
+    let rst_seen_notify = Arc::new(Notify::new());
+    let rst_seen_notify_server = rst_seen_notify.clone();
     let first_data_seen = Arc::new(Notify::new());
     let first_data_seen_server = first_data_seen.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let rst_seen = rst_seen_server.clone();
+        let rst_seen_notify = rst_seen_notify_server.clone();
         let first_data_seen = first_data_seen_server.clone();
         async move {
             server_handshake(&conn).await;
@@ -385,7 +403,7 @@ async fn h2_request_stream_mid_stream_cancellation() {
                 match frame_type {
                     0x01 => stream_id = sid,
                     0x00 => {
-                        first_data_seen.notify_waiters();
+                        first_data_seen.notify_one();
                         if !payload.is_empty() {
                             conn.send_window_update(0, payload.len() as u32)
                                 .await
@@ -401,6 +419,7 @@ async fn h2_request_stream_mid_stream_cancellation() {
                     }
                     0x03 => {
                         rst_seen.store(true, Ordering::SeqCst);
+                        rst_seen_notify.notify_one();
                         break;
                     }
                     _ => {}
@@ -423,20 +442,13 @@ async fn h2_request_stream_mid_stream_cancellation() {
         .unwrap();
     let before_drop = polls.load(Ordering::SeqCst);
     drop(response);
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if rst_seen.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(Duration::from_secs(2), rst_seen_notify.notified())
     .await
     .unwrap();
-    let after_drop = polls.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let after_drop = wait_for_stable_counter(&polls).await;
+    let after_quiescent = wait_for_stable_counter(&polls).await;
     assert_eq!(
-        polls.load(Ordering::SeqCst),
+        after_quiescent,
         after_drop,
         "producer should not continue being polled after cancellation settles"
     );

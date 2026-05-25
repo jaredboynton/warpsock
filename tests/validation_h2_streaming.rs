@@ -9,7 +9,7 @@ use specter::{Client, CookieJar};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::timeout;
 
 mod helpers;
@@ -169,9 +169,15 @@ async fn response_headers_arrive_before_body_completion() {
 
     let server_sent_last_data_at = Arc::new(Mutex::new(0u128));
     let server_sent_last_data_at_clone = server_sent_last_data_at.clone();
+    let headers_observed = Arc::new(Notify::new());
+    let first_chunk_observed = Arc::new(Notify::new());
+    let headers_observed_server = headers_observed.clone();
+    let first_chunk_observed_server = first_chunk_observed.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let server_sent_last_data_at = server_sent_last_data_at_clone.clone();
+        let headers_observed = headers_observed_server.clone();
+        let first_chunk_observed = first_chunk_observed_server.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -197,10 +203,13 @@ async fn response_headers_arrive_before_body_completion() {
                             .await
                             .unwrap();
 
-                        // Deliberately delay sending chunks to allow client to process headers
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        timeout(Duration::from_secs(2), headers_observed.notified())
+                            .await
+                            .unwrap();
                         conn.send_data(stream_id, b"chunk-1", false).await.unwrap();
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        timeout(Duration::from_secs(2), first_chunk_observed.notified())
+                            .await
+                            .unwrap();
 
                         let last_data_time = system_time_now_ms();
                         {
@@ -234,6 +243,7 @@ async fn response_headers_arrive_before_body_completion() {
 
     let header_at = system_time_now_ms();
     assert_eq!(response.status().as_u16(), 200);
+    headers_observed.notify_one();
 
     // Consume body
     assert_eq!(
@@ -247,6 +257,7 @@ async fn response_headers_arrive_before_body_completion() {
             .unwrap(),
         Bytes::from("chunk-1")
     );
+    first_chunk_observed.notify_one();
     assert_eq!(
         response
             .body_mut()
@@ -296,9 +307,15 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
 
     let server_sent_last_chunk_at = Arc::new(Mutex::new(0u128));
     let server_sent_last_chunk_at_clone = server_sent_last_chunk_at.clone();
+    let headers_observed = Arc::new(Notify::new());
+    let first_chunk_observed = Arc::new(Notify::new());
+    let headers_observed_server = headers_observed.clone();
+    let first_chunk_observed_server = first_chunk_observed.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let server_sent_last_chunk_at = server_sent_last_chunk_at_clone.clone();
+        let headers_observed = headers_observed_server.clone();
+        let first_chunk_observed = first_chunk_observed_server.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -324,12 +341,16 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
                             .await
                             .unwrap();
 
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        timeout(Duration::from_secs(2), headers_observed.notified())
+                            .await
+                            .unwrap();
                         conn.send_data(stream_id, b"incremental-chunk-1", false)
                             .await
                             .unwrap();
 
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        timeout(Duration::from_secs(2), first_chunk_observed.notified())
+                            .await
+                            .unwrap();
                         let last_chunk_time = system_time_now_ms();
                         {
                             let mut lock = server_sent_last_chunk_at.lock().await;
@@ -361,6 +382,7 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
     .unwrap();
 
     assert_eq!(response.status().as_u16(), 200);
+    headers_observed.notify_one();
 
     // Read first chunk
     let start_read_chunk_1 = system_time_now_ms();
@@ -374,6 +396,7 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
         .unwrap();
     let end_read_chunk_1 = system_time_now_ms();
     assert_eq!(chunk1, Bytes::from("incremental-chunk-1"));
+    first_chunk_observed.notify_one();
 
     // Read second chunk
     let chunk2 = response
@@ -393,7 +416,7 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
     assert!(end_read_chunk_1 < server_last_chunk_send_at);
 
     let evidence = json!({
-        "configured_chunk_schedule": ["0ms", "50ms", "200ms"],
+        "configured_chunk_schedule": ["headers_observed", "first_chunk_observed"],
         "per_chunk_client_receive_timestamps_sizes": [
             { "timestamp": start_read_chunk_1, "size": chunk1.len() },
             { "timestamp": end_read_chunk_1, "size": chunk2.len() }
@@ -1491,10 +1514,16 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
     let url = server.url_tls();
 
     let rst_received = Arc::new(Mutex::new(false));
+    let rst_received_notify = Arc::new(Notify::new());
+    let client_dropped = Arc::new(Notify::new());
     let rst_received_clone = rst_received.clone();
+    let rst_received_notify_clone = rst_received_notify.clone();
+    let client_dropped_clone = client_dropped.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let rst_received = rst_received_clone.clone();
+        let rst_received_notify = rst_received_notify_clone.clone();
+        let client_dropped = client_dropped_clone.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -1520,14 +1549,16 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
                             .await
                             .unwrap();
 
-                        // Wait a bit, then send data
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        timeout(Duration::from_secs(2), client_dropped.notified())
+                            .await
+                            .unwrap();
                         let _ = conn.send_data(stream_id, b"chunk", false).await;
                     }
                     0x03 => {
                         // RST_STREAM frame received!
                         let mut lock = rst_received.lock().await;
                         *lock = true;
+                        rst_received_notify.notify_one();
                     }
                     _ => {}
                 }
@@ -1550,9 +1581,11 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
 
     // Drop rx1 immediately before consuming anything!
     drop(resp1);
+    client_dropped.notify_one();
 
-    // Wait for driver to process and send RST_STREAM
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    timeout(Duration::from_secs(2), rst_received_notify.notified())
+        .await
+        .expect("driver should send RST_STREAM after dropped receiver");
 
     // Follow-up request should succeed on the same client!
     let mut resp2 = client
@@ -1604,12 +1637,15 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
 
     let rst_received = Arc::new(Mutex::new(false));
     let initial_chunks_sent = Arc::new(tokio::sync::Notify::new());
+    let rst_received_notify = Arc::new(Notify::new());
     let rst_received_clone = rst_received.clone();
     let initial_chunks_sent_clone = initial_chunks_sent.clone();
+    let rst_received_notify_clone = rst_received_notify.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let rst_received = rst_received_clone.clone();
         let initial_chunks_sent = initial_chunks_sent_clone.clone();
+        let rst_received_notify = rst_received_notify_clone.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -1643,7 +1679,7 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
                             for _ in 0..160 {
                                 conn.send_data(stream_id, &chunk, false).await.unwrap();
                             }
-                            initial_chunks_sent.notify_waiters();
+                            initial_chunks_sent.notify_one();
                         } else {
                             conn.send_data(stream_id, b"followup-ok", true)
                                 .await
@@ -1653,6 +1689,7 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
                     0x03 => {
                         let mut lock = rst_received.lock().await;
                         *lock = true;
+                        rst_received_notify.notify_one();
                     }
                     _ => {}
                 }
@@ -1676,17 +1713,9 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
     timeout(Duration::from_secs(1), initial_chunks_sent.notified())
         .await
         .expect("server should send enough chunks to fill the bounded body channel");
-    tokio::time::sleep(Duration::from_millis(50)).await;
     drop(resp1);
 
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if *rst_received.lock().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(Duration::from_secs(1), rst_received_notify.notified())
     .await
     .expect("driver should send RST_STREAM(CANCEL) after a full body channel receiver is dropped");
 
@@ -1917,8 +1946,7 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
         "Fast sibling stream must complete quickly without deadlocking on the slow stream"
     );
 
-    // Slow stream consumer remains backpressured (waits 200ms before draining)
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Slow stream consumer remains backpressured until the fast stream has completed.
     let mut slow_bytes = 0;
     while let Some(chunk) = resp1.body_mut().frame().await {
         let data = chunk.unwrap().into_data().unwrap_or_default();
@@ -1930,7 +1958,7 @@ async fn slow_consumer_backpressure_does_not_deadlock_other_streams() {
         "slow_stream_id": 1,
         "fast_stream_id": 3,
         "fast_stream_completion_time_ms": fast_elapsed.as_millis(),
-        "slow_stream_backpressure_duration_ms": 200,
+        "slow_stream_backpressure_gate": "fast_stream_completed_before_slow_drain",
         "slow_stream_final_byte_count": slow_bytes,
         "success": true
     });
@@ -1982,14 +2010,8 @@ async fn streaming_timeouts_are_enforced_per_phase() {
                         .map(|(_, val)| val.as_str())
                         .unwrap_or("");
 
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                     if path.contains("ttfb-delayed") {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        let response_headers =
-                            encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
-                        let _ = conn
-                            .send_headers(stream_id, &response_headers, true, true)
-                            .await;
+                        std::future::pending::<()>().await;
                     } else if path.contains("read-delayed") {
                         let response_headers =
                             encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
@@ -1997,8 +2019,7 @@ async fn streaming_timeouts_are_enforced_per_phase() {
                             .send_headers(stream_id, &response_headers, false, true)
                             .await;
                         let _ = conn.send_data(stream_id, b"chunk-1", false).await;
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        let _ = conn.send_data(stream_id, b"chunk-2", true).await;
+                        std::future::pending::<()>().await;
                     } else {
                         let response_headers =
                             encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
@@ -2296,8 +2317,6 @@ async fn stale_h2_pool_entries_are_evicted_before_reuse() {
         .unwrap();
     assert_eq!(resp1.status().as_u16(), 200);
     let _ = resp1.body_mut().frame().await;
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut resp2 = client
         .get(format!("{}/fresh-conn", url))
