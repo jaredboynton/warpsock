@@ -85,7 +85,9 @@ zigbuild target="aarch64-unknown-linux-gnu":
     echo ""
     echo "Build complete for $TARGET"
 
-# Build for native macOS (with prebuilt BoringSSL)
+# `zigbuild` is asymmetric with `build` on purpose: cross targets only build
+# the lib, since cross-compiled test/bench binaries can't run on the host.
+# Build for native macOS, full workspace (uses prebuilt BoringSSL)
 [group('build')]
 build:
     #!/usr/bin/env bash
@@ -141,17 +143,10 @@ setup-zigbuild:
     echo "  just zigbuild                           # Linux ARM64"
     echo "  just zigbuild x86_64-unknown-linux-gnu  # Linux x86_64"
 
-# Build prebuilt BoringSSL libraries for all targets
+# Build prebuilt BoringSSL libraries for all targets (or the listed targets).
 [group('setup')]
 build-boringssl *TARGETS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    
-    if [[ -z "{{ TARGETS }}" ]]; then
-        ./scripts/build-boringssl.sh
-    else
-        ./scripts/build-boringssl.sh {{ TARGETS }}
-    fi
+    ./scripts/build-boringssl.sh {{ TARGETS }}
 
 # Fast incremental lib check (avoids 70+ integration-test crates)
 [group('build')]
@@ -168,11 +163,6 @@ check-lib:
     . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
 
     cargo check --lib --locked
-
-# Check release lockfiles and BoringSSL prebuild metadata resolution
-[group('quality')]
-check-release-lockfiles:
-    ./scripts/check-release-lockfiles.sh
 
 # Incremental check for changed files only; never runs `cargo check --tests`
 [group('build')]
@@ -267,9 +257,7 @@ test:
 
     cargo nextest run --all-features --locked
 
-# Run a single integration-test binary (prunes compile + run to that crate only)
-# Usage: just test-one h1_streaming
-#        just test-one h1_streaming pooling_smoke   # inner test-name substring filter
+# Run a single integration-test binary (e.g. just test-one h1_streaming [filter])
 [group('test')]
 test-one binary filter="":
     #!/usr/bin/env bash
@@ -289,9 +277,13 @@ test-one binary filter="":
         cargo nextest run --all-features --locked -E 'binary(={{ binary }}) and test(~{{ filter }})'
     fi
 
-# Run tests with cargo test (if nextest not available)
-[group('test')]
-test-cargo:
+# =============================================================================
+# QUALITY
+# =============================================================================
+
+# Run clippy linter (sources lib-bssl-env.sh like build/test recipes do)
+[group('quality')]
+clippy:
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -303,33 +295,14 @@ test-cargo:
 
     . "$(pwd)/scripts/lib-bssl-env.sh" "$TARGET"
 
-    cargo test --all-features --locked
-
-# =============================================================================
-# QUALITY
-# =============================================================================
-
-# Run clippy linter
-[group('quality')]
-clippy:
     cargo clippy --all-features --locked -- -D warnings
 
-# Check formatting
-[group('quality')]
-fmt-check:
-    cargo fmt -- --check
-
-# Format code
-[group('quality')]
-fmt:
-    cargo fmt
-
-# Run all quality checks
+# Run fmt-check + clippy in parallel, then the full test suite
 [group('quality')]
 check:
     #!/usr/bin/env bash
     set -euo pipefail
-    just fmt-check &
+    cargo fmt -- --check &
     pid_fmt=$!
     just clippy &
     pid_clippy=$!
@@ -344,23 +317,18 @@ check:
 # =============================================================================
 # CLEAN
 # =============================================================================
+# NOTE: There is intentionally no `clean` / `clean-all` / `cargo clean` recipe.
+# AGENTS.md hard rule #6 forbids `cargo clean` (deps recovery is 5-10 min).
+# If disk pressure becomes real, use the targeted recipe below or remove
+# `target/debug/incremental` directly.
 
-# Clean build artifacts
-[group('cleanup')]
-clean:
-    cargo clean
-
-# Clean BoringSSL build cache (not prebuilt libs)
+# Clean BoringSSL build cache (not prebuilt libs in lib/boringssl/)
 [group('cleanup')]
 clean-boringssl-cache:
     rm -rf .boringssl-build
 
-# Clean cargo target + local BoringSSL build scratch (NOT prebuilt libs)
+# Drop the incremental compile cache only (safe; rebuilds in seconds).
+# Use this when target/debug/incremental/ has grown too large.
 [group('cleanup')]
-clean-all:
-    #!/usr/bin/env bash
-    # Does NOT touch lib/boringssl/ (tracked-in-repo prebuilts) or ~/boringssl
-    # (user-wide prebuilts). To rebuild the prebuilts themselves, use
-    # `just build-boringssl` or scripts/build-boringssl.sh.
-    cargo clean
-    rm -rf .boringssl-build
+clean-incremental:
+    rm -rf target/debug/incremental
