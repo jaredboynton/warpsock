@@ -91,8 +91,6 @@ async fn test_gzip_decompression() {
     let compressed = gzip_compress(TEST_BODY.as_bytes());
     let (url, _handle) = start_encoding_server("gzip", compressed).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
     let resp = client
@@ -119,8 +117,6 @@ async fn test_deflate_decompression() {
     let compressed = deflate_compress(TEST_BODY.as_bytes());
     let (url, _handle) = start_encoding_server("deflate", compressed).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
     let resp = client
@@ -144,8 +140,6 @@ async fn test_deflate_decompression() {
 async fn test_brotli_decompression() {
     let compressed = brotli_compress(TEST_BODY.as_bytes());
     let (url, _handle) = start_encoding_server("br", compressed).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
@@ -171,8 +165,6 @@ async fn test_zstd_decompression() {
     let compressed = zstd_compress(TEST_BODY.as_bytes());
     let (url, _handle) = start_encoding_server("zstd", compressed).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
     let resp = client
@@ -197,8 +189,6 @@ async fn test_identity_no_compression() {
     let plain_body = TEST_BODY.as_bytes().to_vec();
     let (url, _handle) = start_encoding_server("identity", plain_body).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
     let resp = client
@@ -220,8 +210,6 @@ async fn test_raw_bytes_vs_decoded() {
     let compressed = gzip_compress(TEST_BODY.as_bytes());
     let compressed_len = compressed.len();
     let (url, _handle) = start_encoding_server("gzip", compressed).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
