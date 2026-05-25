@@ -36,7 +36,7 @@ async fn test_push_promise_when_disabled() {
     let server = MockH2Server::new().await.unwrap();
     let url = format!("http://127.0.0.1:{}/test", server.port());
 
-    let _handle = server.start(|conn| async move {
+    let (_handle, ready) = server.start_with_ready(|conn| async move {
         tracing::info!("Server: Handshake start");
         conn.read_preface().await.unwrap();
 
@@ -130,7 +130,7 @@ async fn test_push_promise_when_disabled() {
         conn.send_data(stream_id, b"OK", true).await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     let client = Client::builder()
         .prefer_http2(true)

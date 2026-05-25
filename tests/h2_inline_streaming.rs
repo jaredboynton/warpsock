@@ -14,7 +14,7 @@ use specter::Client;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
 mod helpers;
@@ -372,11 +372,14 @@ async fn inline_path_handles_dropped_receiver() {
     let server = MockH2Server::new().await.unwrap();
     let url = server.url_tls();
 
-    let rst_seen = Arc::new(tokio::sync::Notify::new());
+    let rst_seen = Arc::new(Notify::new());
     let rst_seen_clone = rst_seen.clone();
+    let client_dropped = Arc::new(Notify::new());
+    let client_dropped_clone = client_dropped.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let rst_seen = rst_seen_clone.clone();
+        let client_dropped = client_dropped_clone.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -405,7 +408,9 @@ async fn inline_path_handles_dropped_receiver() {
                         conn.send_headers(stream_id, &response_headers, false, true)
                             .await
                             .unwrap();
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        timeout(Duration::from_secs(1), client_dropped.notified())
+                            .await
+                            .expect("client should drop the streaming response");
                         let _ = conn.send_data(stream_id, b"after-drop", false).await;
                     }
                     0x03 if Some(stream_id) == request_stream_id => {
@@ -431,6 +436,7 @@ async fn inline_path_handles_dropped_receiver() {
     assert_eq!(response.status().as_u16(), 200);
 
     drop(response);
+    client_dropped.notify_one();
 
     timeout(Duration::from_secs(3), rst_seen.notified())
         .await

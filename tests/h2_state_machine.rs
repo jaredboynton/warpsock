@@ -4,7 +4,9 @@
 //! such as sending DATA frames on closed streams or using invalid stream IDs.
 
 use specter::Client;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 mod helpers;
@@ -59,52 +61,62 @@ async fn test_data_on_closed_stream() {
         .try_init();
     let server = MockH2Server::new().await.unwrap();
     let url = format!("http://127.0.0.1:{}/test", server.port());
+    let client_processed_response = Arc::new(Notify::new());
+    let client_processed_response_server = client_processed_response.clone();
+    let violation_checked = Arc::new(Notify::new());
+    let violation_checked_server = violation_checked.clone();
 
-    let _handle = server.start(|conn| async move {
-        // Handshake and read request
-        let stream_id = perform_handshake_and_read_headers(&conn).await.unwrap();
+    let (_handle, ready) = server.start_with_ready(move |conn| {
+        let client_processed_response = client_processed_response_server.clone();
+        let violation_checked = violation_checked_server.clone();
+        async move {
+            // Handshake and read request
+            let stream_id = perform_handshake_and_read_headers(&conn).await.unwrap();
 
-        assert_eq!(stream_id, 1, "Expected Client Stream ID 1");
+            assert_eq!(stream_id, 1, "Expected Client Stream ID 1");
 
-        // Send response HEADERS with END_STREAM (closing the stream)
-        let response_headers = encode_simple_response();
-        conn.send_headers(stream_id, &response_headers, true, true)
-            .await
-            .unwrap();
+            // Send response HEADERS with END_STREAM (closing the stream)
+            let response_headers = encode_simple_response();
+            conn.send_headers(stream_id, &response_headers, true, true)
+                .await
+                .unwrap();
 
-        // Give client time to process
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(Duration::from_secs(1), client_processed_response.notified())
+                .await
+                .expect("client should process the closed stream response");
 
-        // Violate state machine: send DATA on closed stream
-        conn.send_data(stream_id, b"This should not be accepted", false)
-            .await
-            .unwrap();
+            // Violate state machine: send DATA on closed stream
+            conn.send_data(stream_id, b"This should not be accepted", false)
+                .await
+                .unwrap();
 
-        // Client should send RST_STREAM or GOAWAY
-        let result = timeout(Duration::from_secs(1), conn.read_frame()).await;
+            // Client should send RST_STREAM or GOAWAY
+            let result = timeout(Duration::from_secs(1), conn.read_frame()).await;
 
-        match result {
-            Ok(Ok((_, frame_type, _, _, _))) => {
-                tracing::info!("Received frame type {}", frame_type);
-                if frame_type == 0x03 { // RST_STREAM
-                     // Success
-                } else if frame_type == 0x07 { // GOAWAY
-                     // Success
-                } else {
-                    tracing::warn!("Received unexpected frame type {}", frame_type);
-                    // It is possible we receive a WindowUpdate or something else if timing is tight
+            match result {
+                Ok(Ok((_, frame_type, _, _, _))) => {
+                    tracing::info!("Received frame type {}", frame_type);
+                    if frame_type == 0x03 { // RST_STREAM
+                         // Success
+                    } else if frame_type == 0x07 { // GOAWAY
+                         // Success
+                    } else {
+                        tracing::warn!("Received unexpected frame type {}", frame_type);
+                        // It is possible we receive a WindowUpdate or something else if timing is tight
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Connection closed
+                }
+                Err(_) => {
+                    // Timeout
                 }
             }
-            Ok(Err(_)) => {
-                // Connection closed
-            }
-            Err(_) => {
-                // Timeout
-            }
+            violation_checked.notify_one();
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     // Client makes request
     let client = Client::builder()
@@ -119,6 +131,10 @@ async fn test_data_on_closed_stream() {
     assert!(result.is_ok(), "Request timed out");
     let response = result.unwrap();
     assert!(response.is_ok(), "Request failed: {:?}", response.err());
+    client_processed_response.notify_one();
+    timeout(Duration::from_secs(2), violation_checked.notified())
+        .await
+        .expect("server should check the closed-stream violation");
 }
 
 #[tokio::test]
@@ -128,38 +144,49 @@ async fn test_server_initiated_stream_even_id() {
         .try_init();
     let server = MockH2Server::new().await.unwrap();
     let url = format!("http://127.0.0.1:{}/test", server.port());
+    let client_processed_response = Arc::new(Notify::new());
+    let client_processed_response_server = client_processed_response.clone();
+    let violation_checked = Arc::new(Notify::new());
+    let violation_checked_server = violation_checked.clone();
 
-    let _handle = server.start(|conn| async move {
-        // Handshake and read request
-        let stream_id = perform_handshake_and_read_headers(&conn).await.unwrap();
+    let (_handle, ready) = server.start_with_ready(move |conn| {
+        let client_processed_response = client_processed_response_server.clone();
+        let violation_checked = violation_checked_server.clone();
+        async move {
+            // Handshake and read request
+            let stream_id = perform_handshake_and_read_headers(&conn).await.unwrap();
 
-        // Send valid response for client stream
-        let response_headers = encode_simple_response();
-        conn.send_headers(stream_id, &response_headers, true, true)
-            .await
-            .unwrap();
+            // Send valid response for client stream
+            let response_headers = encode_simple_response();
+            conn.send_headers(stream_id, &response_headers, true, true)
+                .await
+                .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(Duration::from_secs(1), client_processed_response.notified())
+                .await
+                .expect("client should process the closed stream response");
 
-        // Violate state machine: server sends HEADERS on even stream ID (server-initiated)
-        let invalid_headers = encode_simple_response();
-        conn.send_headers(2, &invalid_headers, false, true)
-            .await
-            .unwrap();
+            // Violate state machine: server sends HEADERS on even stream ID (server-initiated)
+            let invalid_headers = encode_simple_response();
+            conn.send_headers(2, &invalid_headers, false, true)
+                .await
+                .unwrap();
 
-        // Client should send GOAWAY or RST_STREAM
-        let result = timeout(Duration::from_secs(1), conn.read_frame()).await;
-        if let Ok(Ok((_, frame_type, _, _, _))) = result {
-            tracing::info!("Received frame type {}", frame_type);
-            assert!(
-                frame_type == 0x03 || frame_type == 0x07,
-                "Expected 0x03 or 0x07, got {}",
-                frame_type
-            );
+            // Client should send GOAWAY or RST_STREAM
+            let result = timeout(Duration::from_secs(1), conn.read_frame()).await;
+            if let Ok(Ok((_, frame_type, _, _, _))) = result {
+                tracing::info!("Received frame type {}", frame_type);
+                assert!(
+                    frame_type == 0x03 || frame_type == 0x07,
+                    "Expected 0x03 or 0x07, got {}",
+                    frame_type
+                );
+            }
+            violation_checked.notify_one();
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     let client = Client::builder()
         .prefer_http2(true)
@@ -170,6 +197,10 @@ async fn test_server_initiated_stream_even_id() {
 
     assert!(result.is_ok());
     assert!(result.unwrap().is_ok());
+    client_processed_response.notify_one();
+    timeout(Duration::from_secs(2), violation_checked.notified())
+        .await
+        .expect("server should check the even-stream-id violation");
 }
 
 /// Encode a minimal HTTP/2 response using literal headers (no dynamic table).

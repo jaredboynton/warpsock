@@ -31,7 +31,7 @@ async fn test_oversized_frame() {
     let server = MockH2Server::new().await.unwrap();
     let url = format!("{}/test", server.url());
 
-    let _handle = server.start(|conn| async move {
+    let (_handle, ready) = server.start_with_ready(|conn| async move {
         perform_handshake(&conn).await.unwrap();
 
         let _ = conn.read_frame().await; // WINDOW_UPDATE
@@ -81,7 +81,7 @@ async fn test_oversized_frame() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     let client = Client::builder().prefer_http2(true).build().unwrap();
     let result = timeout(Duration::from_secs(2), client.get(url.as_str()).send()).await;
@@ -109,7 +109,7 @@ async fn test_zero_length_headers_frame() {
     let server = MockH2Server::new().await.unwrap();
     let url = format!("{}/test", server.url());
 
-    let _handle = server.start(|conn| async move {
+    let (_handle, ready) = server.start_with_ready(|conn| async move {
         perform_handshake(&conn).await.unwrap();
 
         let _ = conn.read_frame().await; // WINDOW_UPDATE
@@ -142,7 +142,7 @@ async fn test_zero_length_headers_frame() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     let client = Client::builder().prefer_http2(true).build().unwrap();
     let result = timeout(Duration::from_secs(2), client.get(url.as_str()).send()).await;

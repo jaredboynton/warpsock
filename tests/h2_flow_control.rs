@@ -167,7 +167,7 @@ async fn test_large_upload_flow_control() {
     }
     let body_clone = body.clone();
 
-    let _handle = server.start(move |conn| async move {
+    let (_handle, ready) = server.start_with_ready(move |conn| async move {
         tracing::info!("Server: reading preface");
         conn.read_preface().await.unwrap();
 
@@ -246,7 +246,7 @@ async fn test_large_upload_flow_control() {
             .unwrap(); // 200 OK
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready.await.expect("mock H2 accept loop ready");
 
     let client = Client::builder()
         .prefer_http2(true)
