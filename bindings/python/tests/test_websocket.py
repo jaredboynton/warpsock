@@ -12,9 +12,28 @@ async def wait(awaitable):
     return await asyncio.wait_for(awaitable, timeout=5)
 
 
+class CloseTrackingList(list):
+    def __init__(self, close_seen):
+        super().__init__()
+        self.close_seen = close_seen
+
+    def append(self, item):
+        super().append(item)
+        if item == ("close", b"\x03\xe8done"):
+            self.close_seen.set()
+
+
 @pytest.mark.asyncio
 async def test_websocket_round_trip_and_controlled_headers():
-    async with create_websocket_fixture(protocols=["chat.v1"]) as fixture:
+    close_seen = asyncio.Event()
+
+    def track_close(connection):
+        connection.received = CloseTrackingList(close_seen)
+
+    async with create_websocket_fixture(
+        protocols=["chat.v1"],
+        on_connection=track_close,
+    ) as fixture:
         client = specter.Client.builder().build()
         builder = client.websocket(fixture.url)
 
@@ -59,10 +78,7 @@ async def test_websocket_round_trip_and_controlled_headers():
         assert message.data == b"are-you-there"
 
         await wait(ws.close(specter.CloseFrame(1000, "done")))
-        for _ in range(20):
-            if ("close", b"\x03\xe8done") in fixture.connections[0].received:
-                break
-            await asyncio.sleep(0.05)
+        await wait(close_seen.wait())
         assert ("close", b"\x03\xe8done") in fixture.connections[0].received
 
 

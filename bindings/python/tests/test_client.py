@@ -2,7 +2,6 @@
 
 import json
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl
 
@@ -51,7 +50,6 @@ class LocalHttpHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
-                time.sleep(0.005)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return
