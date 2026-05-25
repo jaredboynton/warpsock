@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Notify};
 
 mod helpers;
 use helpers::mock_h3_server::{MockEvent, MockH3Server};
@@ -222,8 +222,8 @@ async fn pool_idle_timeout_short_evicts_h1_connections() {
     let r1 = client.get(url.as_str()).send().await.unwrap();
     assert_eq!(r1.status().as_u16(), 200);
 
-    // Wait beyond the configured idle timeout.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait beyond the configured idle timeout instead of using a magic settle delay.
+    tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_millis(100)).await;
 
     let r2 = client.get(url.as_str()).send().await.unwrap();
     assert_eq!(r2.status().as_u16(), 200);
@@ -267,13 +267,20 @@ async fn h1_max_connections_per_origin_limits_active_parallelism() {
     let addr = listener.local_addr().unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
+    let first_active = Arc::new(Notify::new());
+    let (release_tx, release_rx) = mpsc::channel::<()>(3);
+    let release_rx = Arc::new(Mutex::new(release_rx));
     let active_for_task = active.clone();
     let max_active_for_task = max_active.clone();
+    let first_active_for_task = first_active.clone();
+    let release_rx_for_task = release_rx.clone();
 
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let active = active_for_task.clone();
             let max_active = max_active_for_task.clone();
+            let first_active = first_active_for_task.clone();
+            let release_rx = release_rx_for_task.clone();
             tokio::spawn(async move {
                 let mut buffer = Vec::new();
                 let mut read_buf = [0u8; 1024];
@@ -287,7 +294,8 @@ async fn h1_max_connections_per_origin_limits_active_parallelism() {
 
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(current, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                first_active.notify_waiters();
+                let _ = release_rx.lock().await.recv().await;
                 let _ = stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -313,10 +321,26 @@ async fn h1_max_connections_per_origin_limits_active_parallelism() {
         assert_eq!(response.text().unwrap(), "ok");
     };
 
+    let controller = async {
+        tokio::time::timeout(Duration::from_secs(1), first_active.notified())
+            .await
+            .expect("server should receive the first request");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "h1_max_connections_per_origin(1) must not open parallel sockets while the first request is active"
+        );
+
+        for _ in 0..3 {
+            release_tx.send(()).await.unwrap();
+        }
+    };
+
     tokio::join!(
         request(client.clone(), url.clone()),
         request(client.clone(), url.clone()),
         request(client, url),
+        controller,
     );
 
     assert_eq!(
@@ -450,9 +474,10 @@ async fn client_builder_h3_max_idle_timeout_forces_reconnect() {
     });
 
     // Configure the unified Client::builder() H3 idle timeout to a small value.
+    let idle_timeout = Duration::from_millis(100);
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
-        .h3_max_idle_timeout(100)
+        .h3_max_idle_timeout(idle_timeout.as_millis() as u64)
         .build()
         .unwrap();
 
@@ -475,7 +500,7 @@ async fn client_builder_h3_max_idle_timeout_forces_reconnect() {
         bytes::Bytes::from_static(b"chunk")
     );
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep_until(tokio::time::Instant::now() + idle_timeout * 2).await;
 
     let mut response2 = h3
         .send_streaming(&url, "GET", vec![], RequestBody::Empty)
@@ -494,7 +519,6 @@ async fn client_builder_h3_max_idle_timeout_forces_reconnect() {
         bytes::Bytes::from_static(b"chunk")
     );
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         connection_count.load(Ordering::SeqCst),
         2,

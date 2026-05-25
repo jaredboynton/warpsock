@@ -211,7 +211,6 @@ async fn handle_h1_connection(mut stream: TcpStream, logs: Arc<Mutex<Vec<H1Log>>
                     )
                     .await
                     .unwrap();
-                tokio::time::sleep(Duration::from_millis(20)).await;
                 stream.write_all(body).await.unwrap();
                 stream.flush().await.unwrap();
             }
@@ -292,7 +291,6 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
                             .await
                             .unwrap();
                         conn.send_data(stream_id, b"hello-", false).await.unwrap();
-                        tokio::time::sleep(Duration::from_millis(20)).await;
                         conn.send_data(stream_id, b"h2-stream", true).await.unwrap();
                     }
                     _ => {}
@@ -337,7 +335,6 @@ async fn public_streaming_api_is_transport_neutral_for_h1_h2_h3() {
             conn.send_response_headers(stream_id, vec![(":status", "200")], false)
                 .await;
             conn.send_response_data(stream_id, b"hello-", false).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
             conn.send_response_data(stream_id, b"h3-stream", true).await;
         });
         let client = Client::builder()
