@@ -172,6 +172,18 @@ class ClientBuilder:
     def with_platform_roots(self, enabled: bool) -> None:
         """Load root certificates from the OS certificate store."""
         ...
+
+    def hickory_dns(self, enable: bool) -> None:
+        """Enable or disable DNS result caching."""
+        ...
+
+    def dns_cache_ttl(self, ttl_secs: float) -> None:
+        """Set the DNS cache TTL in seconds."""
+        ...
+
+    def http_tls_early_data(self, enabled: bool) -> None:
+        """Enable or disable TCP-TLS 1.3 early data for safe requests."""
+        ...
     
     def build(self) -> "Client":
         """Build the client."""
