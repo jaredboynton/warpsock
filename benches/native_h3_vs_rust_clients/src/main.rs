@@ -3881,6 +3881,18 @@ mod tests {
                 "native_h3_vs_rust_clients_harness",
             ),
             (
+                "quiche_direct_rfc9220_tunnel_close",
+                "h3_tunnel_comparator",
+                "pending_measurement",
+                "native_h3_vs_rust_clients_harness",
+            ),
+            (
+                "tokio_quiche_rfc9220_tunnel_close",
+                "h3_tunnel_comparator",
+                "pending_measurement",
+                "native_h3_vs_rust_clients_harness",
+            ),
+            (
                 "h3_quinn_rfc9220_tunnel",
                 "unsupported_h3_tunnel_comparator",
                 "unsupported_by_client",
@@ -4152,6 +4164,8 @@ mod tests {
         expected.push("specter_native_rfc9220_tunnel_mixed");
         expected.push("quiche_direct_rfc9220_tunnel");
         expected.push("tokio_quiche_rfc9220_tunnel");
+        expected.push("quiche_direct_rfc9220_tunnel_close");
+        expected.push("tokio_quiche_rfc9220_tunnel_close");
 
         assert_eq!(super::local_native_fixture_measurement_plan(), expected);
     }
@@ -4448,6 +4462,29 @@ mod tests {
     }
 
     #[test]
+    fn quiche_direct_rfc9220_tunnel_close_adapter_row_uses_measured_samples() {
+        let samples = vec![
+            super::AdapterSample::new(60.0, 600.0, 6_000),
+            super::AdapterSample::new(10.0, 100.0, 1_000),
+            super::AdapterSample::new(30.0, 300.0, 3_000),
+        ];
+
+        let row = super::quiche_direct_rfc9220_tunnel_close_row_from_samples(&samples);
+
+        assert_eq!(row.competitor_id, "quiche_direct_rfc9220_tunnel_close");
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.p50_ttft_ns, Some(30.0));
+        assert_eq!(row.p95_ttft_ns, Some(60.0));
+        assert_eq!(row.bytes_per_sec, Some(10_000_000_000.0));
+        assert_eq!(row.source, "quiche_direct_rfc9220_tunnel_close_adapter");
+        assert_eq!(row.protocol.as_deref(), Some("h3_rfc9220"));
+        assert_eq!(
+            row.workload.as_deref(),
+            Some("websocket_over_h3_raw_tunnel_close_fin")
+        );
+    }
+
+    #[test]
     fn tokio_quiche_rfc9220_tunnel_adapter_row_uses_measured_samples() {
         let samples = vec![
             super::AdapterSample::new(50.0, 500.0, 5_000),
@@ -4467,6 +4504,29 @@ mod tests {
         assert_eq!(
             row.workload.as_deref(),
             Some("websocket_over_h3_raw_tunnel_echo")
+        );
+    }
+
+    #[test]
+    fn tokio_quiche_rfc9220_tunnel_close_adapter_row_uses_measured_samples() {
+        let samples = vec![
+            super::AdapterSample::new(70.0, 700.0, 7_000),
+            super::AdapterSample::new(10.0, 100.0, 1_000),
+            super::AdapterSample::new(40.0, 400.0, 4_000),
+        ];
+
+        let row = super::tokio_quiche_rfc9220_tunnel_close_row_from_samples(&samples);
+
+        assert_eq!(row.competitor_id, "tokio_quiche_rfc9220_tunnel_close");
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.p50_ttft_ns, Some(40.0));
+        assert_eq!(row.p95_ttft_ns, Some(70.0));
+        assert_eq!(row.bytes_per_sec, Some(10_000_000_000.0));
+        assert_eq!(row.source, "tokio_quiche_rfc9220_tunnel_close_adapter");
+        assert_eq!(row.protocol.as_deref(), Some("h3_rfc9220"));
+        assert_eq!(
+            row.workload.as_deref(),
+            Some("websocket_over_h3_raw_tunnel_close_fin")
         );
     }
 
@@ -4611,6 +4671,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quiche_direct_local_fixture_measures_rfc9220_tunnel_close_fin() {
+        let fixture = super::LocalNativeH3Fixture::start("quiche_direct_rfc9220_tunnel_close")
+            .await
+            .unwrap();
+
+        let row = super::measure_quiche_direct_rfc9220_tunnel_close(&fixture.tunnel_url(), 0, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(row.competitor_id, "quiche_direct_rfc9220_tunnel_close");
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.source, "quiche_direct_rfc9220_tunnel_close_adapter");
+        assert!(row.p50_ttft_ns.is_some());
+        assert!(row.p95_ttft_ns.is_some());
+        assert!(row.bytes_per_sec.is_some_and(|throughput| throughput > 0.0));
+    }
+
+    #[tokio::test]
     async fn tokio_quiche_local_fixture_measures_rfc9220_tunnel_echo() {
         let fixture = super::LocalNativeH3Fixture::start("tokio_quiche_rfc9220_tunnel")
             .await
@@ -4623,6 +4701,24 @@ mod tests {
         assert_eq!(row.competitor_id, "tokio_quiche_rfc9220_tunnel");
         assert_eq!(row.status, "measured_pass");
         assert_eq!(row.source, "tokio_quiche_rfc9220_tunnel_adapter");
+        assert!(row.p50_ttft_ns.is_some());
+        assert!(row.p95_ttft_ns.is_some());
+        assert!(row.bytes_per_sec.is_some_and(|throughput| throughput > 0.0));
+    }
+
+    #[tokio::test]
+    async fn tokio_quiche_local_fixture_measures_rfc9220_tunnel_close_fin() {
+        let fixture = super::LocalNativeH3Fixture::start("tokio_quiche_rfc9220_tunnel_close")
+            .await
+            .unwrap();
+
+        let row = super::measure_tokio_quiche_rfc9220_tunnel_close(&fixture.tunnel_url(), 0, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(row.competitor_id, "tokio_quiche_rfc9220_tunnel_close");
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.source, "tokio_quiche_rfc9220_tunnel_close_adapter");
         assert!(row.p50_ttft_ns.is_some());
         assert!(row.p95_ttft_ns.is_some());
         assert!(row.bytes_per_sec.is_some_and(|throughput| throughput > 0.0));
