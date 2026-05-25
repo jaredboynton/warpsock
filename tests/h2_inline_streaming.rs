@@ -449,7 +449,9 @@ async fn large_streaming_body_avoids_driver_backpressure_stalls() {
     use http::Method;
     use specter::fingerprint::http2::Http2Settings;
     use specter::transport::connector::BoringConnector;
-    use specter::transport::h2::{H2BodyTimeouts, H2Connection, H2PooledConnection, PseudoHeaderOrder};
+    use specter::transport::h2::{
+        H2BodyTimeouts, H2Connection, H2PooledConnection, PseudoHeaderOrder,
+    };
     use specter::RequestBody;
 
     const BODY_LEN: usize = 6 * 1024 * 1024;
@@ -483,7 +485,7 @@ async fn large_streaming_body_avoids_driver_backpressure_stalls() {
                     request_stream_id = Some(stream_id);
                     let response_headers =
                         encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
-                    conn.send_headers(stream_id, &response_headers, false, false)
+                    conn.send_headers(stream_id, &response_headers, false, true)
                         .await
                         .unwrap();
                     let mut sent = 0usize;
