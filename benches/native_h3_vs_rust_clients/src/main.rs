@@ -2784,9 +2784,9 @@ fn measure_quiche_direct_rfc9220_tunnel_mixed_once(
     let mut tunnel_echoed = 0usize;
     let mut tunnel_finished = false;
     let mut tunnel_initial_delay_done = false;
-    let tunnel_payload = rfc9220_tunnel_payload(b'M');
     let expected_tunnel_bytes =
         LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE * LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
+    let tunnel_payload = Bytes::from(vec![b'M'; expected_tunnel_bytes]);
     let start = Instant::now();
     let deadline = start + adapter_timeout();
     let tunnel_headers = quiche_rfc9220_tunnel_headers(&tunnel_url)?;
@@ -2831,21 +2831,18 @@ fn measure_quiche_direct_rfc9220_tunnel_mixed_once(
             if !reqs_sent {
                 let opened_tunnel_stream_id =
                     http3.send_request(&mut conn, &tunnel_headers, false)?;
-                for index in 0..LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES {
-                    let fin = index + 1 == LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
-                    let written = http3.send_body(
-                        &mut conn,
-                        opened_tunnel_stream_id,
-                        tunnel_payload.as_ref(),
-                        fin,
-                    )?;
-                    if written != tunnel_payload.len() {
-                        anyhow::bail!(
-                            "quiche RFC 9220 mixed partial tunnel write: expected {}, wrote {}",
-                            tunnel_payload.len(),
-                            written
-                        );
-                    }
+                let written = http3.send_body(
+                    &mut conn,
+                    opened_tunnel_stream_id,
+                    tunnel_payload.as_ref(),
+                    true,
+                )?;
+                if written != tunnel_payload.len() {
+                    anyhow::bail!(
+                        "quiche RFC 9220 mixed partial tunnel write: expected {}, wrote {}",
+                        tunnel_payload.len(),
+                        written
+                    );
                 }
                 let opened_stream_id = http3.send_request(&mut conn, &stream_headers, true)?;
                 tunnel_stream_id = Some(opened_tunnel_stream_id);
