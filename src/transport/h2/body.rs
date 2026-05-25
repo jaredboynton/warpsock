@@ -733,7 +733,7 @@ impl H2DirectBody {
             conn.set_connection_recv_window(self.conn_recv_window);
             conn.set_stream_recv_window(self.stream_id, self.recv_window);
             if conn.is_reusable()
-                && self.conn_recv_window >= conn.flow_control_refresh_threshold()
+                && self.conn_recv_window >= conn.connection_flow_control_refresh_threshold()
                 && self.recv_window >= conn.flow_control_refresh_threshold()
             {
                 if let Some(on_reusable) = self.on_reusable.take() {
@@ -827,13 +827,14 @@ impl H2DirectBody {
             self.deferred_recv_bytes = 0;
         }
         self.conn_recv_window -= data_len as i32;
-        let conn_increment = if self.conn_recv_window < conn.flow_control_refresh_threshold() {
-            let increment = conn.flow_control_refresh_increment();
-            self.conn_recv_window = self.conn_recv_window.saturating_add(increment as i32);
-            Some(increment)
-        } else {
-            None
-        };
+        let conn_increment =
+            if self.conn_recv_window < conn.connection_flow_control_refresh_threshold() {
+                let increment = conn.connection_flow_control_refresh_increment();
+                self.conn_recv_window = self.conn_recv_window.saturating_add(increment as i32);
+                Some(increment)
+            } else {
+                None
+            };
         if data_len > 0 {
             self.recv_window -= data_len as i32;
         }

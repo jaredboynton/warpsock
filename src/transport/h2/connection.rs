@@ -225,14 +225,15 @@ where
 
         let settings_bytes = settings_frame.serialize();
 
-        // Send WINDOW_UPDATE for connection-level window (configurable per profile)
-        let window_update = WindowUpdateFrame::new(0, settings.initial_window_update);
-
         // Combine all handshake frames into a single write to minimize packets/TLS records
         let mut handshake_buf = BytesMut::new();
         handshake_buf.extend_from_slice(CONNECTION_PREFACE);
         handshake_buf.extend_from_slice(&settings_bytes);
-        handshake_buf.extend_from_slice(&window_update.serialize());
+        if settings.initial_window_update > 0 {
+            // Send WINDOW_UPDATE for connection-level window (configurable per profile)
+            let window_update = WindowUpdateFrame::new(0, settings.initial_window_update);
+            handshake_buf.extend_from_slice(&window_update.serialize());
+        }
 
         // Send PRIORITY frames if configured (Chrome/Firefox fingerprint)
         if let Some(ref priority_tree) = settings.priority_tree {
@@ -263,7 +264,7 @@ where
             settings: settings.clone(),
             pseudo_order,
             streams: HashMap::new(),
-            conn_recv_window: (DEFAULT_INITIAL_WINDOW_SIZE + settings.initial_window_update) as i32,
+            conn_recv_window: Self::initial_connection_recv_window(&settings),
             peer_settings: PeerSettings::default(),
             peer_max_frame_size: Arc::new(AtomicU32::new(DEFAULT_MAX_FRAME_SIZE)),
             read_buf: BytesMut::with_capacity(DEFAULT_READ_BUFFER_CAPACITY),
@@ -1089,19 +1090,27 @@ where
     /// refresh threshold is crossed.
     #[inline]
     pub fn apply_conn_inbound_flow_control_delta(&mut self, data_len: usize) -> Option<u32> {
-        Self::apply_conn_inbound_flow_control_delta_to(&mut self.conn_recv_window, data_len)
+        let threshold = Self::connection_flow_control_refresh_threshold_for(&self.settings);
+        let increment = Self::connection_flow_control_refresh_increment_for(&self.settings);
+        Self::apply_conn_inbound_flow_control_delta_to(
+            &mut self.conn_recv_window,
+            data_len,
+            threshold,
+            increment,
+        )
     }
 
     #[inline]
     pub(crate) fn apply_conn_inbound_flow_control_delta_to(
         recv_window: &mut i32,
         data_len: usize,
+        refresh_threshold: i32,
+        refresh_increment: u32,
     ) -> Option<u32> {
         *recv_window -= data_len as i32;
-        if *recv_window < WINDOW_UPDATE_THRESHOLD {
-            let increment = DEFAULT_INITIAL_WINDOW_SIZE;
-            *recv_window += increment as i32;
-            Some(increment)
+        if *recv_window < refresh_threshold {
+            *recv_window = recv_window.saturating_add(refresh_increment as i32);
+            Some(refresh_increment)
         } else {
             None
         }
@@ -1142,6 +1151,31 @@ where
     /// updates after the window drops below the refresh threshold.
     pub fn flow_control_refresh_increment(&self) -> u32 {
         DEFAULT_INITIAL_WINDOW_SIZE
+    }
+
+    pub(crate) fn connection_flow_control_refresh_threshold(&self) -> i32 {
+        Self::connection_flow_control_refresh_threshold_for(&self.settings)
+    }
+
+    pub(crate) fn connection_flow_control_refresh_increment(&self) -> u32 {
+        Self::connection_flow_control_refresh_increment_for(&self.settings)
+    }
+
+    fn initial_connection_recv_window(settings: &Http2Settings) -> i32 {
+        (DEFAULT_INITIAL_WINDOW_SIZE as u64 + settings.initial_window_update as u64)
+            .min(i32::MAX as u64) as i32
+    }
+
+    fn connection_flow_control_refresh_threshold_for(settings: &Http2Settings) -> i32 {
+        Self::initial_connection_recv_window(settings) / 2
+    }
+
+    fn connection_flow_control_refresh_increment_for(settings: &Http2Settings) -> u32 {
+        if settings.initial_window_update == 0 {
+            DEFAULT_INITIAL_WINDOW_SIZE
+        } else {
+            settings.initial_window_update.min(i32::MAX as u32)
+        }
     }
 
     /// Accumulated released-bytes threshold before the driver sends a stream
@@ -2009,12 +2043,14 @@ where
             }
         }
 
-        let conn_increment = if self.conn_recv_window < WINDOW_UPDATE_THRESHOLD {
-            self.conn_recv_window += DEFAULT_INITIAL_WINDOW_SIZE as i32;
-            Some(DEFAULT_INITIAL_WINDOW_SIZE)
-        } else {
-            None
-        };
+        let conn_increment =
+            if self.conn_recv_window < self.connection_flow_control_refresh_threshold() {
+                let increment = self.connection_flow_control_refresh_increment();
+                self.conn_recv_window = self.conn_recv_window.saturating_add(increment as i32);
+                Some(increment)
+            } else {
+                None
+            };
 
         Ok((conn_increment, stream_increment))
     }
@@ -2295,5 +2331,60 @@ where
         self.write_half
             .write_goaway(last_stream_id, error_code)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+
+    #[test]
+    fn connection_flow_control_refresh_uses_advertised_increment() {
+        let settings = Http2Settings::default();
+        let mut recv_window =
+            H2Connection::<DuplexStream>::initial_connection_recv_window(&settings);
+
+        let increment = H2Connection::<DuplexStream>::apply_conn_inbound_flow_control_delta_to(
+            &mut recv_window,
+            9 * 1024 * 1024,
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_threshold_for(&settings),
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_increment_for(&settings),
+        );
+
+        assert_eq!(increment, Some(CHROME_WINDOW_UPDATE));
+    }
+
+    #[test]
+    fn connection_flow_control_does_not_refresh_above_half_window() {
+        let settings = Http2Settings::default();
+        let mut recv_window =
+            H2Connection::<DuplexStream>::initial_connection_recv_window(&settings);
+
+        let increment = H2Connection::<DuplexStream>::apply_conn_inbound_flow_control_delta_to(
+            &mut recv_window,
+            7 * 1024 * 1024,
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_threshold_for(&settings),
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_increment_for(&settings),
+        );
+
+        assert_eq!(increment, None);
+    }
+
+    #[test]
+    fn connection_flow_control_zero_initial_update_falls_back_to_default_increment() {
+        let mut settings = Http2Settings::default();
+        settings.initial_window_update = 0;
+        let mut recv_window =
+            H2Connection::<DuplexStream>::initial_connection_recv_window(&settings);
+
+        let increment = H2Connection::<DuplexStream>::apply_conn_inbound_flow_control_delta_to(
+            &mut recv_window,
+            40 * 1024,
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_threshold_for(&settings),
+            H2Connection::<DuplexStream>::connection_flow_control_refresh_increment_for(&settings),
+        );
+
+        assert_eq!(increment, Some(DEFAULT_INITIAL_WINDOW_SIZE));
     }
 }
