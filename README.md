@@ -101,6 +101,27 @@ let client = Client::builder()
 - `http2_settings(...)` / `pseudo_order(...)` let you override SETTINGS frames and pseudo header ordering when you need to mimic a different browser or experiment with fingerprints.
 - `h3_upgrade(false)` disables Alt-Svc based HTTP/3 upgrades if you want deterministic TCP-only behavior.
 
+### Cross-protocol capacity policy
+
+Use `CapacityPolicy` when callers need one protocol-neutral capacity control surface instead of separate H1/H2/H3 knobs:
+
+```rust
+use specter::{CapacityPolicy, Client};
+
+let client = Client::builder()
+    .capacity_policy(
+        CapacityPolicy::bounded(32)
+            .with_streaming_body_buffer_slots(16)
+            .with_h3_tunnel_byte_budget(512 * 1024),
+    )
+    .build()?;
+```
+
+- `CapacityPolicy::bounded(n)` applies `n` to H1 active connection slots per origin, H2 local max concurrent stream slots, and the default H2/H3 streaming body queue slots.
+- `with_streaming_body_buffer_slots(n)` sets the shared H2/H3 streaming response body queue depth when body pressure should differ from request concurrency.
+- `with_h3_tunnel_byte_budget(bytes)` sets symmetric RFC 9220 inbound/outbound tunnel byte budgets; use `with_h3_tunnel_outbound_byte_budget(...)` and `with_h3_tunnel_inbound_byte_budget(...)` for asymmetric tunnel pressure.
+- Protocol-specific builder methods remain available for one-off overrides, but `capacity_policy(...)` is the documented cross-protocol default for API consumers.
+
 ### Redirects, retries, and cookies stay under your control
 
 Specter never follows redirects or stores cookies automatically by default. That is intentional so you can replay the exact browser flow the target expects. You can opt in:
@@ -256,7 +277,7 @@ Specter's native HTTP/3 path also has a local same-fixture comparator matrix aga
 | quiche direct | HTTP/3 client | 2.812 ms | 3.227 ms | 6.91 MiB/s |
 | tokio-quiche | HTTP/3 client | 3.483 ms | 4.198 ms | 6.20 MiB/s |
 
-That gate is explicitly for HTTP/3 request/response workloads. `quinn_transport` and `s2n_quic_transport` are separate QUIC transport-only evidence, not H3 HTTP comparator rows. Native QUIC production hardening remains active work for broader recovery soak/backoff validation and browser ACK parity.
+That gate is explicitly for HTTP/3 request/response workloads. `quinn_transport` and `s2n_quic_transport` are separate QUIC transport-only evidence, not H3 HTTP comparator rows. Native QUIC recovery, fallback, browser ACK parity, capture presets, and capacity-policy hardening are tracked as closed regression guards in [`docs/specter-native-h3-remaining-seams.md`](docs/specter-native-h3-remaining-seams.md).
 
 ### Local RFC 9220 WebSocket-over-H3 tunnel suite vs quiche / tokio-quiche
 
@@ -324,6 +345,8 @@ The story isn't median — it's the tail. tokio-tungstenite has dramatically wor
 
 Optimizations applied to win the tail/local echo gate: pre-allocated 16 KB read buffer on `WebSocket::new`, reused frame encode buffer, CSPRNG-backed mask key cache (one `getrandom` syscall per 64 outbound frames instead of per-frame), word-sized payload masking, and `#[inline]` on the frame decode hot path. Source: [`src/websocket/frame.rs`](src/websocket/frame.rs), [`src/websocket/connection.rs`](src/websocket/connection.rs).
 
+The RFC 6455 API exposes both message-level and frame-level control: `WebSocket::split()` returns independent `WebSocketReader` / `WebSocketWriter` halves, `next_frame()` exposes raw frame boundaries for callers that need fragmentation visibility, and `PreparedMessage` with `send_prepared` / `send_prepared_batch` supports reusable text/binary payloads with fresh client masks per send.
+
 Run with `cargo bench --bench codex_ws_streaming`.
 
 ## Implementation
@@ -338,9 +361,9 @@ Run with `cargo bench --bench codex_ws_streaming`.
 - All headers properly lowercased per RFC 7540/9113
 - True multiplexing (concurrent requests on single connection, respecting `MAX_CONCURRENT_STREAMS`)
 
-**HTTP/3** - Native QUIC/H3 implementation under `src/transport/h3`, with request streaming, browser-shaped H3/QUIC fingerprint controls, and RFC 9220 WebSocket-over-H3 tunnels. The H3 benchmark matrix uses `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest_h3` as comparator baselines; production-grade native QUIC recovery/fallback hardening is still active work.
+**HTTP/3** - Native QUIC/H3 implementation under `src/transport/h3`, with request streaming, browser-shaped H3/QUIC fingerprint controls, RFC 9220 WebSocket-over-H3 tunnels, and public capacity snapshots. The H3 benchmark matrix uses `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest_h3` as comparator baselines; current native H3 gap status lives in [`docs/specter-native-h3-remaining-seams.md`](docs/specter-native-h3-remaining-seams.md).
 
-**WebSockets** - RFC 6455 client over HTTP/1.1 Upgrade, RFC 8441 Extended CONNECT tunnels over HTTP/2, and RFC 9220 Extended CONNECT tunnels over native HTTP/3. Compression extensions are intentionally not negotiated.
+**WebSockets** - RFC 6455 client over HTTP/1.1 Upgrade, RFC 8441 Extended CONNECT tunnels over HTTP/2, and RFC 9220 Extended CONNECT tunnels over native HTTP/3. The H1 RFC 6455 surface includes split read/write halves, raw frame receive helpers, prepared reusable messages, and batched prepared writes. Compression extensions are intentionally not negotiated unless a product caller requires permessage-deflate.
 
 **TLS** - BoringSSL configured with Chrome cipher suites, curves, and signature algorithms. The TLS configuration is identical across Chrome 142-148. BoringSSL does its own extension randomization (which matches Chrome's behavior for TLS 1.3).
 
