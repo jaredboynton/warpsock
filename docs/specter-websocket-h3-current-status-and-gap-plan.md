@@ -16,17 +16,8 @@ This file is the current cross-protocol capability and gap plan for requests, st
 | H2 requests/streaming | Production proof exists against reqwest. | Yes, stream multiplexing over one TCP/TLS connection. | Custom H2 stack controls pseudo-header order, HPACK, SETTINGS, flow-control cadence, priority behavior, TLS. | `docs/benchmarks/2026-05-24-streaming/` | Add raw `h2`/`hyper` comparator rows if transport-overhead isolation is needed. |
 | H2 WebSocket (RFC8441) | Implemented as raw byte tunnel. | Yes, Extended CONNECT stream multiplexing when peer enables `SETTINGS_ENABLE_CONNECT_PROTOCOL`. | Custom H2 behavior plus tunnel pacing/backpressure. | README/API docs and RFC8441 tests. | Higher-level ergonomics if callers need RFC6455 framing over the tunnel. |
 | H3 HTTP | Native runtime proof exists. | Yes, QUIC stream multiplexing. | Native QUIC/H3 controls ACK cadence, transport params, H3 settings, QPACK, flow control, scheduling, packet sizing, TLS/0-RTT policy. | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-25-rfc9220-suite-n100.json` | Path migration integration, recovery soak, browser ACK parity, capture presets. |
-| H3 WebSocket (RFC9220) | Implemented as raw byte tunnel. | Yes, Extended CONNECT over H3/QUIC streams. | Native QUIC/H3 controls plus byte-bounded tunnel backpressure and fair tunnel/response scheduling. | Same artifact has echo/close/mixed rows and the full-suite superiority gate. | Connection-amortized comparator parity and public tunnel capacity metrics if callers need them. |
+| H3 WebSocket (RFC9220) | Implemented as raw byte tunnel. | Yes, Extended CONNECT over H3/QUIC streams. | Native QUIC/H3 controls plus byte-bounded tunnel backpressure, public tunnel capacity snapshots, and fair tunnel/response scheduling. | Same artifact has echo/close/mixed rows and the full-suite superiority gate. | Connection-amortized comparator parity and unified cross-protocol capacity policy if callers need it. |
 | QUIC transport baselines | Measured comparator-only rows exist. | QUIC stream multiplexing, but not HTTP/H3. | Lower-layer transport behavior only. | `docs/benchmarks/native-h3-vs-rust-clients/2026-05-24-quic-transport-local.json` and `2026-05-24-s2n-quic-transport-local.json` | Not an H3 production gap; keep out of H3 gates. |
-
-## Direct Answers
-
-- H1 protocol multiplexing is not possible in the H2/H3 sense. HTTP/1.1 supports connection reuse and pipelining, but pipelining has head-of-line blocking and is not equivalent to stream multiplexing.
-- For H1 WebSockets, one upgraded connection carries one ordered WebSocket message stream. Scale capacity through connection pooling/sharding, not protocol-level multiplexing.
-- H2 supports WebSockets through RFC8441 Extended CONNECT when the peer advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
-- H3 supports WebSocket-style byte tunnels through RFC9220 Extended CONNECT. Specter's current H3 API is a raw byte tunnel, not an RFC6455 frame parser layered on top.
-- Specter's main H2 and H3 runtimes are hand-rolled. Third-party H3 clients are benchmark comparators, not runtime dependencies.
-- BoringSSL remains the TLS backend; native fingerprinting can drive exposed TLS knobs, but exact extension-list ordering is still bounded by what the backend permits.
 
 ## Runtime / Comparator Boundary
 
@@ -51,7 +42,7 @@ This file is the current cross-protocol capability and gap plan for requests, st
 | P1 | Recovery soak/backoff validation | H3 runtime production readiness. | Stress repeated loss/PTO/backoff/persistent congestion and client/server app retransmission under load. |
 | P2 | Browser ACK parity | H3 fingerprinting and performance. | Capture Chrome/Firefox ACK thresholds and delays by version and compare with `ack_eliciting_threshold` / `max_ack_delay_ms`. |
 | P2 | TLS/H3 capture presets | H3 fingerprinting. | Add capture-derived raw transport-parameter presets and explicit extension-list ordering where possible beyond BoringSSL permutation policy. |
-| P2 | Public capacity APIs | Requests, streaming, WebSockets, tunnels. | Expose or document pending-byte/backpressure metrics and unified max-pending policies across H1/H2/H3 where callers need them. |
+| P2 | Cross-protocol capacity policy | Requests, streaming, WebSockets, tunnels. | Native H3/RFC9220 capacity snapshots exist; design unified max-pending policies across H1/H2/H3 only where callers need one shared control surface. |
 | P3 | WebSocket ergonomics | H1 RFC6455 and RFC8441/RFC9220 wrappers. | Add frame-level receive, streaming reader/writer, split contracts, cork/writev policy, prepared-message/broadcast APIs, and optional permessage-deflate only if product use cases require them. |
 
 ## Not Active Gaps Anymore
@@ -76,6 +67,7 @@ This file is the current cross-protocol capability and gap plan for requests, st
 | H3 scheduling | Request-body/tunnel class fairness, per-stream rotation, adaptive send budgets, and origin-fair fresh-connect admission exist. |
 | RFC9220 backpressure | Outbound tunnel sends are byte-budgeted and inbound tunnel delivery is guarded by receive-side byte permits. |
 | H3 receive flow control | Public body/tunnel byte consumption drives absolute MAX_DATA/MAX_STREAM_DATA credit. |
+| H3/RFC9220 capacity metrics | `Body::h3_capacity()` reports native H3 streaming body buffer pressure; `H3Tunnel::capacity()` reports RFC9220 inbound/outbound byte-budget pressure. |
 
 ## Comparator / Proof Status
 
@@ -93,4 +85,4 @@ This file is the current cross-protocol capability and gap plan for requests, st
 2. Run recovery soak/backoff validation after path migration work stops touching the driver hot path.
 3. Capture browser ACK behavior and map it to Specter's fingerprint knobs.
 4. Add capture-derived H3/TLS presets where backend control is sufficient.
-5. Decide whether public capacity metrics and WebSocket ergonomics are product requirements before adding API surface.
+5. Decide whether unified cross-protocol capacity policy and WebSocket ergonomics are product requirements before adding more API surface.

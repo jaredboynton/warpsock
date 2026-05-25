@@ -29,7 +29,7 @@ This is the current native H3 gap ledger. It is intentionally not a change log.
 | P1 | Recovery soak/backoff validation | RFC9002-style recovery/PTO implementation is wired through client/server packet spaces and app data retransmit paths. | Longer soak/backoff runs that exercise repeated loss, PTO backoff/reset, persistent congestion, and server/client app-space retransmission under load. |
 | P2 | Browser ACK parity | Threshold + `max_ack_delay_ms` timer paths exist for client/server/fixture, including tuned benchmark profile support. | Capture Chrome/Firefox QUIC ACK thresholds/delays by version and compare against Specter defaults and `ack_eliciting_threshold = 128`. |
 | P2 | TLS/H3 capture presets | Certificate compression, deterministic-vs-browser-permuted extension policy, raw ordered transport parameters, session replay, and 0-RTT controls exist. | Capture-derived raw transport-parameter presets and explicit extension-list ordering beyond BoringSSL permutation policy. |
-| P2 | Public capacity APIs | Internal byte-bounded H3 body/tunnel flow control and fair send scheduling exist. | Public byte-level pending/backpressure metrics for RFC9220 and unified H1/H2/H3 capacity knobs where API consumers need them. |
+| P2 | Cross-protocol capacity policy | Native H3 streaming bodies and RFC9220 tunnels expose public capacity snapshots; internal byte-bounded H3 body/tunnel flow control and fair send scheduling exist. | Unified H1/H2/H3 capacity knobs and policy docs where API consumers need one cross-protocol control surface. |
 
 ## Closed Gaps / Regression Guards
 
@@ -55,6 +55,7 @@ Keep these under regression coverage; do not relist them as active gaps.
 | Raw ordered transport parameters | Caller-supplied raw ordered QUIC transport parameter lists encode in order with dynamic CID placeholders and pool-key separation. |
 | H3 scheduling/fairness | Request-body/tunnel DATA class rotation, per-stream rotation, adaptive DATA budgets, and origin-fair slow-path dispatch are implemented. |
 | Flow control/backpressure | Streaming responses and RFC9220 tunnels release receive credit on public byte consumption; RFC9220 outbound sends use byte permits and release them on transmit. |
+| H3/RFC9220 capacity metrics | `Body::h3_capacity()` reports native H3 streaming body buffer pressure; `H3Tunnel::capacity()` reports RFC9220 inbound/outbound byte-budget pressure. |
 | RFC9220 comparator rows | Specter echo/close/mixed rows and low-level `quiche`/`tokio-quiche` echo/close/mixed rows are persisted at n=100. |
 | Transport-only adapters | `quinn_transport` and optional `s2n_quic_transport` have measured rows and are explicitly outside H3 superiority gates. |
 
@@ -92,7 +93,7 @@ Unsupported RFC9220 capability-audit rows remain explicit non-comparators: `h3_q
 2. Run recovery soak/backoff validation across repeated loss, PTO, app retransmission, and persistent congestion cases.
 3. Capture browser ACK behavior and calibrate native ACK thresholds/timers against Chrome/Firefox versions.
 4. Add capture-derived TLS/H3 presets for raw transport parameters and extension ordering where BoringSSL allows control.
-5. Promote public RFC9220 queued-byte/backpressure metrics if API consumers need unified capacity reporting.
+5. Design unified H1/H2/H3 capacity knobs only if API consumers need one cross-protocol control surface.
 
 ## Validation Commands
 
