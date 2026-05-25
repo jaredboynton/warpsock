@@ -8,6 +8,7 @@
 // Core modules
 pub mod auth;
 pub mod cache;
+pub mod url;
 pub mod cookie;
 pub mod error;
 pub mod headers;
@@ -31,8 +32,10 @@ pub use cookie::{hash_cookie_value, CookieJar};
 pub use error::{Error, Result};
 pub use fingerprint::{FingerprintProfile, PriorityTree};
 pub use headers::Headers;
+pub use headers::HeadersBuilder;
 pub use headers::OrderedHeaders;
 pub use request::{IntoUrl, RedirectPolicy, Request, RequestBody, RequestBodyStream};
+pub use url::Url;
 pub use response::{Body, Response};
 pub use timeouts::{recv_with_idle_timeout, Timeouts};
 pub use version::HttpVersion;
@@ -52,7 +55,7 @@ pub use transport::h1_h2::{
 pub use transport::h2::{H2ClientBuilder, H2Connection, H2PooledConnection, PseudoHeaderOrder};
 pub use transport::h3::{H3Backend, H3Client, H3TransportConfig, H3Tunnel, H3TunnelEvent};
 pub use transport::session::SessionCache;
-pub use transport::tcp::TcpFingerprint;
+pub use transport::tcp::{TcpFingerprint, TcpSocketBuffers};
 
 // Pool re-exports
 pub use pool::alt_svc::{AltSvcCache, AltSvcEntry};

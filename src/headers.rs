@@ -4,7 +4,9 @@
 //! Supported Firefox versions: 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, ESR 115, ESR 128, ESR 140
 
 use crate::cookie::CookieJar;
+use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
+use std::sync::{Arc, OnceLock};
 
 /// Chrome 142 browser headers for page navigation.
 pub fn chrome_142_headers() -> Vec<(&'static str, &'static str)> {
@@ -696,26 +698,29 @@ pub fn chrome_148_form_headers() -> Vec<(&'static str, &'static str)> {
 
 /// Add Cookie header from jar.
 pub fn with_cookies(base: impl Into<Headers>, url: &str, jar: &CookieJar) -> Headers {
-    let mut headers: Headers = base.into();
-    headers.remove("cookie");
+    let base = base.into();
+    let mut builder = HeadersBuilder::from_headers(&base);
+    builder.remove("cookie");
     if let Some(cookie_header) = jar.build_cookie_header(url) {
-        headers.append("Cookie", cookie_header);
+        builder.insert("Cookie", cookie_header);
     }
-    headers
+    builder.build()
 }
 
 /// Add Origin header.
-pub fn with_origin(mut headers: Headers, origin: &str) -> Headers {
-    headers.remove("origin");
-    headers.append("Origin", origin.to_string());
-    headers
+pub fn with_origin(headers: Headers, origin: &str) -> Headers {
+    let mut builder = HeadersBuilder::from_headers(&headers);
+    builder.remove("origin");
+    builder.insert("Origin", origin);
+    builder.build()
 }
 
 /// Add Referer header.
-pub fn with_referer(mut headers: Headers, referer: &str) -> Headers {
-    headers.remove("referer");
-    headers.append("Referer", referer.to_string());
-    headers
+pub fn with_referer(headers: Headers, referer: &str) -> Headers {
+    let mut builder = HeadersBuilder::from_headers(&headers);
+    builder.remove("referer");
+    builder.insert("Referer", referer);
+    builder.build()
 }
 
 /// Convert owned headers to references.
@@ -731,56 +736,111 @@ pub fn headers_to_owned(headers: Vec<(&'static str, &'static str)>) -> Vec<(Stri
         .collect()
 }
 
-/// Ordered headers for requests and responses.
-///
-/// This preserves insertion order for fingerprinting while providing
-/// convenient lookup and mutation helpers.
-#[derive(Debug, Clone, Default)]
-pub struct Headers {
-    headers: Vec<(String, String)>,
+/// Byte span into a contiguous header buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderSpan {
+    name_start: u32,
+    name_len: u32,
+    value_start: u32,
+    value_len: u32,
 }
 
-impl Headers {
+impl HeaderSpan {
+    fn name<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        let start = self.name_start as usize;
+        &buf[start..start + self.name_len as usize]
+    }
+
+    fn value<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        let start = self.value_start as usize;
+        &buf[start..start + self.value_len as usize]
+    }
+}
+
+fn name_eq_ignore_ascii_case(buf: &[u8], span: &HeaderSpan, name: &[u8]) -> bool {
+    let header_name = span.name(buf);
+    header_name.len() == name.len()
+        && header_name
+            .iter()
+            .zip(name)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn push_header_bytes(buf: &mut BytesMut, spans: &mut Vec<HeaderSpan>, name: &[u8], value: &[u8]) {
+    let name_start = buf.len() as u32;
+    buf.extend_from_slice(name);
+    let name_len = name.len() as u32;
+    let value_start = buf.len() as u32;
+    buf.extend_from_slice(value);
+    let value_len = value.len() as u32;
+    spans.push(HeaderSpan {
+        name_start,
+        name_len,
+        value_start,
+        value_len,
+    });
+}
+
+/// Mutable builder for byte-spanned headers.
+#[derive(Debug, Default)]
+pub struct HeadersBuilder {
+    buf: BytesMut,
+    spans: Vec<HeaderSpan>,
+}
+
+impl HeadersBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn from_vec(headers: Vec<(String, String)>) -> Self {
-        Self { headers }
-    }
-
-    pub fn from_static(headers: Vec<(&'static str, &'static str)>) -> Self {
+    pub fn with_capacity(header_count: usize, byte_capacity: usize) -> Self {
         Self {
-            headers: headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            buf: BytesMut::with_capacity(byte_capacity),
+            spans: Vec::with_capacity(header_count),
         }
     }
 
+    pub fn from_headers(headers: &Headers) -> Self {
+        let mut builder = Self::with_capacity(headers.len(), headers.buf.len());
+        for (name, value) in headers.iter_bytes() {
+            builder.push(name, value);
+        }
+        builder
+    }
+
     pub fn len(&self) -> usize {
-        self.headers.len()
+        self.spans.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.headers.is_empty()
+        self.spans.is_empty()
     }
 
-    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        let name = name.into();
-        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
-        self.headers.push((name, value.into()));
+    pub fn push(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        push_header_bytes(
+            &mut self.buf,
+            &mut self.spans,
+            name.as_ref(),
+            value.as_ref(),
+        );
     }
 
-    pub fn append(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.headers.push((name.into(), value.into()));
+    pub fn append(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        self.push(name, value);
     }
 
-    pub fn remove(&mut self, name: &str) -> Option<Vec<String>> {
+    pub fn insert(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        let name = name.as_ref();
+        self.spans.retain(|span| !name_eq_ignore_ascii_case(&self.buf, span, name));
+        self.push(name, value);
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Vec<Vec<u8>>> {
+        let name = name.as_bytes();
         let mut removed = Vec::new();
-        self.headers.retain(|(k, v)| {
-            if k.eq_ignore_ascii_case(name) {
-                removed.push(v.clone());
+        self.spans.retain(|span| {
+            if name_eq_ignore_ascii_case(&self.buf, span, name) {
+                removed.push(span.value(&self.buf).to_vec());
                 false
             } else {
                 true
@@ -793,22 +853,21 @@ impl Headers {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find_map(|(k, v)| {
-            if k.eq_ignore_ascii_case(name) {
-                Some(v.as_str())
-            } else {
-                None
-            }
-        })
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        let name = name.as_bytes();
+        self.spans
+            .iter()
+            .find(|span| name_eq_ignore_ascii_case(&self.buf, span, name))
+            .map(|span| span.value(&self.buf))
     }
 
-    pub fn get_all(&self, name: &str) -> Vec<&str> {
-        self.headers
+    pub fn get_all(&self, name: &str) -> Vec<&[u8]> {
+        let name = name.as_bytes();
+        self.spans
             .iter()
-            .filter_map(|(k, v)| {
-                if k.eq_ignore_ascii_case(name) {
-                    Some(v.as_str())
+            .filter_map(|span| {
+                if name_eq_ignore_ascii_case(&self.buf, span, name) {
+                    Some(span.value(&self.buf))
                 } else {
                     None
                 }
@@ -820,35 +879,154 @@ impl Headers {
         self.get(name).is_some()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        self.spans.iter().map(|span| {
+            (
+                span.name(&self.buf),
+                span.value(&self.buf),
+            )
+        })
     }
 
-    pub fn iter_ordered(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub fn build(self) -> Headers {
+        Headers {
+            buf: self.buf.freeze(),
+            spans: Arc::from(self.spans.into_boxed_slice()),
+        }
+    }
+}
+
+/// Ordered headers for requests and responses.
+///
+/// This preserves insertion order for fingerprinting while providing
+/// convenient lookup and mutation helpers.
+#[derive(Debug, Clone, Default)]
+pub struct Headers {
+    buf: Bytes,
+    spans: Arc<[HeaderSpan]>,
+}
+
+impl Headers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_vec(headers: Vec<(String, String)>) -> Self {
+        let mut builder = HeadersBuilder::with_capacity(headers.len(), headers.len() * 32);
+        for (name, value) in headers {
+            builder.push(name.as_bytes(), value.as_bytes());
+        }
+        builder.build()
+    }
+
+    pub fn from_static(headers: Vec<(&'static str, &'static str)>) -> Self {
+        let mut builder = HeadersBuilder::with_capacity(headers.len(), headers.len() * 32);
+        for (name, value) in headers {
+            builder.push(name.as_bytes(), value.as_bytes());
+        }
+        builder.build()
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let mut builder = HeadersBuilder::from_headers(self);
+        builder.insert(name.into(), value.into());
+        *self = builder.build();
+    }
+
+    pub fn append(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let mut builder = HeadersBuilder::from_headers(self);
+        builder.append(name.into(), value.into());
+        *self = builder.build();
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Vec<String>> {
+        let mut builder = HeadersBuilder::from_headers(self);
+        let removed = builder.remove(name).map(|values| {
+            values
+                .into_iter()
+                .map(|value| String::from_utf8_lossy(&value).into_owned())
+                .collect()
+        });
+        *self = builder.build();
+        removed
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let name = name.as_bytes();
+        self.spans
+            .iter()
+            .find(|span| name_eq_ignore_ascii_case(&self.buf, span, name))
+            .and_then(|span| std::str::from_utf8(span.value(&self.buf)).ok())
+    }
+
+    pub fn get_all(&self, name: &str) -> Vec<&str> {
+        let name = name.as_bytes();
+        self.spans
+            .iter()
+            .filter_map(|span| {
+                if name_eq_ignore_ascii_case(&self.buf, span, name) {
+                    std::str::from_utf8(span.value(&self.buf)).ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    pub fn iter_bytes(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        self.spans.iter().map(|span| {
+            (
+                span.name(&self.buf),
+                span.value(&self.buf),
+            )
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.iter_bytes().filter_map(|(name, value)| {
+            Some((
+                std::str::from_utf8(name).ok()?,
+                std::str::from_utf8(value).ok()?,
+            ))
+        })
+    }
+
+    pub fn iter_ordered(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.iter()
     }
 
     pub fn extend(&mut self, other: Headers) {
-        self.headers.extend(other.headers);
-    }
-
-    pub fn as_slice(&self) -> &[(String, String)] {
-        &self.headers
+        let mut builder = HeadersBuilder::from_headers(self);
+        for (name, value) in other.iter_bytes() {
+            builder.append(name, value);
+        }
+        *self = builder.build();
     }
 
     pub fn as_refs(&self) -> Vec<(&str, &str)> {
-        self.headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
+        self.iter().collect()
     }
 
     pub fn to_vec(&self) -> Vec<(String, String)> {
-        self.headers.clone()
+        self.iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
     }
 
     pub fn into_inner(self) -> Vec<(String, String)> {
-        self.headers
+        self.to_vec()
     }
 }
 
@@ -866,15 +1044,17 @@ impl From<Vec<(&'static str, &'static str)>> for Headers {
 
 impl From<HeaderMap> for Headers {
     fn from(map: HeaderMap) -> Self {
-        let mut headers = Vec::new();
+        let mut builder = HeadersBuilder::with_capacity(map.len(), map.len() * 32);
         for (name, value) in map.iter() {
-            let value = value
-                .to_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned());
-            headers.push((name.as_str().to_string(), value));
+            builder.append(name.as_str(), value.as_bytes());
         }
-        Headers { headers }
+        builder.build()
+    }
+}
+
+impl From<HeadersBuilder> for Headers {
+    fn from(builder: HeadersBuilder) -> Self {
+        builder.build()
     }
 }
 
@@ -889,31 +1069,61 @@ impl From<HeaderMap> for Headers {
 /// change the User-Agent value are not JA4H-distinguishable here.
 ///
 /// This type preserves exact header order for fingerprint accuracy.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OrderedHeaders {
-    headers: Vec<(String, String)>,
+    headers: Headers,
+    cached_pairs: OnceLock<Arc<[(String, String)]>>,
 }
+
+impl Clone for OrderedHeaders {
+    fn clone(&self) -> Self {
+        Self {
+            headers: self.headers.clone(),
+            cached_pairs: OnceLock::new(),
+        }
+    }
+}
+
+static CHROME_NAVIGATION_HEADERS: OnceLock<OrderedHeaders> = OnceLock::new();
+static FIREFOX_NAVIGATION_HEADERS: OnceLock<OrderedHeaders> = OnceLock::new();
 
 impl OrderedHeaders {
     /// Create new ordered headers.
     pub fn new(headers: Vec<(String, String)>) -> Self {
-        Self { headers }
+        Self {
+            headers: Headers::from_vec(headers),
+            cached_pairs: OnceLock::new(),
+        }
     }
 
     /// Create Chrome navigation headers with exact order.
     /// Uses Chrome 148 (latest implemented) by default.
     pub fn chrome_navigation() -> Self {
-        Self::new(headers_to_owned(chrome_148_headers()))
+        CHROME_NAVIGATION_HEADERS
+            .get_or_init(|| Self::new(headers_to_owned(chrome_148_headers())))
+            .clone()
     }
 
     /// Create Firefox navigation headers with exact order.
     /// Uses Firefox 151 (latest implemented release) by default.
     pub fn firefox_navigation() -> Self {
-        Self::new(headers_to_owned(firefox_151_headers()))
+        FIREFOX_NAVIGATION_HEADERS
+            .get_or_init(|| Self::new(headers_to_owned(firefox_151_headers())))
+            .clone()
     }
 
-    /// Get headers as vector.
+    /// Get headers as vector pairs (cached for stable references).
     pub fn headers(&self) -> &[(String, String)] {
+        self.cached_pairs
+            .get_or_init(|| {
+                let pairs = self.headers.to_vec();
+                Arc::from(pairs.into_boxed_slice())
+            })
+            .as_ref()
+    }
+
+    /// Borrow the underlying byte-spanned headers.
+    pub fn headers_ref(&self) -> &Headers {
         &self.headers
     }
 
@@ -925,22 +1135,18 @@ impl OrderedHeaders {
     pub fn ja4h_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
 
-        // Extract header names (lowercase) in order
         let header_names: Vec<String> = self
             .headers
             .iter()
             .map(|(name, _)| name.to_lowercase())
             .collect();
 
-        // Create header names string
         let names_str = header_names.join(",");
 
-        // Calculate hash of header order (using names for simplicity)
         let mut hasher = Sha256::new();
         hasher.update(names_str.as_bytes());
         let hash = hasher.finalize();
 
-        // Use first 12 hex characters (24 bits) for fingerprint
         let hash_str: String = hash[..3].iter().map(|b| format!("{:02x}", b)).collect();
 
         format!("{}|{}", names_str, hash_str)
@@ -948,13 +1154,13 @@ impl OrderedHeaders {
 
     /// Add a header (preserves order).
     pub fn add(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        self.headers.append(name, value);
         self
     }
 
     /// Convert to vector of owned headers.
     pub fn into_vec(self) -> Vec<(String, String)> {
-        self.headers
+        self.headers.into_inner()
     }
 }
 
@@ -966,7 +1172,7 @@ impl From<Vec<(String, String)>> for OrderedHeaders {
 
 impl From<OrderedHeaders> for Vec<(String, String)> {
     fn from(oh: OrderedHeaders) -> Self {
-        oh.headers
+        oh.into_vec()
     }
 }
 
