@@ -33,11 +33,7 @@ mod tests {
             ready_for_task.store(1, Ordering::SeqCst);
         });
 
-        assert!(wait_until(
-            || ready.load(Ordering::SeqCst) == 1,
-            Duration::from_secs(1),
-        )
-        .await);
+        assert!(wait_until(|| ready.load(Ordering::SeqCst) == 1, Duration::from_secs(1),).await);
     }
 
     #[tokio::test]

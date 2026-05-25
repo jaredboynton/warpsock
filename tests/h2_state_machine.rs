@@ -178,7 +178,9 @@ async fn test_server_initiated_stream_even_id() {
                         Ok((_, frame_type, _, _, _)) if matches!(frame_type, 0x03 | 0x07) => {
                             return Ok(frame_type);
                         }
-                        Ok((_, frame_type, _, _, _)) if matches!(frame_type, 0x02 | 0x04 | 0x08) => {
+                        Ok((_, frame_type, _, _, _))
+                            if matches!(frame_type, 0x02 | 0x04 | 0x08) =>
+                        {
                             tracing::info!("Skipping benign frame type {}", frame_type);
                         }
                         other => return other.map(|(_, frame_type, _, _, _)| frame_type),

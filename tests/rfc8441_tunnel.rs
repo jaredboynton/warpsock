@@ -118,8 +118,7 @@ fn spawn_driver_with_settings_and_config(
         let conn = RawH2Connection::connect(client, settings, PseudoHeaderOrder::Chrome)
             .await
             .unwrap();
-        let backpressure_stall_count =
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backpressure_stall_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let driver = H2Driver::new(
             conn,
             driver_command_tx,

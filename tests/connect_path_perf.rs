@@ -72,7 +72,10 @@ async fn happy_eyeballs_prefers_reachable_ipv4_over_blackholed_ipv6() {
         .parse()
         .unwrap();
     let started = Instant::now();
-    connector.connect(&uri).await.expect("connect should succeed");
+    connector
+        .connect(&uri)
+        .await
+        .expect("connect should succeed");
     assert!(
         started.elapsed() < Duration::from_millis(400),
         "expected staggered v4 win, took {:?}",

@@ -95,9 +95,7 @@ async fn spawn_tls13_server(enable_early_data: bool) -> (SocketAddr, Vec<u8>, on
 async fn second_connect_resumes_tls13_session_ticket() {
     let (addr, ca_pem, shutdown) = spawn_tls13_ticket_server().await;
     let shared_cache = Arc::new(SessionCache::new());
-    let resolver = Arc::new(StaticResolver {
-        addrs: vec![addr],
-    });
+    let resolver = Arc::new(StaticResolver { addrs: vec![addr] });
     let connector = BoringConnector::new()
         .with_root_certificates(vec![ca_pem])
         .with_shared_session_cache(shared_cache.clone())
@@ -112,10 +110,7 @@ async fn second_connect_resumes_tls13_session_ticket() {
         .parse()
         .unwrap();
 
-    let mut first = connector
-        .connect(&uri)
-        .await
-        .expect("first TLS handshake");
+    let mut first = connector.connect(&uri).await.expect("first TLS handshake");
     assert!(
         !first.session_reused(),
         "first handshake should be a fresh session, not resumption"
@@ -131,7 +126,11 @@ async fn second_connect_resumes_tls13_session_ticket() {
 
     // Wait for the new-session callback after BoringSSL parses the NewSessionTicket.
     let key = specter::transport::session::SessionCacheKey::new("127.0.0.1", addr.port());
-    assert!(shared_cache.wait_for_session(&key, Duration::from_secs(2)).await);
+    assert!(
+        shared_cache
+            .wait_for_session(&key, Duration::from_secs(2))
+            .await
+    );
     assert!(
         shared_cache.get_session(&key).is_some(),
         "expected a TLS 1.3 session ticket to be cached after the first dial"
@@ -170,7 +169,11 @@ async fn early_data_session_marked_zero_rtt_capable_when_server_enables_it() {
     drop(first);
 
     let key = specter::transport::session::SessionCacheKey::new("127.0.0.1", addr.port());
-    assert!(shared_cache.wait_for_session(&key, Duration::from_secs(2)).await);
+    assert!(
+        shared_cache
+            .wait_for_session(&key, Duration::from_secs(2))
+            .await
+    );
     assert!(
         shared_cache.supports_zero_rtt(&key),
         "TLS session ticket must advertise early-data capability when the server enables 0-RTT"
@@ -189,7 +192,10 @@ async fn early_data_session_marked_zero_rtt_capable_when_server_enables_it() {
         .await
         .expect("second dial with early data");
     assert!(
-        matches!(outcome, EarlyDataOutcome::Accepted | EarlyDataOutcome::Rejected { .. }),
+        matches!(
+            outcome,
+            EarlyDataOutcome::Accepted | EarlyDataOutcome::Rejected { .. }
+        ),
         "expected an early-data Accepted/Rejected outcome, got {:?}",
         outcome
     );

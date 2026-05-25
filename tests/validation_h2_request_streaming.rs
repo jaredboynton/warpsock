@@ -443,13 +443,12 @@ async fn h2_request_stream_mid_stream_cancellation() {
     let before_drop = polls.load(Ordering::SeqCst);
     drop(response);
     timeout(Duration::from_secs(2), rst_seen_notify.notified())
-    .await
-    .unwrap();
+        .await
+        .unwrap();
     let after_drop = wait_for_stable_counter(&polls).await;
     let after_quiescent = wait_for_stable_counter(&polls).await;
     assert_eq!(
-        after_quiescent,
-        after_drop,
+        after_quiescent, after_drop,
         "producer should not continue being polled after cancellation settles"
     );
 

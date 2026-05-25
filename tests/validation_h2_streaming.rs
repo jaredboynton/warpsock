@@ -1743,8 +1743,10 @@ async fn backpressured_receiver_drop_cancels_full_body_channel() {
     drop(resp1);
 
     timeout(Duration::from_secs(1), rst_received_notify.notified())
-    .await
-    .expect("driver should send RST_STREAM(CANCEL) after a full body channel receiver is dropped");
+        .await
+        .expect(
+            "driver should send RST_STREAM(CANCEL) after a full body channel receiver is dropped",
+        );
 
     let mut resp2 = client
         .get(format!("{}/followup-after-backpressure-drop", url))

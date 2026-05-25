@@ -45,10 +45,7 @@ fn relative_resolution_strips_fragment() {
 #[test]
 fn relative_resolution_empty_reference() {
     let base = Url::parse("https://example.com/a?x=1").unwrap();
-    assert_eq!(
-        base.join("").unwrap().as_str(),
-        "https://example.com/a?x=1"
-    );
+    assert_eq!(base.join("").unwrap().as_str(), "https://example.com/a?x=1");
 }
 
 #[test]

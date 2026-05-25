@@ -761,10 +761,9 @@ async fn native_h3_dropped_response_body_sends_stream_cancel() {
         let cancel_code = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match conn.read_event().await {
-                    Some(MockEvent::Reset {
-                        stream_id,
-                        code,
-                    }) if stream_id == first_stream_id => break code,
+                    Some(MockEvent::Reset { stream_id, code }) if stream_id == first_stream_id => {
+                        break code
+                    }
                     Some(MockEvent::Headers { stream_id, .. }) => {
                         pending_second_stream_id = Some(stream_id);
                     }
@@ -785,7 +784,7 @@ async fn native_h3_dropped_response_body_sends_stream_cancel() {
                     Some(_) => continue,
                     None => return,
                 }
-            }
+            },
         };
         conn.send_response_headers(second_stream_id, vec![(":status", "200")], false)
             .await;
