@@ -6,6 +6,7 @@ use specter::transport::h3::handshake::{ClientH3Event, NativeQuicServerHandshake
 use specter::transport::h3::native::{decode_header_block, encode_frame, H3Frame, H3Header};
 use specter::transport::h3::quic::{split_long_header_datagram, ConnectionId, LongHeaderType};
 use specter::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
+use specter::transport::h3::tls::NATIVE_H3_TICKET_KEY_LEN;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +17,11 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 const SHORT_HEADER_CID_LEN: usize = 16;
 const MOCK_IDLE_TIMEOUT: Duration = Duration::from_millis(150);
+pub const TEST_RESUMPTION_TICKET_KEYS: [u8; NATIVE_H3_TICKET_KEY_LEN] = [
+    0x73, 0x70, 0x65, 0x63, 0x74, 0x65, 0x72, 0x2d, 0x68, 0x33, 0x2d, 0x73, 0x74, 0x65, 0x6b, 0x21,
+    0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0,
+    0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0,
+];
 
 /// A mock HTTP/3 server for testing.
 #[allow(dead_code)]
@@ -25,6 +31,7 @@ pub struct MockH3Server {
     enable_extended_connect: bool,
     fingerprint: Http3Fingerprint,
     connection_count: Arc<AtomicUsize>,
+    ticket_keys: Option<[u8; NATIVE_H3_TICKET_KEY_LEN]>,
 }
 
 impl MockH3Server {
@@ -42,6 +49,7 @@ impl MockH3Server {
             enable_extended_connect: false,
             fingerprint,
             connection_count: Arc::new(AtomicUsize::new(0)),
+            ticket_keys: None,
         })
     }
 
@@ -54,6 +62,12 @@ impl MockH3Server {
     pub async fn new_with_extended_connect() -> std::io::Result<Self> {
         let mut server = Self::new().await?;
         server.enable_extended_connect = true;
+        Ok(server)
+    }
+
+    pub async fn new_with_session_resumption() -> std::io::Result<Self> {
+        let mut server = Self::new().await?;
+        server.ticket_keys = Some(TEST_RESUMPTION_TICKET_KEYS);
         Ok(server)
     }
 
@@ -91,6 +105,7 @@ impl MockH3Server {
         let enable_extended_connect = self.enable_extended_connect;
         let fingerprint = self.fingerprint.clone();
         let connection_count = self.connection_count.clone();
+        let ticket_keys = self.ticket_keys;
 
         loop {
             let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -123,6 +138,7 @@ impl MockH3Server {
                         handler.clone(),
                         enable_extended_connect,
                         fingerprint.clone(),
+                        ticket_keys,
                         first.destination_cid.clone(),
                         first.source_cid.clone(),
                     );
@@ -158,6 +174,7 @@ fn spawn_native_connection<F, Fut>(
     handler: Arc<F>,
     enable_extended_connect: bool,
     mut fingerprint: Http3Fingerprint,
+    ticket_keys: Option<[u8; NATIVE_H3_TICKET_KEY_LEN]>,
     client_destination_cid: ConnectionId,
     client_source_cid: ConnectionId,
 ) where
@@ -169,14 +186,26 @@ fn spawn_native_connection<F, Fut>(
         fingerprint.settings.enable_extended_connect = true;
     }
     let server_source_cid = client_destination_cid.clone();
-    let server = match NativeQuicServerHandshake::new(
-        &fingerprint,
-        &cert_pem,
-        &key_pem,
-        client_destination_cid,
-        client_source_cid,
-        server_source_cid,
-    ) {
+    let server = match if let Some(ticket_keys) = ticket_keys.as_ref() {
+        NativeQuicServerHandshake::new_with_ticket_keys(
+            &fingerprint,
+            &cert_pem,
+            &key_pem,
+            client_destination_cid,
+            client_source_cid,
+            server_source_cid,
+            ticket_keys,
+        )
+    } else {
+        NativeQuicServerHandshake::new(
+            &fingerprint,
+            &cert_pem,
+            &key_pem,
+            client_destination_cid,
+            client_source_cid,
+            server_source_cid,
+        )
+    } {
         Ok(server) => server,
         Err(err) => {
             tracing::error!("native mock H3 server handshake init failed: {}", err);
@@ -358,6 +387,19 @@ impl NativeMockH3Connection {
                 }
                 if let Some(packet) = self.handshake.build_server_initial_ack_packet()? {
                     self.send_packet(packet.packet).await?;
+                }
+            }
+            if packets
+                .iter()
+                .any(|packet| packet.packet_type == LongHeaderType::ZeroRtt)
+            {
+                for event in self
+                    .handshake
+                    .open_client_zero_rtt_h3_event_packet(packet)?
+                {
+                    if self.apply_client_event(event).await? {
+                        active = true;
+                    }
                 }
             }
             if packets
