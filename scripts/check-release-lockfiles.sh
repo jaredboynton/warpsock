@@ -10,6 +10,15 @@ manifests=(
     "bindings/python/Cargo.toml"
 )
 
+bssl_targets=(
+    "aarch64-apple-darwin"
+    "x86_64-apple-darwin"
+    "aarch64-unknown-linux-gnu"
+    "x86_64-unknown-linux-gnu"
+    "aarch64-pc-windows-msvc"
+    "x86_64-pc-windows-msvc"
+)
+
 if grep -q "RUSTC_WRAPPER=sccache" "$PROJECT_ROOT/.github/workflows/node-release.yml"; then
     echo "Node Release must not set RUSTC_WRAPPER=sccache; napi build runs cargo metadata and fails under sccache when CARGO_INCREMENTAL is set." >&2
     exit 1
@@ -95,6 +104,15 @@ for manifest in "${manifests[@]}"; do
             exit 1
             ;;
     esac
+done
+
+for target in "${bssl_targets[@]}"; do
+    package_spec="$("$PROJECT_ROOT/scripts/install-boringssl-prebuilt.sh" --manifest-path bindings/node/Cargo.toml --print-package "$target")"
+    expected_prefix="@jaredboynton/bssl-prebuild-$target@"
+    if [[ "$package_spec" != "$expected_prefix"* ]]; then
+        echo "Expected npm BoringSSL package spec for $target, got: $package_spec" >&2
+        exit 1
+    fi
 done
 
 root_version="$(version_from_cargo_toml "$PROJECT_ROOT/Cargo.toml")"

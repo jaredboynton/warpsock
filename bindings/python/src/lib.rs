@@ -664,6 +664,27 @@ impl ClientBuilder {
         Ok(())
     }
 
+    /// Enable or disable Specter's built-in DNS result cache.
+    fn hickory_dns(&mut self, enable: bool) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.hickory_dns(enable);
+        Ok(())
+    }
+
+    /// Set the DNS cache TTL used when caching is enabled.
+    fn dns_cache_ttl(&mut self, ttl_secs: f64) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.dns_cache_ttl(Duration::from_secs_f64(ttl_secs));
+        Ok(())
+    }
+
+    /// Enable TLS 1.3 0-RTT early data for eligible idempotent H1 requests.
+    fn http_tls_early_data(&mut self, enabled: bool) -> PyResult<()> {
+        let old = std::mem::replace(&mut self.inner, RustClient::builder());
+        self.inner = old.http_tls_early_data(enabled);
+        Ok(())
+    }
+
     /// Build the client.
     fn build(&mut self) -> PyResult<Client> {
         // Take ownership of the builder

@@ -785,6 +785,33 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable or disable Specter's built-in DNS result cache.
+    #[napi]
+    pub fn hickory_dns(&mut self, enable: bool) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.hickory_dns(enable));
+        }
+        self
+    }
+
+    /// Set the DNS cache TTL used when caching is enabled.
+    #[napi]
+    pub fn dns_cache_ttl(&mut self, ttl_secs: f64) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.dns_cache_ttl(Duration::from_secs_f64(ttl_secs)));
+        }
+        self
+    }
+
+    /// Enable TLS 1.3 0-RTT early data for eligible idempotent H1 requests.
+    #[napi]
+    pub fn http_tls_early_data(&mut self, enabled: bool) -> &Self {
+        if let Some(inner) = self.inner.take() {
+            self.inner = Some(inner.http_tls_early_data(enabled));
+        }
+        self
+    }
+
     /// Build the client.
     #[napi]
     pub fn build(&mut self) -> Result<Client> {
