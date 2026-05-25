@@ -12,6 +12,32 @@ pub enum Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedMessage {
+    Text(Bytes),
+    Binary(Bytes),
+}
+
+impl PreparedMessage {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(Bytes::from(text.into()))
+    }
+
+    pub fn binary(bytes: impl Into<Bytes>) -> Self {
+        Self::Binary(bytes.into())
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(bytes) | Self::Binary(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseFrame {
     pub code: CloseCode,
     pub reason: String,
