@@ -1363,6 +1363,37 @@ async fn measure_local_native_fixture(
     let mut rows = Vec::new();
     let mut fixture_events = Vec::new();
     for client in local_native_fixture_measurement_plan_for(selected_client)? {
+        if client == "tokio_quiche_rfc9220_tunnel_mixed" {
+            for _ in 0..warmups {
+                let fixture = LocalNativeH3Fixture::start(client).await?;
+                let tunnel_url = fixture.tunnel_url();
+                let _ = measure_tokio_quiche_rfc9220_tunnel_mixed_once(
+                    fixture.stream_url(),
+                    &tunnel_url,
+                )
+                .await?;
+                fixture_events.extend(fixture.events());
+            }
+
+            let mut measured = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let fixture = LocalNativeH3Fixture::start(client).await?;
+                let tunnel_url = fixture.tunnel_url();
+                measured.push(
+                    measure_tokio_quiche_rfc9220_tunnel_mixed_once(
+                        fixture.stream_url(),
+                        &tunnel_url,
+                    )
+                    .await?,
+                );
+                fixture_events.extend(fixture.events());
+            }
+            rows.push(tokio_quiche_rfc9220_tunnel_mixed_row_from_samples(
+                &measured,
+            ));
+            continue;
+        }
+
         let fixture = LocalNativeH3Fixture::start(client).await?;
         let url = fixture.stream_url();
         let row = match client {
@@ -3483,8 +3514,13 @@ async fn read_tokio_quiche_rfc9220_tunnel_mixed_slow(
                     "tokio_quiche RFC 9220 mixed tunnel timed out after {:?}",
                     adapter_timeout()
                 )
-            })?
-            .ok_or_else(|| anyhow::anyhow!("tokio_quiche RFC 9220 mixed tunnel stream closed"))?;
+            })?;
+        let Some(frame) = frame else {
+            if echoed == expected_tunnel_bytes {
+                return Ok(echoed as u64);
+            }
+            anyhow::bail!("tokio_quiche RFC 9220 mixed tunnel stream closed");
+        };
         match frame {
             tokio_quiche::http3::driver::InboundFrame::Body(chunk, fin) => {
                 echoed = echoed.saturating_add(chunk.len());
@@ -5676,7 +5712,7 @@ mod tests {
     async fn tokio_quiche_local_fixture_measures_repeated_rfc9220_tunnel_slow_consumer_mixed_workload()
     {
         let measurements =
-            super::measure_local_native_fixture(0, 2, Some("tokio_quiche_rfc9220_tunnel_mixed"))
+            super::measure_local_native_fixture(0, 5, Some("tokio_quiche_rfc9220_tunnel_mixed"))
                 .await
                 .unwrap();
 
@@ -5686,7 +5722,7 @@ mod tests {
         assert_eq!(row.competitor_id, "tokio_quiche_rfc9220_tunnel_mixed");
         assert_eq!(row.status, "measured_pass");
         assert_eq!(row.source, "tokio_quiche_rfc9220_tunnel_mixed_adapter");
-        assert_eq!(row.sample_count, Some(2));
+        assert_eq!(row.sample_count, Some(5));
         assert!(row.bytes_per_sec.is_some_and(|throughput| throughput > 0.0));
     }
 
