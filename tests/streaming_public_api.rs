@@ -296,8 +296,12 @@ async fn send_response_helpers_are_buffered_for_h1_h2_h3() {
                         conn.send_headers(stream_id, &headers, false, true)
                             .await
                             .unwrap();
-                        conn.send_data(stream_id, br#"{"ok":true,"#, false).await.unwrap();
-                        conn.send_data(stream_id, br#""protocol":"h2"}"#, true).await.unwrap();
+                        conn.send_data(stream_id, br#"{"ok":true,"#, false)
+                            .await
+                            .unwrap();
+                        conn.send_data(stream_id, br#""protocol":"h2"}"#, true)
+                            .await
+                            .unwrap();
                     }
                     _ => {}
                 }
@@ -339,8 +343,10 @@ async fn send_response_helpers_are_buffered_for_h1_h2_h3() {
                 false,
             )
             .await;
-            conn.send_response_data(stream_id, br#"{"ok":true,"#, false).await;
-            conn.send_response_data(stream_id, br#""protocol":"h3"}"#, true).await;
+            conn.send_response_data(stream_id, br#"{"ok":true,"#, false)
+                .await;
+            conn.send_response_data(stream_id, br#""protocol":"h3"}"#, true)
+                .await;
         });
         let client = Client::builder()
             .danger_accept_invalid_certs(true)

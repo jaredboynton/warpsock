@@ -1842,7 +1842,11 @@ impl Client {
         })
     }
 
-    async fn apply_cookie_header_for_url(&self, request_url: String, headers: &mut Headers) -> bool {
+    async fn apply_cookie_header_for_url(
+        &self,
+        request_url: String,
+        headers: &mut Headers,
+    ) -> bool {
         let Some(jar) = &self.cookie_store else {
             return false;
         };
