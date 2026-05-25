@@ -324,7 +324,10 @@ pub struct NativeH3PendingResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeH3StreamingResponseEvent {
-    Headers { status: u16, headers: Headers },
+    Headers {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
     Data(Bytes),
     Finished,
     GoAway { id: u64 },
@@ -332,7 +335,10 @@ pub enum NativeH3StreamingResponseEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeH3TunnelEvent {
-    Open { status: u16, headers: Headers },
+    Open {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
     Data(Bytes),
     Finished,
     GoAway { id: u64 },
@@ -535,7 +541,7 @@ impl NativeH3DriverState {
         state.opened = true;
         streaming_events.push(NativeH3StreamingResponseEvent::Headers {
             status,
-            headers: Headers::from(response_headers),
+            headers: response_headers,
         });
         Ok(())
     }
@@ -622,7 +628,7 @@ impl NativeH3DriverState {
             state.opened = true;
             tunnel_events.push(NativeH3TunnelEvent::Open {
                 status,
-                headers: Headers::from(state.headers.clone()),
+                headers: state.headers.clone(),
             });
             return Ok(());
         }
@@ -2487,7 +2493,7 @@ impl NativeH3Driver {
         match event {
             NativeH3StreamingResponseEvent::Headers { status, headers } => {
                 if let Some(headers_tx) = stream.headers_tx.take() {
-                    let _ = headers_tx.send(Ok((status, headers)));
+                    let _ = headers_tx.send(Ok((status, Headers::from(headers))));
                 }
             }
             NativeH3StreamingResponseEvent::Data(bytes) => {

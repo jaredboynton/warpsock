@@ -40,7 +40,7 @@ pub enum DriverCommand {
     /// Open an RFC 9220 WebSocket-over-HTTP/3 tunnel.
     OpenWebSocketTunnel {
         uri: http::Uri,
-        headers: Headers,
+        headers: Vec<(String, String)>,
         response_tx: oneshot::Sender<Result<H3Tunnel>>,
     },
 }
