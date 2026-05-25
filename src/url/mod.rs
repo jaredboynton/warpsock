@@ -143,6 +143,17 @@ impl Url {
         Ok(())
     }
 
+    pub fn set_host(&mut self, host: Option<&str>) -> Result<(), ParseError> {
+        let host = host.ok_or_else(|| ParseError::new("missing URL host"))?;
+        validate_authority(host)?;
+        let scheme = self.scheme();
+        let host = parse_host_label(host)?;
+        let authority = format_authority_host(Some(host), self.port())?;
+        let path_and_query = path_and_query_of(&self.uri);
+        *self = Self::assemble(scheme, &authority, &path_and_query)?;
+        Ok(())
+    }
+
     pub fn set_query(&mut self, query: Option<&str>) -> Result<(), ParseError> {
         let scheme = self.scheme();
         let authority = self
@@ -171,11 +182,7 @@ impl Url {
         }
 
         let base_scheme = self.scheme();
-        let base_authority = self
-            .uri
-            .authority()
-            .map(|a| a.as_str())
-            .unwrap_or("");
+        let base_authority = self.uri.authority().map(|a| a.as_str()).unwrap_or("");
         let base_path = self.path();
         let base_query = self.query();
 
@@ -296,9 +303,7 @@ fn validate_authority(authority: &str) -> Result<(), ParseError> {
         ));
     }
     if !authority.is_ascii() {
-        return Err(ParseError::new(
-            "non-ASCII host requires explicit punycode",
-        ));
+        return Err(ParseError::new("non-ASCII host requires explicit punycode"));
     }
     Ok(())
 }
@@ -327,14 +332,13 @@ fn parse_host_port(authority: &str) -> Result<(Host, Option<u16>), ParseError> {
         return Ok((Host::Ipv6(ip), port));
     }
 
-    if let Some((host, port)) = authority.rsplit_once(':')
-        && !host.is_empty()
-        && port.chars().all(|c| c.is_ascii_digit())
-    {
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| ParseError::new("invalid port"))?;
-        return Ok((parse_host_label(host)?, Some(port)));
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| ParseError::new("invalid port"))?;
+            return Ok((parse_host_label(host)?, Some(port)));
+        }
     }
 
     Ok((parse_host_label(authority)?, None))
@@ -457,6 +461,7 @@ fn remove_dot_segments(path: &str) -> String {
     }
 }
 
+#[cfg(test)]
 mod unit_tests {
     use super::*;
 

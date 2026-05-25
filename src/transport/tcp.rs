@@ -161,7 +161,7 @@ fn set_tcp_notsent_lowat(socket: &socket2::Socket, bytes: u32) -> io::Result<()>
     #[cfg(target_os = "linux")]
     use libc::TCP_NOTSENT_LOWAT;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const TCP_NOTSENT_LOWAT: i32 = 0x202;
+    const TCP_NOTSENT_LOWAT: i32 = 0x201;
 
     let fd = socket.as_raw_fd();
     let value = bytes;
@@ -197,7 +197,7 @@ fn read_tcp_notsent_lowat(socket: &socket2::Socket) -> io::Result<u32> {
     #[cfg(target_os = "linux")]
     use libc::TCP_NOTSENT_LOWAT;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const TCP_NOTSENT_LOWAT: i32 = 0x202;
+    const TCP_NOTSENT_LOWAT: i32 = 0x201;
 
     let fd = socket.as_raw_fd();
     let mut value: u32 = 0;
