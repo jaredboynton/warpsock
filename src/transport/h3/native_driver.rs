@@ -20,6 +20,7 @@ use crate::transport::h3::handshake::{NativeQuicHandshake, ServerH3Event, Server
 use crate::transport::h3::native::{
     decode_header_block, H3Frame, H3Header, H3Setting, H3StreamType,
 };
+use crate::transport::h3::path::QuicPathSet;
 use crate::transport::h3::quic::QuicEcnMark;
 use crate::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use crate::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
@@ -60,6 +61,11 @@ impl Wake for NotifyWake {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum H3SendClass {
+    /// Strict-priority HEADERS/control frames (CONNECT, request-start,
+    /// non-streaming request). Drained ahead of any DATA class so a freshly
+    /// issued streaming request or tunnel CONNECT never sits behind
+    /// in-flight tunnel/request body bytes.
+    Control,
     RequestBody,
     TunnelData,
 }
@@ -69,6 +75,10 @@ impl H3SendClass {
         match self {
             Self::RequestBody => Self::TunnelData,
             Self::TunnelData => Self::RequestBody,
+            // Control is strict-priority and not part of the round-robin
+            // data-class rotation; default the alternation back to
+            // RequestBody so we never observe `other()` returning Control.
+            Self::Control => Self::RequestBody,
         }
     }
 }
@@ -93,13 +103,26 @@ impl Default for H3SendScheduler {
 }
 
 impl H3SendScheduler {
-    fn next_classes(&self, has_request_body: bool, has_tunnel_data: bool) -> Vec<H3SendClass> {
-        match (has_request_body, has_tunnel_data) {
-            (true, true) => vec![self.next_class, self.next_class.other()],
-            (true, false) => vec![H3SendClass::RequestBody],
-            (false, true) => vec![H3SendClass::TunnelData],
-            (false, false) => Vec::new(),
+    fn next_classes(
+        &self,
+        has_control: bool,
+        has_request_body: bool,
+        has_tunnel_data: bool,
+    ) -> Vec<H3SendClass> {
+        let mut classes = Vec::with_capacity(3);
+        if has_control {
+            classes.push(H3SendClass::Control);
         }
+        match (has_request_body, has_tunnel_data) {
+            (true, true) => {
+                classes.push(self.next_class);
+                classes.push(self.next_class.other());
+            }
+            (true, false) => classes.push(H3SendClass::RequestBody),
+            (false, true) => classes.push(H3SendClass::TunnelData),
+            (false, false) => {}
+        }
+        classes
     }
 
     fn ordered_streams(&self, class: H3SendClass, mut stream_ids: Vec<u64>) -> Vec<u64> {
@@ -116,10 +139,19 @@ impl H3SendScheduler {
     }
 
     fn record_stream_progress(&mut self, class: H3SendClass, stream_id: u64) {
-        self.next_class = class.other();
         match class {
-            H3SendClass::RequestBody => self.next_request_after = Some(stream_id),
-            H3SendClass::TunnelData => self.next_tunnel_after = Some(stream_id),
+            H3SendClass::Control => {
+                // Control is strict-priority; draining it does not perturb
+                // the request/tunnel data-class round-robin rotation.
+            }
+            H3SendClass::RequestBody => {
+                self.next_class = H3SendClass::TunnelData;
+                self.next_request_after = Some(stream_id);
+            }
+            H3SendClass::TunnelData => {
+                self.next_class = H3SendClass::RequestBody;
+                self.next_tunnel_after = Some(stream_id);
+            }
         }
     }
 
@@ -141,6 +173,7 @@ impl H3SendScheduler {
 
     fn next_after(&self, class: H3SendClass) -> Option<u64> {
         match class {
+            H3SendClass::Control => None,
             H3SendClass::RequestBody => self.next_request_after,
             H3SendClass::TunnelData => self.next_tunnel_after,
         }
@@ -691,6 +724,8 @@ pub fn spawn_native_h3_driver(
             early_data_reason: handshake.early_data_reason(),
         });
     let mut state = NativeH3DriverState::default();
+    let mut path_set = QuicPathSet::new();
+    path_set.install_primary(peer_addr);
     let mut pending_responses = HashMap::new();
     if let Some(pending) = pending_zero_rtt_response {
         state.track_response_stream(pending.stream_id);
@@ -703,6 +738,7 @@ pub fn spawn_native_h3_driver(
         fingerprint,
         socket,
         peer_addr,
+        path_set,
         state,
         pending_responses,
         pending_streaming_responses: HashMap::new(),
@@ -744,6 +780,7 @@ struct NativeH3Driver {
     fingerprint: Http3Fingerprint,
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
+    path_set: QuicPathSet,
     state: NativeH3DriverState,
     pending_responses: HashMap<u64, oneshot::Sender<Result<StreamResponse>>>,
     pending_streaming_responses: HashMap<u64, NativeDriverStreamingResponseState>,
@@ -1239,10 +1276,7 @@ impl NativeH3Driver {
             .handshake
             .build_client_h3_preface_packets(&self.fingerprint)?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1257,10 +1291,7 @@ impl NativeH3Driver {
         else {
             return Ok(());
         };
-        self.socket
-            .send_to(packet.packet.as_ref(), self.peer_addr)
-            .await
-            .map_err(Error::Io)?;
+        self.send_packet_to_peer(packet.packet.as_ref()).await?;
         Ok(())
     }
 
@@ -1282,10 +1313,7 @@ impl NativeH3Driver {
         let close_state = self.handshake.close_state_mut();
         close_state.set_replay_min_interval(pto);
         close_state.set_replay_packet_threshold(1);
-        self.socket
-            .send_to(close_packet.as_ref(), self.peer_addr)
-            .await
-            .map_err(Error::Io)?;
+        self.send_packet_to_peer(close_packet.as_ref()).await?;
         Ok(())
     }
 
@@ -1295,10 +1323,8 @@ impl NativeH3Driver {
     /// packet number for each retransmission.
     async fn replay_connection_close(&mut self) -> Result<()> {
         if let Some(close_packet) = &self.closing_connection_close_packet {
-            self.socket
-                .send_to(close_packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            let close_packet = close_packet.clone();
+            self.send_packet_to_peer(close_packet.as_ref()).await?;
             self.handshake
                 .client_mark_connection_close_replayed(Instant::now());
         }
@@ -1364,10 +1390,7 @@ impl NativeH3Driver {
             .handshake
             .build_client_receive_flow_control_update_packets()?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1380,10 +1403,7 @@ impl NativeH3Driver {
                 self.fingerprint.transport.ack_delay_exponent,
             )?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1393,10 +1413,7 @@ impl NativeH3Driver {
             .handshake
             .retransmit_lost_client_application_stream_packets()?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1410,10 +1427,7 @@ impl NativeH3Driver {
             .handshake
             .retransmit_pto_client_application_stream_packets(now, pto_timeout)?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1502,10 +1516,7 @@ impl NativeH3Driver {
                 };
                 self.state.track_response_stream(packet.stream_id);
                 self.pending_responses.insert(packet.stream_id, response_tx);
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
             }
             DriverCommand::SendStreamingRequest {
                 method,
@@ -1592,10 +1603,7 @@ impl NativeH3Driver {
                         request_stream,
                     ),
                 );
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
                 self.flush_scheduled_send_work().await?;
             }
             DriverCommand::OpenWebSocketTunnel {
@@ -1655,10 +1663,7 @@ impl NativeH3Driver {
                         self.transport_config.tunnel_inbound_byte_budget,
                     ),
                 );
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
             }
             DriverCommand::SendTunnelData {
                 stream_id,
@@ -1677,10 +1682,7 @@ impl NativeH3Driver {
 
     async fn send_flow_control_blocked_packet(&mut self) -> Result<()> {
         if let Some(packet) = self.handshake.build_client_flow_control_blocked_packet()? {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         Ok(())
     }
@@ -1713,10 +1715,11 @@ impl NativeH3Driver {
     async fn flush_scheduled_send_work(&mut self) -> Result<bool> {
         let classes = self
             .send_scheduler
-            .next_classes(self.has_request_body_work(), self.has_tunnel_data_work());
+            .next_classes(false, self.has_request_body_work(), self.has_tunnel_data_work());
 
         for class in classes {
             let progressed_stream = match class {
+                H3SendClass::Control => None,
                 H3SendClass::RequestBody => self.flush_request_stream_bodies_once().await?,
                 H3SendClass::TunnelData => self.flush_pending_tunnel_data_once().await?,
             };
@@ -1783,10 +1786,7 @@ impl NativeH3Driver {
         };
 
         if let Some(packet) = packet {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
 
         if !bytes.is_empty() {
@@ -1938,10 +1938,7 @@ impl NativeH3Driver {
                             Err(error) => return Err(error),
                         };
                         if let Some(packet) = packet {
-                            self.socket
-                                .send_to(packet.packet.as_ref(), self.peer_addr)
-                                .await
-                                .map_err(Error::Io)?;
+                            self.send_packet_to_peer(packet.packet.as_ref()).await?;
                         }
                         if let Some(stream) = self.pending_streaming_responses.get_mut(&stream_id) {
                             if let Some(body) = stream.request_stream.as_mut() {
@@ -1984,10 +1981,7 @@ impl NativeH3Driver {
                     Err(error) => return Err(error),
                 };
             if let Some(packet) = packet {
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
             }
 
             self.send_scheduler.record_data_sent(data.len());
@@ -2022,6 +2016,7 @@ impl NativeH3Driver {
         datagram: &[u8],
         ecn_mark: Option<QuicEcnMark>,
     ) -> Result<()> {
+        self.observe_path_packet_from(remote_address, datagram.len());
         // RFC9000 § 10.2: once we are draining we MUST drop all incoming
         // packets without further processing.
         if self.handshake.close_state().is_draining() {
@@ -2071,26 +2066,17 @@ impl NativeH3Driver {
                 .process_server_datagram_with_ecn(datagram, ecn_mark)?;
             self.drain_session_tickets();
             if let Some(packet) = self.handshake.build_client_initial_ack_packet()? {
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
             }
             if let Some(packet) = self.handshake.build_client_handshake_ack_packet()? {
-                self.socket
-                    .send_to(packet.packet.as_ref(), self.peer_addr)
-                    .await
-                    .map_err(Error::Io)?;
+                self.send_packet_to_peer(packet.packet.as_ref()).await?;
             }
             for processed in processed_packets {
                 if let Some(packet) = self
                     .handshake
                     .build_client_handshake_crypto_packet(processed.handshake_crypto_out)?
                 {
-                    self.socket
-                        .send_to(packet.packet.as_ref(), self.peer_addr)
-                        .await
-                        .map_err(Error::Io)?;
+                    self.send_packet_to_peer(packet.packet.as_ref()).await?;
                 }
             }
             return Ok(());
@@ -2112,10 +2098,7 @@ impl NativeH3Driver {
                 self.fingerprint.transport.ack_delay_exponent,
             )?
         {
-            self.socket
-                .send_to(packet.packet.as_ref(), self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
+            self.send_packet_to_peer(packet.packet.as_ref()).await?;
         }
         self.observe_recovery_signals();
         self.send_lost_application_stream_retransmits().await?;
@@ -2123,10 +2106,7 @@ impl NativeH3Driver {
             match event {
                 ServerH3Event::PathChallenge(data) => {
                     let packet = self.handshake.build_client_path_response_packet(data)?;
-                    self.socket
-                        .send_to(packet.packet.as_ref(), self.peer_addr)
-                        .await
-                        .map_err(Error::Io)?;
+                    self.send_packet_to_peer(packet.packet.as_ref()).await?;
                 }
                 event => self.apply_h3_event(event)?,
             }
@@ -2155,8 +2135,37 @@ impl NativeH3Driver {
                 .handshake
                 .is_client_path_address_validated(&remote_address)
         {
+            self.path_set.promote_to_primary(remote_address);
             self.peer_addr = remote_address;
         }
+    }
+
+    fn observe_path_packet_from(&mut self, remote_address: SocketAddr, len: usize) {
+        self.path_set
+            .observe_packet_from(remote_address, len, Instant::now());
+    }
+
+    fn can_send_to_path(&self, remote_address: SocketAddr, additional_bytes: usize) -> bool {
+        self.path_set.may_send_to(remote_address, additional_bytes)
+    }
+
+    async fn send_packet_to_peer(&mut self, packet: &[u8]) -> Result<()> {
+        self.send_packet_to_path(self.peer_addr, packet).await
+    }
+
+    async fn send_packet_to_path(&mut self, remote_address: SocketAddr, packet: &[u8]) -> Result<()> {
+        if !self.can_send_to_path(remote_address, packet.len()) {
+            return Err(Error::Quic(
+                "native QUIC anti-amplification budget exhausted for unvalidated path".into(),
+            ));
+        }
+        let sent = self
+            .socket
+            .send_to(packet, remote_address)
+            .await
+            .map_err(Error::Io)?;
+        self.path_set.record_sent_to(remote_address, sent);
+        Ok(())
     }
 
     fn drain_session_tickets(&mut self) {
@@ -2408,18 +2417,12 @@ impl NativeH3Driver {
         let reset = self
             .handshake
             .build_client_reset_stream_packet(stream_id, H3_REQUEST_CANCELLED)?;
-        self.socket
-            .send_to(reset.packet.as_ref(), self.peer_addr)
-            .await
-            .map_err(Error::Io)?;
+        self.send_packet_to_peer(reset.packet.as_ref()).await?;
 
         let stop = self
             .handshake
             .build_client_stop_sending_packet(stream_id, H3_REQUEST_CANCELLED)?;
-        self.socket
-            .send_to(stop.packet.as_ref(), self.peer_addr)
-            .await
-            .map_err(Error::Io)?;
+        self.send_packet_to_peer(stop.packet.as_ref()).await?;
         Ok(())
     }
 
@@ -2627,20 +2630,20 @@ mod tests {
         let mut scheduler = H3SendScheduler::default();
 
         assert_eq!(
-            scheduler.next_classes(true, true),
+            scheduler.next_classes(false, true, true),
             [H3SendClass::RequestBody, H3SendClass::TunnelData]
         );
 
         scheduler.record_stream_progress(H3SendClass::RequestBody, 0);
         assert_eq!(
-            scheduler.next_classes(true, true),
+            scheduler.next_classes(false, true, true),
             [H3SendClass::TunnelData, H3SendClass::RequestBody],
             "tunnel DATA must get the next class turn after request body progress"
         );
 
         scheduler.record_stream_progress(H3SendClass::TunnelData, 4);
         assert_eq!(
-            scheduler.next_classes(true, true),
+            scheduler.next_classes(false, true, true),
             [H3SendClass::RequestBody, H3SendClass::TunnelData],
             "request bodies must regain the next class turn after tunnel progress"
         );
@@ -2995,6 +2998,11 @@ mod tests {
             fingerprint,
             socket,
             peer_addr,
+            path_set: {
+                let mut path_set = QuicPathSet::new();
+                path_set.install_primary(peer_addr);
+                path_set
+            },
             state: NativeH3DriverState::default(),
             pending_responses: HashMap::new(),
             pending_streaming_responses: HashMap::new(),
@@ -3119,6 +3127,11 @@ mod tests {
             fingerprint: Http3Fingerprint::default(),
             socket,
             peer_addr: original_peer,
+            path_set: {
+                let mut path_set = QuicPathSet::new();
+                path_set.install_primary(original_peer);
+                path_set
+            },
             state: NativeH3DriverState::default(),
             pending_responses: HashMap::new(),
             pending_streaming_responses: HashMap::new(),
@@ -3175,6 +3188,11 @@ mod tests {
             fingerprint,
             socket,
             peer_addr: original_peer,
+            path_set: {
+                let mut path_set = QuicPathSet::new();
+                path_set.install_primary(original_peer);
+                path_set
+            },
             state: NativeH3DriverState::default(),
             pending_responses: HashMap::new(),
             pending_streaming_responses: HashMap::new(),
