@@ -1,31 +1,43 @@
 //! BoringSSL TLS connector.
 
-use boring::ssl::{SslConnector, SslMethod, SslSessionCacheMode, SslVersion};
+use boring::ex_data::Index;
+use boring::ssl::{
+    NameType, Ssl, SslConnector, SslMethod, SslSessionCacheMode, SslVersion,
+};
 use boring::x509::X509;
+use foreign_types_shared::ForeignTypeRef;
 use http::Uri;
 use std::io;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_boring::SslStream;
+use tokio::task::JoinSet;
+use tokio_boring::{SslStream, SslStreamBuilder};
 
 use crate::error::Error;
 use crate::fingerprint::tls::TlsFingerprint;
 use crate::transport::dns::DnsConfig;
+use crate::transport::session::{SessionCache, SessionCacheKey};
 use crate::transport::tcp::{configure_tcp_socket, TcpFingerprint};
 
 // FFI bindings for BoringSSL extension control
-use boring_sys::{CRYPTO_BUFFER, SSL, SSL_CTX};
+use boring_sys::{CRYPTO_BUFFER, SSL, SSL_CTX, SSL_SESSION};
 use std::os::raw::c_int;
 
 extern "C" {
-    /// Enable GREASE (Generate Random Extensions And Sustain Extensibility)
     pub fn SSL_CTX_set_grease_enabled(ctx: *mut SSL_CTX, enabled: c_int) -> c_int;
-    /// Enable extension order permutation (Chrome 110+ behavior)
     pub fn SSL_CTX_set_permute_extensions(ctx: *mut SSL_CTX, enabled: c_int) -> c_int;
+    pub fn SSL_CTX_set_early_data_enabled(ctx: *mut SSL_CTX, enabled: c_int);
+    pub fn SSL_set_early_data_enabled(ssl: *mut SSL, enabled: c_int);
+    pub fn SSL_in_early_data(ssl: *const SSL) -> c_int;
+    pub fn SSL_early_data_accepted(ssl: *const SSL) -> c_int;
+    pub fn SSL_get_early_data_reason(ssl: *const SSL) -> c_int;
+    pub fn SSL_SESSION_early_data_capable(session: *const SSL_SESSION) -> c_int;
 }
 
 /// Brotli certificate decompression callback for BoringSSL.
@@ -106,6 +118,93 @@ unsafe extern "C" fn decompress_zlib_cert(
     }
 }
 
+/// Bridge between sync IO traits and async tokio IO traits for TLS handshakes.
+struct AsyncStreamBridge<S> {
+    stream: S,
+    waker: Option<std::task::Waker>,
+}
+
+impl<S> AsyncStreamBridge<S> {
+    fn new(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        Self {
+            stream,
+            waker: None,
+        }
+    }
+
+    fn set_waker(&mut self, ctx: Option<&mut Context<'_>>) {
+        self.waker = ctx.map(|ctx| ctx.waker().clone());
+    }
+
+    fn with_context<F, R>(&mut self, f: F) -> R
+    where
+        S: Unpin,
+        F: FnOnce(&mut Context<'_>, Pin<&mut S>) -> R,
+    {
+        let mut ctx = Context::from_waker(self.waker.as_ref().expect("missing waker in bridge"));
+        f(&mut ctx, Pin::new(&mut self.stream))
+    }
+}
+
+impl<S> io::Read for AsyncStreamBridge<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.with_context(|ctx, stream| {
+            let mut buf = ReadBuf::new(buf);
+            match stream.poll_read(ctx, &mut buf)? {
+                Poll::Ready(()) => Ok(buf.filled().len()),
+                Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        })
+    }
+}
+
+impl<S> io::Write for AsyncStreamBridge<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.with_context(|ctx, stream| stream.poll_write(ctx, buf)) {
+            Poll::Ready(r) => r,
+            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.with_context(|ctx, stream| stream.poll_flush(ctx)) {
+            Poll::Ready(r) => r,
+            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectPort(u16);
+
+static CONNECT_PORT_INDEX: OnceLock<Index<Ssl, ConnectPort>> = OnceLock::new();
+
+fn connect_port_index() -> &'static Index<Ssl, ConnectPort> {
+    CONNECT_PORT_INDEX.get_or_init(|| Ssl::new_ex_index().expect("SSL ex index"))
+}
+
+const DEFAULT_HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+/// Outcome of a TLS 1.3 0-RTT early-data attempt on the TCP-TLS path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EarlyDataOutcome {
+    /// Server accepted 0-RTT; early bytes are on the wire.
+    Accepted,
+    /// Server rejected 0-RTT; BoringSSL retransmits as 1-RTT data.
+    Rejected { reason: u32 },
+    /// No cached ticket, early data disabled, or payload not eligible.
+    NotAttempted,
+}
+
 /// BoringSSL-based TLS connector for hyper.
 #[derive(Clone)]
 pub struct BoringConnector {
@@ -118,6 +217,10 @@ pub struct BoringConnector {
     use_platform_roots: bool,
     /// Skip TLS certificate verification (DANGEROUS - for testing only)
     danger_accept_invalid_certs: bool,
+    ssl_connectors: Arc<OnceLock<[Arc<SslConnector>; 2]>>,
+    session_cache: Arc<SessionCache>,
+    happy_eyeballs_delay: Duration,
+    enable_early_data: bool,
 }
 
 #[derive(Clone, Default)]
@@ -134,6 +237,10 @@ impl BoringConnector {
     /// Use `with_platform_roots(true)` to enable automatic loading of OS root CAs,
     /// which is required for cross-compiled builds (e.g., Windows builds from macOS).
     pub fn new() -> Self {
+        Self::with_session_cache(Arc::new(SessionCache::new()))
+    }
+
+    fn with_session_cache(session_cache: Arc<SessionCache>) -> Self {
         Self {
             tls_config: None,
             tcp_fingerprint: None,
@@ -142,33 +249,46 @@ impl BoringConnector {
             root_certs: Vec::new(),
             use_platform_roots: false,
             danger_accept_invalid_certs: false,
+            ssl_connectors: Arc::new(OnceLock::new()),
+            session_cache,
+            happy_eyeballs_delay: DEFAULT_HAPPY_EYEBALLS_DELAY,
+            enable_early_data: false,
         }
+    }
+
+    /// Share a TLS session cache across connector clones and client connectors.
+    pub fn with_shared_session_cache(mut self, session_cache: Arc<SessionCache>) -> Self {
+        self.session_cache = session_cache;
+        self
+    }
+
+    /// Stagger dual-stack connection attempts (RFC 8305). Zero disables stagger.
+    pub fn happy_eyeballs_delay(mut self, delay: Duration) -> Self {
+        self.happy_eyeballs_delay = delay;
+        self
+    }
+
+    /// Enable TLS 1.3 0-RTT early data on resumable TCP-TLS connections.
+    pub fn with_early_data(mut self, enabled: bool) -> Self {
+        self.enable_early_data = enabled;
+        self
     }
 
     /// Create a connector with TLS fingerprint configuration.
     pub fn with_fingerprint(fp: TlsFingerprint) -> Self {
-        Self {
-            tls_config: Some(fp),
-            tcp_fingerprint: None,
-            dns_config: DnsConfig::new(),
-            tcp_keepalive: TcpKeepaliveConfig::default(),
-            root_certs: Vec::new(),
-            use_platform_roots: false,
-            danger_accept_invalid_certs: false,
-        }
+        Self::with_session_cache(Arc::new(SessionCache::new())).with_fingerprint_inner(fp)
+    }
+
+    fn with_fingerprint_inner(mut self, fp: TlsFingerprint) -> Self {
+        self.tls_config = Some(fp);
+        self
     }
 
     /// Create a connector with both TLS and TCP fingerprint configuration.
     pub fn with_fingerprints(tls_fp: TlsFingerprint, tcp_fp: TcpFingerprint) -> Self {
-        Self {
-            tls_config: Some(tls_fp),
-            tcp_fingerprint: Some(tcp_fp),
-            dns_config: DnsConfig::new(),
-            tcp_keepalive: TcpKeepaliveConfig::default(),
-            root_certs: Vec::new(),
-            use_platform_roots: false,
-            danger_accept_invalid_certs: false,
-        }
+        Self::with_session_cache(Arc::new(SessionCache::new()))
+            .with_fingerprint_inner(tls_fp)
+            .with_tcp_fingerprint(tcp_fp)
     }
 
     /// Set TCP fingerprint configuration.
@@ -232,26 +352,39 @@ impl BoringConnector {
         self
     }
 
-    fn configure_ssl(&self, _domain: &str, alpn_mode: AlpnMode) -> Result<SslConnector, Error> {
+    fn ssl_connector(&self, alpn_mode: AlpnMode) -> Result<Arc<SslConnector>, Error> {
+        let index = alpn_index(alpn_mode);
+        if let Some(connectors) = self.ssl_connectors.get() {
+            return Ok(connectors[index].clone());
+        }
+        let cached = [
+            Arc::new(self.build_ssl_connector(AlpnMode::Default)?),
+            Arc::new(self.build_ssl_connector(AlpnMode::Http1Only)?),
+        ];
+        match self.ssl_connectors.set(cached) {
+            Ok(()) => {}
+            Err(_) => {}
+        }
+        Ok(self
+            .ssl_connectors
+            .get()
+            .expect("connector cache initialized")[index]
+            .clone())
+    }
+
+    fn build_ssl_connector(&self, alpn_mode: AlpnMode) -> Result<SslConnector, Error> {
         let mut builder = SslConnector::builder(SslMethod::tls_client())
             .map_err(|e| Error::Tls(format!("Failed to create SSL connector: {}", e)))?;
 
-        // Skip certificate verification if danger_accept_invalid_certs is enabled
         if self.danger_accept_invalid_certs {
             builder.set_verify(boring::ssl::SslVerifyMode::NONE);
         }
 
-        // Load platform root certificates if enabled
-        // This is required for cross-compiled builds where BoringSSL can't find system certs
         if self.use_platform_roots {
             let result = rustls_native_certs::load_native_certs();
-
-            // Log any errors encountered while loading certificates
             for err in &result.errors {
                 tracing::warn!("Error loading platform certificate: {}", err);
             }
-
-            // Add successfully loaded certificates to the trust store
             let mut loaded = 0;
             for cert_der in result.certs {
                 if let Ok(x509) = X509::from_der(cert_der.as_ref()) {
@@ -263,19 +396,15 @@ impl BoringConnector {
             tracing::debug!("Loaded {} platform root certificates", loaded);
         }
 
-        // Add custom root certs (in addition to platform roots)
         for cert_bytes in &self.root_certs {
             if let Ok(cert) = X509::from_der(cert_bytes) {
                 let _ = builder.cert_store_mut().add_cert(cert);
             } else if let Ok(cert) = X509::from_pem(cert_bytes) {
                 let _ = builder.cert_store_mut().add_cert(cert);
-            } else {
-                // Ignore invalid certs or log warning
             }
         }
 
         if let Some(fp) = &self.tls_config {
-            // Set cipher list from fingerprint
             if !fp.cipher_list.is_empty() {
                 let cipher_str = fp.cipher_list.join(":");
                 builder
@@ -283,8 +412,6 @@ impl BoringConnector {
                     .map_err(|e| Error::Tls(format!("Failed to set cipher list: {}", e)))?;
             }
 
-            // Set curves/groups from fingerprint
-            // If Kyber is enabled, prepend X25519Kyber768Draft00 to the curves list
             if !fp.curves.is_empty() {
                 let curves_str = if fp.enable_kyber {
                     format!("X25519Kyber768Draft00:{}", fp.curves.join(":"))
@@ -295,13 +422,11 @@ impl BoringConnector {
                     .set_curves_list(&curves_str)
                     .map_err(|e| Error::Tls(format!("Failed to set curves: {}", e)))?;
             } else if fp.enable_kyber {
-                // If no curves specified but Kyber is enabled, set Kyber as the only group
                 builder
                     .set_curves_list("X25519Kyber768Draft00")
                     .map_err(|e| Error::Tls(format!("Failed to set curves: {}", e)))?;
             }
 
-            // Set signature algorithms from fingerprint
             if !fp.sigalgs.is_empty() {
                 let sigalgs_str = fp.sigalgs.join(":");
                 builder.set_sigalgs_list(&sigalgs_str).map_err(|e| {
@@ -309,31 +434,22 @@ impl BoringConnector {
                 })?;
             }
 
-            // Enable GREASE and extension permutation for Chrome-like behavior
-            // Firefox also randomizes extensions but doesn't use GREASE
             unsafe {
                 let ctx = builder.as_ptr() as *mut SSL_CTX;
                 if fp.grease {
-                    // Chrome: enable GREASE and extension permutation
                     SSL_CTX_set_grease_enabled(ctx, 1);
                     SSL_CTX_set_permute_extensions(ctx, 1);
                 } else {
-                    // Firefox: enable extension permutation but NOT GREASE
                     SSL_CTX_set_grease_enabled(ctx, 0);
                     SSL_CTX_set_permute_extensions(ctx, 1);
                 }
 
-                // Configure certificate compression (compress_certificate extension)
-                // Chrome uses Brotli, Firefox does not use compression
-                // Note: Certificate compression is configured via SSL_CTX_add_cert_compression_alg
-                // which requires callback functions. We only implement decompression (client receives
-                // compressed certs from server).
                 match fp.cert_compression {
                     crate::fingerprint::CertCompression::Brotli => {
                         let _ = boring_sys::SSL_CTX_add_cert_compression_alg(
                             ctx,
                             boring_sys::TLSEXT_cert_compression_brotli as u16,
-                            None, // No compression callback (client doesn't compress)
+                            None,
                             Some(decompress_brotli_cert),
                         );
                     }
@@ -341,29 +457,14 @@ impl BoringConnector {
                         let _ = boring_sys::SSL_CTX_add_cert_compression_alg(
                             ctx,
                             boring_sys::TLSEXT_cert_compression_zlib as u16,
-                            None, // No compression callback (client doesn't compress)
+                            None,
                             Some(decompress_zlib_cert),
                         );
                     }
-                    crate::fingerprint::CertCompression::None => {
-                        // No certificate compression
-                    }
+                    crate::fingerprint::CertCompression::None => {}
                 }
-
-                // Note: ALPS (Application-Layer Protocol Settings) extension is deferred.
-                // The API requires SSL_add_application_settings() which works on the SSL object
-                // (not SSL_CTX), meaning it must be called after SSL object creation during
-                // connection setup. This would require architectural changes to access the SSL
-                // object before handshake completion.
             }
 
-            // Note: extension_order field in TlsFingerprint is for reference only.
-            // Modern browsers (Chrome 110+, Firefox 133+) randomize extension order,
-            // so we cannot set a static order. The extension_order field is used for
-            // JA3 fingerprint reference (though JA3 will vary due to randomization)
-            // and JA4 fingerprinting (which sorts extensions alphabetically).
-
-            // Set min/max TLS version
             builder
                 .set_min_proto_version(Some(SslVersion::TLS1_2))
                 .map_err(|e| Error::Tls(format!("Failed to set min TLS version: {}", e)))?;
@@ -371,7 +472,6 @@ impl BoringConnector {
                 .set_max_proto_version(Some(SslVersion::TLS1_3))
                 .map_err(|e| Error::Tls(format!("Failed to set max TLS version: {}", e)))?;
         } else {
-            // Default configuration
             builder
                 .set_min_proto_version(Some(SslVersion::TLS1_2))
                 .map_err(|e| Error::Tls(format!("Failed to set min TLS version: {}", e)))?;
@@ -380,11 +480,44 @@ impl BoringConnector {
                 .map_err(|e| Error::Tls(format!("Failed to set max TLS version: {}", e)))?;
         }
 
-        // Enable session caching (browsers use this for session resumption)
-        // This enables TLS session tickets and session ID caching
-        builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        builder.set_session_cache_mode(
+            SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL,
+        );
 
-        // Enable ALPN for HTTP/2 or constrain it for HTTP/1-only callers.
+        if self.enable_early_data {
+            unsafe {
+                SSL_CTX_set_early_data_enabled(builder.as_ptr() as *mut SSL_CTX, 1);
+            }
+        }
+
+        let session_cache = self.session_cache.clone();
+        builder.set_new_session_callback(move |ssl, session| {
+            let host = ssl
+                .servername(NameType::HOST_NAME)
+                .unwrap_or("")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let port = ssl
+                .ex_data(*connect_port_index())
+                .map(|ConnectPort(port)| *port)
+                .unwrap_or(443);
+            if host.is_empty() {
+                return;
+            }
+            if let Ok(der) = session.to_der() {
+                let early_data_capable = unsafe {
+                    SSL_SESSION_early_data_capable(session.as_ptr()) != 0
+                };
+                let max_age = Duration::from_secs(session.timeout().max(0) as u64);
+                session_cache.store_session(
+                    SessionCacheKey::new(&host, port),
+                    der,
+                    early_data_capable,
+                    Some(max_age),
+                );
+            }
+        });
+
         let alpn_protos = match alpn_mode {
             AlpnMode::Default => b"\x02h2\x08http/1.1".as_slice(),
             AlpnMode::Http1Only => b"\x08http/1.1".as_slice(),
@@ -394,6 +527,83 @@ impl BoringConnector {
             .map_err(|e| Error::Tls(format!("Failed to set ALPN: {}", e)))?;
 
         Ok(builder.build())
+    }
+
+    fn prepare_ssl(
+        &self,
+        ssl_connector: &SslConnector,
+        host: &str,
+        port: u16,
+        enable_early_data: bool,
+    ) -> Result<Ssl, Error> {
+        let config = ssl_connector
+            .configure()
+            .map_err(|e| Error::Tls(format!("Failed to configure SSL: {}", e)))?;
+        let mut ssl = config
+            .into_ssl(host)
+            .map_err(|e| Error::Tls(format!("Failed to prepare SSL: {}", e)))?;
+        ssl.replace_ex_data(*connect_port_index(), ConnectPort(port));
+
+        let cache_key = SessionCacheKey::new(host, port);
+        if let Some(session) = self.session_cache.get_session(&cache_key) {
+            unsafe {
+                ssl.set_session(&session).map_err(|e| {
+                    Error::Tls(format!("Failed to install cached TLS session: {}", e))
+                })?;
+            }
+        }
+
+        if enable_early_data && self.enable_early_data {
+            unsafe {
+                SSL_set_early_data_enabled(ssl.as_ptr(), 1);
+            }
+        }
+
+        Ok(ssl)
+    }
+
+    async fn tls_handshake(
+        &self,
+        ssl_connector: &SslConnector,
+        host: &str,
+        port: u16,
+        tcp_stream: TcpStream,
+        early_data: Option<&[u8]>,
+    ) -> Result<(SslStream<TcpStream>, EarlyDataOutcome), Error> {
+        let attempt_early_data = early_data.is_some_and(|data| {
+            !data.is_empty()
+                && self.enable_early_data
+                && self
+                    .session_cache
+                    .supports_zero_rtt(&SessionCacheKey::new(host, port))
+        });
+        let ssl = self.prepare_ssl(
+            ssl_connector,
+            host,
+            port,
+            attempt_early_data,
+        )?;
+
+        if attempt_early_data {
+            let early_data = early_data.expect("checked above");
+            let mid = ssl.setup_connect(AsyncStreamBridge::new(tcp_stream));
+            return drive_handshake_with_early_data(mid, early_data).await;
+        }
+
+        let stream = SslStreamBuilder::new(ssl, tcp_stream)
+            .connect()
+            .await
+            .map_err(|e| Error::Tls(format!("TLS handshake failed: {}", e)))?;
+        Ok((stream, EarlyDataOutcome::NotAttempted))
+    }
+
+    fn configure_ssl(&self, _domain: &str, alpn_mode: AlpnMode) -> Result<SslConnector, Error> {
+        self.build_ssl_connector(alpn_mode)
+    }
+
+    /// Access the shared TLS session cache (for tests and diagnostics).
+    pub fn session_cache(&self) -> &Arc<SessionCache> {
+        &self.session_cache
     }
 }
 
@@ -464,6 +674,14 @@ impl MaybeHttpsStream {
     pub fn is_h2(&self) -> bool {
         self.alpn_protocol().is_h2()
     }
+
+    /// Whether the TLS session was resumed from the external session cache.
+    pub fn session_reused(&self) -> bool {
+        match self {
+            MaybeHttpsStream::Http(_) => false,
+            MaybeHttpsStream::Https(stream) => stream.ssl().session_reused(),
+        }
+    }
 }
 
 impl AsyncRead for MaybeHttpsStream {
@@ -522,6 +740,19 @@ impl BoringConnector {
         uri: &Uri,
         alpn_mode: AlpnMode,
     ) -> Result<MaybeHttpsStream, Error> {
+        let (stream, _) = self
+            .connect_with_alpn_and_early_data(uri, alpn_mode, None)
+            .await?;
+        Ok(stream)
+    }
+
+    /// Connect with optional TLS 1.3 0-RTT early data on resumable sessions.
+    pub async fn connect_with_alpn_and_early_data(
+        &self,
+        uri: &Uri,
+        alpn_mode: AlpnMode,
+        early_data: Option<&[u8]>,
+    ) -> Result<(MaybeHttpsStream, EarlyDataOutcome), Error> {
         let host = uri
             .host()
             .ok_or_else(|| Error::Connection("Missing host".into()))?;
@@ -533,80 +764,26 @@ impl BoringConnector {
                 80
             });
 
-        let addrs = self.dns_config.resolve(host, port).await?;
-
-        // Configure TCP socket options if fingerprint is provided
+        let addrs = interleave_addresses(self.dns_config.resolve(host, port).await?);
         let tcp_stream = if let Some(ref tcp_fp) = self.tcp_fingerprint {
-            // Create socket2 socket, configure it, then connect and convert to tokio TcpStream
-            use socket2::{Domain, Socket, Type};
-            use tokio::task;
-
-            // Perform blocking socket operations in a blocking task
-            let tcp_fp_clone = tcp_fp.clone();
-            let keepalive = self.tcp_keepalive.clone();
-            let host_for_error = host.to_string();
-            let std_stream = task::spawn_blocking(move || -> Result<std::net::TcpStream, Error> {
-                let mut last_error = None;
-                for socket_addr in addrs {
-                    let domain = match socket_addr {
-                        std::net::SocketAddr::V4(_) => Domain::IPV4,
-                        std::net::SocketAddr::V6(_) => Domain::IPV6,
-                    };
-                    let socket = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP))
-                        .map_err(|e| Error::Connection(format!("Failed to create socket: {e}")))?;
-
-                    configure_tcp_socket(&socket, &tcp_fp_clone).map_err(|e| {
-                        Error::Connection(format!("Failed to configure TCP socket: {e}"))
-                    })?;
-                    apply_tcp_keepalive(socket2::SockRef::from(&socket), &keepalive)?;
-
-                    match socket.connect(&socket_addr.into()) {
-                        Ok(()) => {
-                            socket.set_nonblocking(true).map_err(|e| {
-                                Error::Connection(format!("Failed to set non-blocking: {e}"))
-                            })?;
-                            return Ok(socket.into());
-                        }
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                Err(Error::Connection(format!(
-                    "Failed to connect to {host_for_error}:{port}: {}",
-                    last_error
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "no addresses resolved".to_string())
-                )))
-            })
-            .await
-            .map_err(|e| Error::Connection(format!("Blocking task failed: {}", e)))??;
-
-            // Convert to tokio TcpStream (socket is already non-blocking)
-            TcpStream::from_std(std_stream).map_err(|e| {
-                Error::Connection(format!("Failed to convert to tokio stream: {}", e))
-            })?
+            connect_tcp_fingerprint(
+                addrs,
+                tcp_fp.clone(),
+                self.tcp_keepalive.clone(),
+                self.happy_eyeballs_delay,
+                host,
+                port,
+            )
+            .await?
         } else {
-            // Default connection without TCP fingerprinting
-            let mut last_error = None;
-            let mut connected = None;
-            for addr in addrs {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        connected = Some(stream);
-                        break;
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            let stream = connected.ok_or_else(|| {
-                Error::Connection(format!(
-                    "Failed to connect to {host}:{port}: {}",
-                    last_error
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "no addresses resolved".to_string())
-                ))
-            })?;
-            apply_tcp_keepalive_to_stream(&stream, &self.tcp_keepalive)?;
-            stream
+            connect_tcp_async(
+                addrs,
+                self.happy_eyeballs_delay,
+                self.tcp_keepalive.clone(),
+                host,
+                port,
+            )
+            .await?
         };
 
         tcp_stream
@@ -614,19 +791,13 @@ impl BoringConnector {
             .map_err(|e| Error::Connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
         if uri.scheme_str() == Some("https") {
-            let ssl_connector = self.configure_ssl(host, alpn_mode)?;
-
-            let ssl_config = ssl_connector
-                .configure()
-                .map_err(|e| Error::Tls(format!("Failed to configure SSL: {}", e)))?;
-
-            let ssl_stream = tokio_boring::connect(ssl_config, host, tcp_stream)
-                .await
-                .map_err(|e| Error::Tls(format!("TLS handshake failed: {}", e)))?;
-
-            Ok(MaybeHttpsStream::Https(ssl_stream))
+            let ssl_connector = self.ssl_connector(alpn_mode)?;
+            let (ssl_stream, outcome) = self
+                .tls_handshake(&ssl_connector, host, port, tcp_stream, early_data)
+                .await?;
+            Ok((MaybeHttpsStream::Https(ssl_stream), outcome))
         } else {
-            Ok(MaybeHttpsStream::Http(tcp_stream))
+            Ok((MaybeHttpsStream::Http(tcp_stream), EarlyDataOutcome::NotAttempted))
         }
     }
 
@@ -639,6 +810,283 @@ impl BoringConnector {
 impl Default for BoringConnector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn alpn_index(mode: AlpnMode) -> usize {
+    match mode {
+        AlpnMode::Default => 0,
+        AlpnMode::Http1Only => 1,
+    }
+}
+
+fn interleave_addresses(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v6 = addrs.iter().copied().filter(|addr| addr.is_ipv6()).collect::<Vec<_>>();
+    let mut v4 = addrs.iter().copied().filter(|addr| addr.is_ipv4()).collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(addrs.len());
+    loop {
+        let mut progressed = false;
+        if let Some(addr) = v6.first().copied() {
+            v6.remove(0);
+            out.push(addr);
+            progressed = true;
+        }
+        if let Some(addr) = v4.first().copied() {
+            v4.remove(0);
+            out.push(addr);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
+async fn connect_tcp_async(
+    addrs: Vec<SocketAddr>,
+    delay: Duration,
+    keepalive: TcpKeepaliveConfig,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, Error> {
+    if addrs.is_empty() {
+        return Err(Error::Connection(format!(
+            "Failed to connect to {host}:{port}: no addresses resolved"
+        )));
+    }
+
+    if delay.is_zero() || addrs.len() == 1 {
+        let mut last_error = None;
+        for addr in addrs {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    apply_tcp_keepalive_to_stream(&stream, &keepalive)?;
+                    return Ok(stream);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        return Err(connection_error(host, port, last_error));
+    }
+
+    let mut join_set = JoinSet::new();
+    for (index, addr) in addrs.into_iter().enumerate() {
+        let stagger = delay.saturating_mul(index as u32);
+        join_set.spawn(async move {
+            if !stagger.is_zero() {
+                tokio::time::sleep(stagger).await;
+            }
+            TcpStream::connect(addr).await
+        });
+    }
+
+    let mut last_error = None;
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(stream)) => {
+                join_set.abort_all();
+                apply_tcp_keepalive_to_stream(&stream, &keepalive)?;
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(error) => last_error = Some(error.into()),
+        }
+    }
+
+    Err(connection_error(host, port, last_error))
+}
+
+/// Loser attempts in the fingerprint path may continue until their bounded
+/// `connect_timeout` even after a winner is chosen.
+async fn connect_tcp_fingerprint(
+    addrs: Vec<SocketAddr>,
+    tcp_fp: TcpFingerprint,
+    keepalive: TcpKeepaliveConfig,
+    delay: Duration,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, Error> {
+    use socket2::{Domain, Socket, Type};
+
+    if addrs.is_empty() {
+        return Err(Error::Connection(format!(
+            "Failed to connect to {host}:{port}: no addresses resolved"
+        )));
+    }
+
+    let per_attempt_timeout = delay
+        .saturating_add(Duration::from_millis(50))
+        .max(Duration::from_millis(50));
+    let mut join_set: JoinSet<Result<std::net::TcpStream, Error>> = JoinSet::new();
+    for (index, addr) in addrs.into_iter().enumerate() {
+        let stagger = delay.saturating_mul(index as u32);
+        let tcp_fp = tcp_fp.clone();
+        let keepalive = keepalive.clone();
+        join_set.spawn_blocking(move || {
+            if !stagger.is_zero() {
+                std::thread::sleep(stagger);
+            }
+            let domain = match addr {
+                SocketAddr::V4(_) => Domain::IPV4,
+                SocketAddr::V6(_) => Domain::IPV6,
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(|e| Error::Connection(format!("Failed to create socket: {e}")))?;
+            configure_tcp_socket(&socket, &tcp_fp).map_err(|e| {
+                Error::Connection(format!("Failed to configure TCP socket: {e}"))
+            })?;
+            apply_tcp_keepalive(socket2::SockRef::from(&socket), &keepalive)?;
+            socket
+                .connect_timeout(&addr.into(), per_attempt_timeout)
+                .map_err(|e| Error::Connection(format!("Failed to connect to {addr}: {e}")))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| Error::Connection(format!("Failed to set non-blocking: {e}")))?;
+            Ok(socket.into())
+        });
+    }
+
+    let mut last_error = None;
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(std_stream)) => {
+                join_set.abort_all();
+                return TcpStream::from_std(std_stream).map_err(|e| {
+                    Error::Connection(format!("Failed to convert to tokio stream: {e}"))
+                });
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    Err(Error::Connection(format!(
+        "Failed to connect to {host}:{port}: {}",
+        last_error.unwrap_or_else(|| "no addresses resolved".to_string())
+    )))
+}
+
+fn connection_error(host: &str, port: u16, last_error: Option<io::Error>) -> Error {
+    Error::Connection(format!(
+        "Failed to connect to {host}:{port}: {}",
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no addresses resolved".to_string())
+    ))
+}
+
+async fn drive_handshake_with_early_data<S>(
+    mut mid: boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>,
+    early_data: &[u8],
+) -> Result<(SslStream<S>, EarlyDataOutcome), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use boring::ssl::HandshakeError as SslHandshakeError;
+
+    let mut early_offset = 0usize;
+
+    loop {
+        mid.get_mut().set_waker(None);
+        match mid.handshake() {
+            Ok(stream) => {
+                let ssl = stream.ssl();
+                let outcome = if unsafe { SSL_early_data_accepted(ssl.as_ptr()) != 0 } {
+                    EarlyDataOutcome::Accepted
+                } else {
+                    EarlyDataOutcome::Rejected {
+                        reason: unsafe { SSL_get_early_data_reason(ssl.as_ptr()) as u32 },
+                    }
+                };
+                return Ok((wrap_tokio_ssl_stream(stream), outcome));
+            }
+            Err(SslHandshakeError::WouldBlock(mut pending)) => {
+                if early_offset < early_data.len()
+                    && unsafe { SSL_in_early_data(pending.ssl().as_ptr()) != 0 }
+                {
+                    let written = write_tls_early_data(pending.ssl_mut(), &early_data[early_offset..])?;
+                    early_offset += written;
+                }
+                mid = pending_handshake(pending).await?;
+            }
+            Err(SslHandshakeError::SetupFailure(err)) => {
+                return Err(Error::Tls(format!("TLS handshake setup failed: {err}")));
+            }
+            Err(SslHandshakeError::Failure(err)) => {
+                return Err(Error::Tls(format!(
+                    "TLS handshake failed: {}",
+                    err.error()
+                )));
+            }
+        }
+    }
+}
+
+fn wrap_tokio_ssl_stream<S>(
+    stream: boring::ssl::SslStream<AsyncStreamBridge<S>>,
+) -> SslStream<S> {
+    // Both types are single-field newtypes over the same inner `SslStream<AsyncStreamBridge<S>>`.
+    unsafe { std::mem::transmute(stream) }
+}
+
+async fn pending_handshake<S>(
+    mid: boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>,
+) -> Result<boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::future::Future;
+
+    struct HandshakeWait<S> {
+        mid: Option<boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>>,
+        registered: bool,
+    }
+
+    impl<S> Future for HandshakeWait<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        type Output = boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.registered {
+                let mid = self.mid.as_mut().expect("mid missing");
+                mid.get_mut().set_waker(Some(cx));
+                mid.ssl_mut().set_task_waker(Some(cx.waker().clone()));
+                self.registered = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(self.mid.take().expect("mid missing on wake"))
+        }
+    }
+
+    Ok(HandshakeWait {
+        mid: Some(mid),
+        registered: false,
+    }
+    .await)
+}
+
+fn write_tls_early_data(ssl: &mut boring::ssl::SslRef, data: &[u8]) -> Result<usize, Error> {
+    unsafe {
+        let written = boring_sys::SSL_write(
+            ssl.as_ptr() as *mut SSL,
+            data.as_ptr() as *const std::ffi::c_void,
+            data.len().try_into().unwrap_or(i32::MAX),
+        );
+        if written > 0 {
+            return Ok(written as usize);
+        }
+        let code = boring_sys::SSL_get_error(ssl.as_ptr(), written);
+        if code == boring_sys::SSL_ERROR_WANT_READ as i32
+            || code == boring_sys::SSL_ERROR_WANT_WRITE as i32
+        {
+            return Ok(0);
+        }
+        Err(Error::Tls(format!(
+            "Failed to write TLS early data (ssl error code {code})"
+        )))
     }
 }
 

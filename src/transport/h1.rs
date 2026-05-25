@@ -30,6 +30,8 @@ pub struct H1StreamingOptions {
     pub on_reusable: H1ReuseHook,
     pub read_idle_timeout: Option<Duration>,
     pub total_timeout: Option<Duration>,
+    /// When true, the request head was already sent during TLS 0-RTT / 1-RTT replay.
+    pub request_head_sent: bool,
 }
 
 /// Maximum response header size (64KB).
@@ -50,11 +52,16 @@ const MAX_HEADERS_COUNT: usize = 100;
 /// memcpy costs.
 const STREAM_READ_BUF_SIZE: usize = 64 * 1024;
 
+/// Coalesce chunked request-body frames up to this payload size into one write.
+const CHUNKED_COALESCE_COPY_LIMIT: usize = 64 * 1024;
+
 /// HTTP/1.1 connection for sending requests.
 pub struct H1Connection {
     stream: MaybeHttpsStream,
     /// Whether the connection should be closed after the current response.
     should_close: bool,
+    /// Reused scratch for coalesced chunked request-body frames.
+    chunked_write_scratch: BytesMut,
 }
 
 pub(crate) enum H1BodyMode {
@@ -65,7 +72,7 @@ pub(crate) enum H1BodyMode {
 }
 
 #[derive(Clone, Copy)]
-enum H1RequestBodyKind {
+pub(crate) enum H1RequestBodyKind {
     None,
     ContentLength(u64),
     Chunked,
@@ -495,7 +502,7 @@ impl HttpBody for H1Body {
     }
 }
 
-fn h1_request_body_kind(body: &RequestBody) -> H1RequestBodyKind {
+pub(crate) fn h1_request_body_kind(body: &RequestBody) -> H1RequestBodyKind {
     match body {
         RequestBody::Empty => H1RequestBodyKind::None,
         RequestBody::Bytes(bytes) => H1RequestBodyKind::ContentLength(bytes.len() as u64),
@@ -519,6 +526,7 @@ impl H1Connection {
         Self {
             stream,
             should_close: false,
+            chunked_write_scratch: BytesMut::with_capacity(256),
         }
     }
 
@@ -588,23 +596,27 @@ impl H1Connection {
         options: H1StreamingOptions,
     ) -> Result<Response> {
         let body_kind = h1_request_body_kind(&body);
-        let request_bytes = self.build_request(&method, uri, &headers, body_kind)?;
+        let request_bytes = Self::build_request_bytes(&method, uri, &headers, body_kind)?;
 
-        match body {
-            RequestBody::Stream {
-                stream,
-                content_length: Some(expected_len),
-            } => {
-                self.write_sized_request_stream_with_head(request_bytes, stream, expected_len)
-                    .await?;
+        if !options.request_head_sent {
+            match body {
+                RequestBody::Stream {
+                    stream,
+                    content_length: Some(expected_len),
+                } => {
+                    self.write_sized_request_stream_with_head(request_bytes, stream, expected_len)
+                        .await?;
+                }
+                body => {
+                    self.stream
+                        .write_all(&request_bytes)
+                        .await
+                        .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
+                    self.write_request_body(body).await?;
+                }
             }
-            body => {
-                self.stream
-                    .write_all(&request_bytes)
-                    .await
-                    .map_err(|e| Error::HttpProtocol(format!("Failed to write request: {}", e)))?;
-                self.write_request_body(body).await?;
-            }
+        } else {
+            self.write_request_body(body).await?;
         }
 
         self.stream
@@ -633,8 +645,27 @@ impl H1Connection {
     /// - CONNECT uses authority-form (host:port)
     /// - Server-wide OPTIONS uses asterisk-form (*)
     /// - All others use origin-form (/path?query)
+    /// Build the HTTP/1.1 request head as bytes.
+    pub(crate) fn build_request_bytes(
+        method: &Method,
+        uri: &Uri,
+        headers: &[(String, String)],
+        body_kind: H1RequestBodyKind,
+    ) -> Result<Vec<u8>> {
+        Self::build_request_impl(method, uri, headers, body_kind)
+    }
+
     fn build_request(
         &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &[(String, String)],
+        body_kind: H1RequestBodyKind,
+    ) -> Result<Vec<u8>> {
+        Self::build_request_impl(method, uri, headers, body_kind)
+    }
+
+    fn build_request_impl(
         method: &Method,
         uri: &Uri,
         headers: &[(String, String)],
@@ -806,34 +837,7 @@ impl H1Connection {
                         if chunk.is_empty() {
                             continue;
                         }
-                        let prefix = format!("{:x}\r\n", chunk.len());
-                        self.stream
-                            .write_all(prefix.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                Error::HttpProtocol(format!(
-                                    "Failed to write chunked request body header: {}",
-                                    e
-                                ))
-                            })?;
-                        self.stream.write_all(&chunk).await.map_err(|e| {
-                            Error::HttpProtocol(format!(
-                                "Failed to write chunked request body data: {}",
-                                e
-                            ))
-                        })?;
-                        self.stream.write_all(b"\r\n").await.map_err(|e| {
-                            Error::HttpProtocol(format!(
-                                "Failed to write chunked request body delimiter: {}",
-                                e
-                            ))
-                        })?;
-                        self.stream.flush().await.map_err(|e| {
-                            Error::HttpProtocol(format!(
-                                "Failed to flush chunked request body: {}",
-                                e
-                            ))
-                        })?;
+                        self.write_chunked_body_frame(&chunk).await?;
                     }
                     self.stream.write_all(b"0\r\n\r\n").await.map_err(|e| {
                         Error::HttpProtocol(format!(
@@ -842,6 +846,77 @@ impl H1Connection {
                         ))
                     })
                 }
+            }
+        }
+    }
+
+    /// Write one RFC 9112 chunked frame (`hex-size\r\n` + payload + `\r\n`).
+    ///
+    /// Small chunks coalesce into a single `write_all`. Large chunks on plain
+    /// TCP use `write_vectored`; BoringSSL flattens vectored writes internally,
+    /// so the TLS path uses three `write_all` calls (still omitting per-chunk flush).
+    async fn write_chunked_body_frame(&mut self, chunk: &Bytes) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        let prefix = format!("{:x}\r\n", chunk.len());
+        let prefix_bytes = prefix.as_bytes();
+
+        if chunk.len() <= CHUNKED_COALESCE_COPY_LIMIT {
+            self.chunked_write_scratch.clear();
+            if self.chunked_write_scratch.capacity()
+                < prefix_bytes.len() + chunk.len() + 2
+            {
+                self.chunked_write_scratch
+                    .reserve(prefix_bytes.len() + chunk.len() + 2);
+            }
+            self.chunked_write_scratch.extend_from_slice(prefix_bytes);
+            self.chunked_write_scratch.extend_from_slice(chunk);
+            self.chunked_write_scratch.extend_from_slice(b"\r\n");
+            return self
+                .stream
+                .write_all(&self.chunked_write_scratch)
+                .await
+                .map_err(|e| {
+                    Error::HttpProtocol(format!(
+                        "Failed to write chunked request body frame: {}",
+                        e
+                    ))
+                });
+        }
+
+        match &mut self.stream {
+            MaybeHttpsStream::Http(tcp) => {
+                write_tcp_vectored_all(tcp, prefix_bytes, chunk, b"\r\n").await.map_err(|e| {
+                    Error::HttpProtocol(format!(
+                        "Failed to write large chunked request body frame: {}",
+                        e
+                    ))
+                })
+            }
+            MaybeHttpsStream::Https(_) => {
+                self.stream
+                    .write_all(prefix_bytes)
+                    .await
+                    .map_err(|e| {
+                        Error::HttpProtocol(format!(
+                            "Failed to write chunked request body header: {}",
+                            e
+                        ))
+                    })?;
+                self.stream.write_all(chunk).await.map_err(|e| {
+                    Error::HttpProtocol(format!(
+                        "Failed to write chunked request body data: {}",
+                        e
+                    ))
+                })?;
+                self.stream.write_all(b"\r\n").await.map_err(|e| {
+                    Error::HttpProtocol(format!(
+                        "Failed to write chunked request body delimiter: {}",
+                        e
+                    ))
+                })
             }
         }
     }
@@ -1531,6 +1606,28 @@ async fn write_sized_request_stream_with_head_http(
         )));
     }
 
+    Ok(())
+}
+
+async fn write_tcp_vectored_all(
+    tcp: &mut tokio::net::TcpStream,
+    prefix: &[u8],
+    chunk: &[u8],
+    suffix: &[u8],
+) -> std::io::Result<()> {
+    use std::io::IoSlice;
+    let mut bufs = [
+        IoSlice::new(prefix),
+        IoSlice::new(chunk),
+        IoSlice::new(suffix),
+    ];
+    while !bufs.is_empty() {
+        let n = tcp.write_vectored(&bufs).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut bufs, n);
+    }
     Ok(())
 }
 

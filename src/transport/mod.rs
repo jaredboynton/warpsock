@@ -12,3 +12,6 @@ pub mod h2;
 pub mod h3;
 pub mod session;
 pub mod tcp;
+pub mod zero_rtt;
+
+pub use zero_rtt::{is_zero_rtt_safe_request, is_zero_rtt_safe_request_parts};

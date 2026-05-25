@@ -33,6 +33,16 @@ pub struct TcpFingerprint {
     /// Enable TCP timestamps (RFC 1323).
     /// Modern browsers: true
     pub timestamps: bool,
+    /// Optional `TCP_NOTSENT_LOWAT` watermark (bytes). Linux and macOS only.
+    ///
+    /// Limits unsent data in the kernel send buffer before `EPOLLOUT` is
+    /// signaled, improving request-response latency on high-RTT links. Applies
+    /// to all new connections; does not retroactively affect pooled connections.
+    ///
+    /// Recommended values (Eric Dumazet):
+    /// - `16384` (16 KiB): interactive RPC / low-latency request-response
+    /// - `131072` (128 KiB): general-purpose throughput/latency balance
+    pub tcp_notsent_lowat: Option<u32>,
 }
 
 impl Default for TcpFingerprint {
@@ -45,6 +55,7 @@ impl Default for TcpFingerprint {
             window_scale: 6,
             sack_permitted: true,
             timestamps: true,
+            tcp_notsent_lowat: None,
         }
     }
 }
@@ -76,6 +87,10 @@ pub fn configure_tcp_socket(socket: &socket2::Socket, fp: &TcpFingerprint) -> io
     // Set TTL for IPv4 packets
     socket.set_ttl_v4(fp.ttl as u32)?;
 
+    if let Some(bytes) = fp.tcp_notsent_lowat {
+        set_tcp_notsent_lowat(socket, bytes)?;
+    }
+
     // MSS (Maximum Segment Size) is negotiated during TCP handshake and cannot be
     // directly set via socket options. The OS handles MSS negotiation based
     // on MTU discovery.
@@ -91,9 +106,75 @@ pub fn configure_tcp_socket(socket: &socket2::Socket, fp: &TcpFingerprint) -> io
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+fn set_tcp_notsent_lowat(socket: &socket2::Socket, bytes: u32) -> io::Result<()> {
+    use std::mem;
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    use libc::TCP_NOTSENT_LOWAT;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const TCP_NOTSENT_LOWAT: i32 = 0x202;
+
+    let fd = socket.as_raw_fd();
+    let value = bytes;
+    // SAFETY: `fd` is a valid socket descriptor and `value` is a plain u32 for
+    // TCP_NOTSENT_LOWAT on Linux/Darwin.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            (&raw const value).cast(),
+            mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn set_tcp_notsent_lowat(_socket: &socket2::Socket, _bytes: u32) -> io::Result<()> {
+    tracing::debug!("TCP_NOTSENT_LOWAT is not supported on this platform");
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[cfg(test)]
+fn read_tcp_notsent_lowat(socket: &socket2::Socket) -> io::Result<u32> {
+    use std::mem;
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    use libc::TCP_NOTSENT_LOWAT;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const TCP_NOTSENT_LOWAT: i32 = 0x202;
+
+    let fd = socket.as_raw_fd();
+    let mut value: u32 = 0;
+    let mut len = mem::size_of::<u32>() as libc::socklen_t;
+    // SAFETY: `fd` is valid; `value`/`len` are initialized for getsockopt out-params.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            (&raw mut value).cast(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket2::{Domain, Socket, Type};
 
     #[test]
     fn test_tcp_fingerprint_defaults() {
@@ -104,6 +185,7 @@ mod tests {
         assert_eq!(fp.window_scale, 6);
         assert!(fp.sack_permitted);
         assert!(fp.timestamps);
+        assert!(fp.tcp_notsent_lowat.is_none());
     }
 
     #[test]
@@ -113,5 +195,29 @@ mod tests {
         // Chrome and Firefox use similar TCP settings
         assert_eq!(chrome.window_size, firefox.window_size);
         assert_eq!(chrome.ttl, firefox.ttl);
+    }
+
+    #[test]
+    fn default_tcp_configuration_leaves_socket_buffers_untouched() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
+        let initial_recv = socket.recv_buffer_size().unwrap();
+        let initial_send = socket.send_buffer_size().unwrap();
+
+        configure_tcp_socket(&socket, &TcpFingerprint::default()).unwrap();
+
+        assert_eq!(socket.recv_buffer_size().unwrap(), initial_recv);
+        assert_eq!(socket.send_buffer_size().unwrap(), initial_send);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn tcp_notsent_lowat_round_trips_via_getsockopt() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        let fp = TcpFingerprint {
+            tcp_notsent_lowat: Some(16_384),
+            ..TcpFingerprint::default()
+        };
+        configure_tcp_socket(&socket, &fp).unwrap();
+        assert_eq!(read_tcp_notsent_lowat(&socket).unwrap(), 16_384);
     }
 }

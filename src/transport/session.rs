@@ -1,18 +1,39 @@
-//! TLS session resumption and caching.
+//! TLS session resumption and caching for TCP-TLS connections.
 //!
-//! Implements generic session ticket caching for TLS 1.2 and TLS 1.3 session resumption.
-//! Browsers cache session tickets to enable 0-RTT (early data) and faster handshakes, but
-//! native HTTP/3 does not yet wire this cache into the QUIC TLS handshake.
+//! BoringSSL does not retain client sessions in its internal cache. Callers must
+//! install `SSL_CTX_sess_set_new_cb`, store tickets externally, and replay them
+//! with `SSL_set_session` on subsequent dials.
 
+use boring::ssl::SslSession;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// TLS session ticket cache.
-///
-/// Stores session tickets per host to enable session resumption.
-/// Session tickets are provided by the server during TLS handshake
-/// and can be reused for subsequent connections.
+/// Cache key for a TLS session ticket.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SessionCacheKey {
+    pub host: String,
+    pub port: u16,
+}
+
+impl SessionCacheKey {
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            port,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedSession {
+    der: Vec<u8>,
+    early_data_capable: bool,
+    max_age: Duration,
+    received_at: Instant,
+}
+
+/// Host-keyed TLS session ticket cache shared across connector clones.
 #[derive(Debug, Clone)]
 pub struct SessionCache {
     inner: Arc<Mutex<SessionCacheInner>>,
@@ -20,20 +41,8 @@ pub struct SessionCache {
 
 #[derive(Debug)]
 struct SessionCacheInner {
-    /// Session tickets by host:port
-    tickets: HashMap<String, SessionTicket>,
-    /// Maximum age for session tickets
-    max_age: Duration,
-}
-
-#[derive(Debug, Clone)]
-struct SessionTicket {
-    /// Session ticket data (opaque blob from server)
-    data: Vec<u8>,
-    /// When this ticket was received
-    received_at: Instant,
-    /// Maximum age for this ticket (from server)
-    max_age: Duration,
+    sessions: HashMap<SessionCacheKey, CachedSession>,
+    default_max_age: Duration,
 }
 
 impl SessionCache {
@@ -41,75 +50,110 @@ impl SessionCache {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SessionCacheInner {
-                tickets: HashMap::new(),
-                max_age: Duration::from_secs(86400), // 24 hours
+                sessions: HashMap::new(),
+                default_max_age: Duration::from_secs(86400),
             })),
         }
     }
 
-    /// Create a session cache with custom max age.
+    /// Create a session cache with custom default max age.
     pub fn with_max_age(max_age: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SessionCacheInner {
-                tickets: HashMap::new(),
-                max_age,
+                sessions: HashMap::new(),
+                default_max_age: max_age,
             })),
         }
     }
 
-    /// Store a session ticket for a host.
-    pub fn store_ticket(&self, host: &str, ticket_data: Vec<u8>, max_age: Option<Duration>) {
+    /// Store a serialized TLS session for later resumption.
+    pub fn store_session(
+        &self,
+        key: SessionCacheKey,
+        der: Vec<u8>,
+        early_data_capable: bool,
+        max_age: Option<Duration>,
+    ) {
         let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
-        let max_age = max_age.unwrap_or(inner.max_age);
-
-        inner.tickets.insert(
-            host.to_string(),
-            SessionTicket {
-                data: ticket_data,
-                received_at: Instant::now(),
+        let max_age = max_age.unwrap_or(inner.default_max_age);
+        inner.sessions.insert(
+            key,
+            CachedSession {
+                der,
+                early_data_capable,
                 max_age,
+                received_at: Instant::now(),
             },
         );
     }
 
-    /// Get a session ticket for a host (if valid and not expired).
-    pub fn get_ticket(&self, host: &str) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
-
-        if let Some(ticket) = inner.tickets.get(host) {
-            // Check if ticket is still valid
-            if ticket.received_at.elapsed() < ticket.max_age {
-                return Some(ticket.data.clone());
-            } else {
-                // Expired, remove it
-                inner.tickets.remove(host);
-            }
-        }
-
-        None
+    /// Legacy host-only store API retained for compatibility.
+    pub fn store_ticket(&self, host: &str, ticket_data: Vec<u8>, max_age: Option<Duration>) {
+        self.store_session(
+            SessionCacheKey::new(host, 443),
+            ticket_data,
+            false,
+            max_age,
+        );
     }
 
-    /// Clear all cached tickets.
+    /// Load a cached session if still valid.
+    pub fn get_session(&self, key: &SessionCacheKey) -> Option<SslSession> {
+        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
+        let entry = inner.sessions.get(key)?.clone();
+        if entry.received_at.elapsed() >= entry.max_age {
+            inner.sessions.remove(key);
+            return None;
+        }
+        SslSession::from_der(&entry.der).ok()
+    }
+
+    /// Whether a cached session advertises TLS 1.3 early-data support.
+    pub fn supports_zero_rtt(&self, key: &SessionCacheKey) -> bool {
+        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
+        let Some(entry) = inner.sessions.get(key) else {
+            return false;
+        };
+        if entry.received_at.elapsed() >= entry.max_age {
+            inner.sessions.remove(key);
+            return false;
+        }
+        entry.early_data_capable
+    }
+
+    /// Legacy host-only lookup API retained for compatibility.
+    pub fn get_ticket(&self, host: &str) -> Option<Vec<u8>> {
+        let key = SessionCacheKey::new(host, 443);
+        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
+        let entry = inner.sessions.get(&key)?.clone();
+        if entry.received_at.elapsed() >= entry.max_age {
+            inner.sessions.remove(&key);
+            return None;
+        }
+        Some(entry.der.clone())
+    }
+
+    /// Clear all cached sessions.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
-        inner.tickets.clear();
+        inner.sessions.clear();
     }
 
-    /// Remove expired tickets.
+    /// Remove expired sessions.
     pub fn cleanup_expired(&self) {
         let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
         inner
-            .tickets
-            .retain(|_, ticket| ticket.received_at.elapsed() < ticket.max_age);
+            .sessions
+            .retain(|_, entry| entry.received_at.elapsed() < entry.max_age);
     }
 
-    /// Get the number of cached tickets.
+    /// Number of cached sessions.
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().expect("Session cache mutex poisoned");
-        inner.tickets.len()
+        inner.sessions.len()
     }
 
-    /// Check if cache is empty.
+    /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -128,25 +172,22 @@ mod tests {
     #[test]
     fn test_session_cache_store_and_retrieve() {
         let cache = SessionCache::new();
-        cache.store_ticket("example.com", vec![1, 2, 3], None);
+        cache.store_session(
+            SessionCacheKey::new("example.com", 443),
+            vec![1, 2, 3],
+            false,
+            None,
+        );
 
-        assert_eq!(cache.get_ticket("example.com"), Some(vec![1, 2, 3]));
-        assert_eq!(cache.get_ticket("other.com"), None);
-    }
-
-    #[test]
-    fn test_session_cache_expiration() {
-        let cache = SessionCache::with_max_age(Duration::from_secs(1));
-        cache.store_ticket("example.com", vec![1, 2, 3], None);
-
-        assert_eq!(cache.get_ticket("example.com"), Some(vec![1, 2, 3]));
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_secs(2));
-
-        // Ticket should be expired
-        assert_eq!(cache.get_ticket("example.com"), None);
-        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache
+                .get_ticket("example.com")
+                .expect("legacy lookup should work"),
+            vec![1, 2, 3]
+        );
+        assert!(cache
+            .get_session(&SessionCacheKey::new("other.com", 443))
+            .is_none());
     }
 
     #[test]

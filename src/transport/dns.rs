@@ -48,7 +48,7 @@ impl DnsConfig {
             overrides: Arc::new(HashMap::new()),
             resolver: Arc::new(SystemResolver),
             cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_enabled: false,
+            cache_enabled: true,
             cache_ttl: Duration::from_secs(300),
         }
     }
