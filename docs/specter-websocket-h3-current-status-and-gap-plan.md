@@ -52,6 +52,7 @@ This file is the current cross-protocol capability and gap plan for requests, st
 | Required H3 HTTP comparator proof | `specter_native`, `quiche_direct`, `tokio_quiche`, `h3_quinn`, and `reqwest_h3` have measured same-fixture rows and the H3 HTTP gate passes. |
 | RFC9220 full tunnel-suite superiority | Echo, close/FIN, and slow-consumer mixed rows for Specter and low-level `quiche`/`tokio-quiche` are measured at n=100 with the full-suite gate passing. |
 | Same-fixture `tokio_quiche` body/FIN timeout | Current persisted proofs get through the matrix with zero fixture events. |
+| Fixture packet-noise cleanup | Ignored post-application short-header packet-open noise is suppressed from logs and benchmark artifacts; non-ignored packet errors still serialize stable `category` and `fatal` audit fields. |
 | RFC9220 comparator rows | Specter echo/close/mixed and low-level `quiche`/`tokio-quiche` echo/close/mixed rows are persisted at n=100. |
 | `quinn_transport` / `s2n_quic_transport` adapters | Transport-only measured rows exist; they are outside H3 superiority gates. |
 | ACK timer behavior | Native client/server/fixture ACKs now flush on threshold or `max_ack_delay_ms`. |
