@@ -518,6 +518,7 @@ impl H3Client {
             eprintln!("skip unsafe");
             return Ok(None);
         }
+        eprintln!("zero-rtt safe");
 
         let key = self.pool_key(url)?;
         if self.cached_hot_handle(url).is_some() {
@@ -546,6 +547,7 @@ impl H3Client {
             eprintln!("skip too large {} > {}", request.payload.len(), entry.max_early_data);
             return Ok(None);
         }
+        eprintln!("zero-rtt attempting payload={}", request.payload.len());
 
         let origin = key.origin_key();
         let _ticket = self.dispatcher.acquire(origin).await;
