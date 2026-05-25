@@ -3227,6 +3227,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "libc",
  "parking_lot",
  "pin-project-lite",
  "psl",
