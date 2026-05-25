@@ -121,7 +121,8 @@ async fn handle_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec
                 stream.flush().await.unwrap();
             }
             "/delay-headers" => {
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+                let _ = hold_rx.await;
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
@@ -138,7 +139,8 @@ async fn handle_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec
                 stream.flush().await.unwrap();
                 stream.write_all(b"5\r\nfirst\r\n").await.unwrap();
                 stream.flush().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+                let _ = hold_rx.await;
                 stream.write_all(b"0\r\n\r\n").await.unwrap();
                 stream.flush().await.unwrap();
             }
@@ -158,7 +160,7 @@ async fn handle_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec
                     stream.write_all(chunk).await.unwrap();
                     stream.write_all(b"\r\n").await.unwrap();
                     stream.flush().await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    tokio::task::yield_now().await;
                 }
                 stream.write_all(b"0\r\n\r\n").await.unwrap();
                 stream.flush().await.unwrap();
@@ -169,7 +171,7 @@ async fn handle_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec
                     .await
                     .unwrap();
                 stream.flush().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::task::yield_now().await;
                 stream.write_all(b"delimited").await.unwrap();
                 stream.flush().await.unwrap();
                 return;
@@ -180,7 +182,7 @@ async fn handle_connection(id: usize, mut stream: TcpStream, logs: Arc<Mutex<Vec
                     .await
                     .unwrap();
                 stream.flush().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::task::yield_now().await;
                 stream.write_all(b"early-2").await.unwrap();
                 stream.flush().await.unwrap();
                 let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
@@ -204,7 +206,7 @@ async fn write_fixed(stream: &mut TcpStream, chunks: &[&[u8]]) {
         .unwrap();
     stream.flush().await.unwrap();
     for chunk in chunks {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::task::yield_now().await;
         stream.write_all(chunk).await.unwrap();
         stream.flush().await.unwrap();
     }
