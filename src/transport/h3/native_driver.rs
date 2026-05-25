@@ -3151,4 +3151,55 @@ mod tests {
             .handshake
             .is_client_path_address_validated(&migrated_peer));
     }
+
+    #[tokio::test]
+    async fn driver_blocks_unvalidated_path_sends_beyond_anti_amplification_budget() {
+        let fingerprint = Http3Fingerprint::default();
+        let handshake = NativeQuicHandshake::client_with_verify_peer(
+            "localhost",
+            &fingerprint,
+            crate::transport::h3::quic::ConnectionId::from_static(b"server-dcid"),
+            crate::transport::h3::quic::ConnectionId::from_static(b"client-scid"),
+            false,
+        )
+        .expect("handshake");
+
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("socket"));
+        let original_peer = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let migrated_peer = SocketAddr::from(([127, 0, 0, 1], 4434));
+        let mut driver = NativeH3Driver {
+            command_tx,
+            command_rx,
+            handshake,
+            fingerprint,
+            socket,
+            peer_addr: original_peer,
+            state: NativeH3DriverState::default(),
+            pending_responses: HashMap::new(),
+            pending_streaming_responses: HashMap::new(),
+            pending_tunnels: HashMap::new(),
+            pending_commands: VecDeque::new(),
+            is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            closing_connection_close_packet: None,
+            body_progress_notify: Arc::new(Notify::new()),
+            send_scheduler: H3SendScheduler::default(),
+            transport_config: H3TransportConfig::default(),
+            session_cache: crate::transport::h3::session_cache::NativeH3SessionCache::new(),
+            session_cache_key: crate::transport::h3::session_cache::NativeH3SessionCacheKey::new(
+                "localhost",
+                std::iter::empty::<Vec<u8>>(),
+                false,
+                None,
+            ),
+            max_idle_timeout: Duration::from_secs(1),
+            last_activity: Instant::now(),
+            initial_datagram: None,
+        };
+
+        driver.observe_path_packet_from(migrated_peer, 1200);
+
+        assert!(driver.can_send_to_path(migrated_peer, 3600));
+        assert!(!driver.can_send_to_path(migrated_peer, 3601));
+    }
 }
