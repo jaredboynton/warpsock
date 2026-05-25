@@ -4063,6 +4063,36 @@ impl NativeQuicHandshake {
         self.build_client_application_control_packet(QuicFrame::PathResponse(data))
     }
 
+    pub fn build_client_new_connection_id_packet(
+        &mut self,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [u8; 16],
+    ) -> Result<ClientApplicationControlPacket> {
+        if connection_id.as_bytes().is_empty() {
+            return Err(Error::Quic(
+                "native QUIC NEW_CONNECTION_ID cannot carry an empty connection id".into(),
+            ));
+        }
+        if retire_prior_to > sequence_number {
+            return Err(Error::Quic(
+                "native QUIC NEW_CONNECTION_ID retire_prior_to exceeds sequence_number".into(),
+            ));
+        }
+        self.client_cid_inventory.register_local_issued(
+            sequence_number,
+            connection_id.clone(),
+            stateless_reset_token,
+        )?;
+        self.build_client_application_control_packet(QuicFrame::NewConnectionId {
+            sequence_number,
+            retire_prior_to,
+            connection_id: Bytes::copy_from_slice(connection_id.as_bytes()),
+            stateless_reset_token,
+        })
+    }
+
     pub fn build_client_path_challenge_packet(
         &mut self,
         data: [u8; 8],
@@ -4856,6 +4886,8 @@ impl NativeQuicHandshake {
         self.client_application_sent_streams.clear();
         self.client_application_recovery_lost_packets.clear();
         self.client_path_validator = QuicPathValidator::default();
+        self.client_cid_inventory =
+            new_client_cid_inventory(&self.fingerprint, &self.source_cid);
         self.client_pmtu_probe = QuicPmtuProbePolicy::from_transport(&self.fingerprint.transport);
         self.recovery = recovery_state_from_transport(&self.fingerprint.transport);
         self.next_client_initial_packet_number = 1;
