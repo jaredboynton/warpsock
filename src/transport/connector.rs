@@ -559,6 +559,10 @@ impl BoringConnector {
             .into_ssl(host)
             .map_err(|e| Error::Tls(format!("Failed to prepare SSL: {}", e)))?;
         ssl.replace_ex_data(*connect_port_index(), ConnectPort(port));
+        ssl.replace_ex_data(
+            *connect_host_index(),
+            ConnectHost(host.trim_end_matches('.').to_ascii_lowercase()),
+        );
 
         let cache_key = SessionCacheKey::new(host, port);
         if let Some(session) = self.session_cache.get_session(&cache_key) {
@@ -998,91 +1002,76 @@ fn connection_error(host: &str, port: u16, last_error: Option<io::Error>) -> Err
 }
 
 async fn drive_handshake_with_early_data<S>(
-    mut mid: boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>,
+    mid: boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>,
     early_data: &[u8],
 ) -> Result<(SslStream<S>, EarlyDataOutcome), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use boring::ssl::HandshakeError as SslHandshakeError;
+    use std::future::poll_fn;
 
+    let mut state: Option<boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>> = Some(mid);
     let mut early_offset = 0usize;
 
-    loop {
-        mid.get_mut().set_waker(None);
-        match mid.handshake() {
-            Ok(stream) => {
-                let ssl = stream.ssl();
-                let outcome = if unsafe { SSL_early_data_accepted(ssl.as_ptr()) != 0 } {
-                    EarlyDataOutcome::Accepted
-                } else {
-                    EarlyDataOutcome::Rejected {
-                        reason: unsafe { SSL_get_early_data_reason(ssl.as_ptr()) },
+    poll_fn(|cx| {
+        loop {
+            let mut current = state.take().expect("handshake state taken twice");
+            current.get_mut().set_waker(Some(cx));
+
+            if early_offset < early_data.len()
+                && unsafe { SSL_in_early_data(current.ssl().as_ptr()) != 0 }
+            {
+                match write_tls_early_data(
+                    current.ssl_mut(),
+                    &early_data[early_offset..],
+                ) {
+                    Ok(written) => early_offset += written,
+                    Err(err) => {
+                        current.get_mut().set_waker(None);
+                        return Poll::Ready(Err(err));
                     }
-                };
-                return Ok((wrap_tokio_ssl_stream(stream), outcome));
-            }
-            Err(SslHandshakeError::WouldBlock(mut pending)) => {
-                if early_offset < early_data.len()
-                    && unsafe { SSL_in_early_data(pending.ssl().as_ptr()) != 0 }
-                {
-                    let written =
-                        write_tls_early_data(pending.ssl_mut(), &early_data[early_offset..])?;
-                    early_offset += written;
                 }
-                mid = pending_handshake(pending).await?;
             }
-            Err(SslHandshakeError::SetupFailure(err)) => {
-                return Err(Error::Tls(format!("TLS handshake setup failed: {err}")));
-            }
-            Err(SslHandshakeError::Failure(err)) => {
-                return Err(Error::Tls(format!("TLS handshake failed: {}", err.error())));
+
+            match current.handshake() {
+                Ok(mut stream) => {
+                    stream.get_mut().set_waker(None);
+                    let ssl = stream.ssl();
+                    let outcome = if unsafe { SSL_early_data_accepted(ssl.as_ptr()) != 0 } {
+                        EarlyDataOutcome::Accepted
+                    } else {
+                        EarlyDataOutcome::Rejected {
+                            reason: unsafe { SSL_get_early_data_reason(ssl.as_ptr()) },
+                        }
+                    };
+                    return Poll::Ready(Ok((wrap_tokio_ssl_stream(stream), outcome)));
+                }
+                Err(SslHandshakeError::WouldBlock(mut pending)) => {
+                    pending.get_mut().set_waker(None);
+                    state = Some(pending);
+                    return Poll::Pending;
+                }
+                Err(SslHandshakeError::SetupFailure(err)) => {
+                    return Poll::Ready(Err(Error::Tls(format!(
+                        "TLS handshake setup failed: {err}"
+                    ))));
+                }
+                Err(SslHandshakeError::Failure(err)) => {
+                    return Poll::Ready(Err(Error::Tls(format!(
+                        "TLS handshake failed: {}",
+                        err.error()
+                    ))));
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 fn wrap_tokio_ssl_stream<S>(stream: boring::ssl::SslStream<AsyncStreamBridge<S>>) -> SslStream<S> {
     // Both types are single-field newtypes over the same inner `SslStream<AsyncStreamBridge<S>>`.
     unsafe { std::mem::transmute(stream) }
-}
-
-async fn pending_handshake<S>(
-    mid: boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>,
-) -> Result<boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>, Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    use std::future::Future;
-
-    struct HandshakeWait<S> {
-        mid: Option<boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>>,
-        registered: bool,
-    }
-
-    impl<S> Future for HandshakeWait<S>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        type Output = boring::ssl::MidHandshakeSslStream<AsyncStreamBridge<S>>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if !self.registered {
-                let mid = self.mid.as_mut().expect("mid missing");
-                mid.get_mut().set_waker(Some(cx));
-                mid.ssl_mut().set_task_waker(Some(cx.waker().clone()));
-                self.registered = true;
-                return Poll::Pending;
-            }
-            Poll::Ready(self.mid.take().expect("mid missing on wake"))
-        }
-    }
-
-    Ok(HandshakeWait {
-        mid: Some(mid),
-        registered: false,
-    }
-    .await)
 }
 
 fn write_tls_early_data(ssl: &mut boring::ssl::SslRef, data: &[u8]) -> Result<usize, Error> {
