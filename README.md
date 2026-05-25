@@ -276,7 +276,7 @@ The combined artifact [`2026-05-25-rfc9220-n100-plus-close-comparators.json`](do
 | quiche direct (RFC 9220 tunnel close) | client DATA+FIN / server FIN | 2.982 ms | 4.280 ms | 324 KiB/s | 30 |
 | tokio-quiche (RFC 9220 tunnel close) | client DATA+FIN / server FIN | 3.342 ms | 3.625 ms | 299 KiB/s | 30 |
 
-`h3-quinn`, `reqwest_h3`, `tokio-tungstenite`, and `reqwest` remain explicit `unsupported_by_client` capability rows because none expose an RFC 9220 Extended CONNECT raw byte tunnel API. Full tunnel-suite superiority still waits on third-party slow-consumer mixed comparator rows and gate expansion to cover close/FIN at n=100.
+The combined artifact [`2026-05-25-rfc9220-n100-plus-close-and-mixed-comparators.json`](docs/benchmarks/native-h3-vs-rust-clients/2026-05-25-rfc9220-n100-plus-close-and-mixed-comparators.json) also adds n=30 low-level slow-consumer mixed rows: `quiche_direct_rfc9220_tunnel_mixed` p50 3.044 ms / p95 3.184 ms and `tokio_quiche_rfc9220_tunnel_mixed` p50 4.548 ms / p95 4.917 ms. `h3-quinn`, `reqwest_h3`, `tokio-tungstenite`, and `reqwest` remain explicit `unsupported_by_client` capability rows because none expose an RFC 9220 Extended CONNECT raw byte tunnel API. Full tunnel-suite superiority is not claimed yet; the current dedicated RFC 9220 gate covers echo rows only.
 
 ### Local WebSocket echo vs fastwebsockets and tokio-tungstenite
 
