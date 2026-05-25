@@ -5,13 +5,12 @@
 
 use bytes::Bytes;
 use http::{Method, Uri};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
-use crate::headers::Headers;
 use crate::headers::Headers;
 use crate::request::RequestBody;
 use crate::response::{Body, Response};
@@ -306,11 +305,7 @@ impl H2Handle {
     }
 
     /// Open an RFC 8441 WebSocket tunnel through the background H2 driver.
-    pub async fn open_websocket_tunnel(
-        &self,
-        uri: Uri,
-        headers: &Headers,
-    ) -> Result<H2Tunnel> {
+    pub async fn open_websocket_tunnel(&self, uri: Uri, headers: &Headers) -> Result<H2Tunnel> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.command_tx

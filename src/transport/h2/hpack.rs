@@ -5,8 +5,8 @@
 //! - Full control over header encoding for fingerprint accuracy
 //! - Complete Huffman encoding support
 
-use crate::transport::h2::hpack_impl::{Decoder, Encoder};
 use crate::headers::Headers;
+use crate::transport::h2::hpack_impl::{Decoder, Encoder};
 use bytes::Bytes;
 
 fn bytes_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
@@ -128,10 +128,7 @@ impl HpackEncoder {
             if name.is_empty() {
                 continue;
             }
-            if name
-                .iter()
-                .any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F))
-            {
+            if name.iter().any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F)) {
                 continue;
             }
 
@@ -215,10 +212,7 @@ impl HpackEncoder {
             if name.is_empty() {
                 return Err("RFC 8441 header name must not be empty".to_string());
             }
-            if name
-                .iter()
-                .any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F))
-            {
+            if name.iter().any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F)) {
                 return Err(format!(
                     "RFC 8441 invalid header name rejected: {}",
                     String::from_utf8_lossy(name)

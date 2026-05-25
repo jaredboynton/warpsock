@@ -518,51 +518,57 @@ where
             (b":authority".to_vec(), authority.as_bytes().to_vec()),
         ];
 
-        for (name, value) in headers {
-            if name.starts_with(':') {
+        for (name, value) in headers.iter_bytes() {
+            if name.first() == Some(&b':') {
                 return Err(Error::HttpProtocol(format!(
                     "PROTOCOL_ERROR: user pseudo-header {} is not allowed",
-                    name
+                    String::from_utf8_lossy(name)
                 )));
             }
 
-            if name.is_empty()
-                || name
-                    .as_bytes()
-                    .iter()
-                    .any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F))
-            {
+            if name.is_empty() || name.iter().any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F)) {
                 return Err(Error::HttpProtocol(
                     "PROTOCOL_ERROR: invalid HTTP/2 header name".into(),
                 ));
             }
 
-            let name_lower = name.to_lowercase();
+            let name_lower = if name.iter().all(|b| b.is_ascii_lowercase()) {
+                name.to_vec()
+            } else {
+                name.iter().map(|b| b.to_ascii_lowercase()).collect()
+            };
             if matches!(
-                name_lower.as_str(),
-                "connection"
-                    | "keep-alive"
-                    | "proxy-connection"
-                    | "transfer-encoding"
-                    | "upgrade"
-                    | "host"
-                    | "sec-websocket-key"
-                    | "sec-websocket-accept"
-                    | "sec-websocket-extensions"
+                name_lower.as_slice(),
+                b"connection"
+                    | b"keep-alive"
+                    | b"proxy-connection"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+                    | b"host"
+                    | b"sec-websocket-key"
+                    | b"sec-websocket-accept"
+                    | b"sec-websocket-extensions"
             ) {
                 return Err(Error::HttpProtocol(format!(
                     "PROTOCOL_ERROR: forbidden RFC 8441 header {}",
-                    name_lower
+                    String::from_utf8_lossy(&name_lower)
                 )));
             }
 
-            if name_lower == "te" && value.to_lowercase() != "trailers" {
-                return Err(Error::HttpProtocol(
-                    "PROTOCOL_ERROR: TE header is only allowed with value trailers".into(),
-                ));
+            if name_lower == b"te" {
+                let te_ok = value.len() == b"trailers".len()
+                    && value
+                        .iter()
+                        .zip(b"trailers".iter())
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b));
+                if !te_ok {
+                    return Err(Error::HttpProtocol(
+                        "PROTOCOL_ERROR: TE header is only allowed with value trailers".into(),
+                    ));
+                }
             }
 
-            owned_headers.push((name_lower.into_bytes(), value.as_bytes().to_vec()));
+            owned_headers.push((name_lower, value.to_vec()));
         }
 
         let header_refs: Vec<(&[u8], &[u8])> = owned_headers
@@ -640,6 +646,7 @@ where
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
             .collect();
+        let headers = Headers::from(headers);
         self.send_headers_raw(method, uri, &headers, end_stream)
             .await
     }
@@ -2090,7 +2097,7 @@ where
         let end_stream = body.is_none();
         let stream_id = self
             .write_half
-            .write_request_with_optional_body(&method, uri, &headers, body, max_frame_size)
+            .write_request_with_optional_body(&method, uri, headers, body, max_frame_size)
             .await?;
 
         // Register stream

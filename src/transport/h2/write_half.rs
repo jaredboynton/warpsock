@@ -20,7 +20,6 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::headers::Headers;
-use crate::headers::Headers;
 
 use super::frame::{
     ContinuationFrame, DataFrame, ErrorCode, GoAwayFrame, HeadersFrame, PingFrame, RstStreamFrame,
@@ -121,13 +120,10 @@ where
             ));
         }
 
-        let header_block = guard.encoder.encode_request(
-            method.as_str(),
-            scheme,
-            authority,
-            path,
-            &Headers::from(headers.to_vec()),
-        );
+        let header_block =
+            guard
+                .encoder
+                .encode_request(method.as_str(), scheme, authority, path, headers);
 
         if header_block.is_empty() {
             return Err(Error::HttpProtocol(
@@ -362,13 +358,10 @@ where
             ));
         }
 
-        let header_block = guard.encoder.encode_request(
-            method.as_str(),
-            scheme,
-            authority,
-            path,
-            &Headers::from(headers.to_vec()),
-        );
+        let header_block =
+            guard
+                .encoder
+                .encode_request(method.as_str(), scheme, authority, path, headers);
 
         if header_block.is_empty() {
             return Err(Error::HttpProtocol(

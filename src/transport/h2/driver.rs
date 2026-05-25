@@ -987,7 +987,7 @@ where
     ) -> Result<()> {
         match self
             .connection
-            .open_extended_connect_websocket_with_end_stream(&uri, headers)
+            .open_extended_connect_websocket_with_end_stream(&uri, &headers)
             .await
         {
             Ok((stream_id, end_stream)) => {

@@ -67,6 +67,7 @@ use std::time::Duration;
 
 use crate::error::Result;
 use crate::fingerprint::http2::Http2Settings;
+use crate::headers::Headers;
 use crate::response::Response;
 use crate::transport::connector::MaybeHttpsStream;
 
@@ -145,7 +146,7 @@ impl H2Connection {
         &mut self,
         method: Method,
         uri: &Uri,
-        headers: Vec<(String, String)>,
+        headers: &Headers,
         body: Option<Bytes>,
     ) -> Result<Response> {
         self.inner.send_request(method, uri, headers, body).await
@@ -272,7 +273,7 @@ impl H2PooledConnection {
         &self,
         method: Method,
         uri: &Uri,
-        headers: Vec<(String, String)>,
+        headers: &Headers,
         body: Option<Bytes>,
     ) -> Result<Response> {
         self.handle.send_request(method, uri, headers, body).await
@@ -283,7 +284,7 @@ impl H2PooledConnection {
         &self,
         method: Method,
         uri: &Uri,
-        headers: Vec<(String, String)>,
+        headers: &Headers,
         body: crate::request::RequestBody,
         body_timeouts: H2BodyTimeouts,
     ) -> Result<Response> {
@@ -296,7 +297,7 @@ impl H2PooledConnection {
     pub async fn open_websocket_tunnel(
         &self,
         uri: Uri,
-        headers: Vec<(String, String)>,
+        headers: &Headers,
     ) -> Result<H2Tunnel> {
         self.handle.open_websocket_tunnel(uri, headers).await
     }
