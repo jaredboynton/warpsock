@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
 
 const TEST_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -65,6 +65,38 @@ impl MockH2Server {
                 });
             }
         })
+    }
+
+    /// Start the server and signal once the spawned task reaches the accept loop.
+    #[allow(dead_code)]
+    pub fn start_with_ready<F, Fut>(
+        self,
+        handler: F,
+    ) -> (tokio::task::JoinHandle<()>, oneshot::Receiver<()>)
+    where
+        F: Fn(MockH2Connection) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let handler = Arc::new(handler);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            loop {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(());
+                }
+                let Ok((stream, _)) = self.listener.accept().await else {
+                    break;
+                };
+                let handler_clone = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let conn = MockH2Connection::new(stream);
+                    handler_clone(conn).await;
+                });
+            }
+        });
+
+        (handle, ready_rx)
     }
 
     /// Start the server with TLS support.

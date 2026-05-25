@@ -1,6 +1,23 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+pub async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async move {
+        loop {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub async fn wait_for_count(count: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
+    wait_until(|| count.load(Ordering::SeqCst) >= expected, timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -129,13 +129,9 @@ async fn second_connect_resumes_tls13_session_ticket() {
     .await;
     drop(first);
 
-    // Poll the cache briefly: the new-session callback runs after BoringSSL parses
-    // the NewSessionTicket, which can land slightly after the read returns bytes.
+    // Wait for the new-session callback after BoringSSL parses the NewSessionTicket.
     let key = specter::transport::session::SessionCacheKey::new("127.0.0.1", addr.port());
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while shared_cache.get_session(&key).is_none() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(shared_cache.wait_for_session(&key, Duration::from_secs(2)).await);
     assert!(
         shared_cache.get_session(&key).is_some(),
         "expected a TLS 1.3 session ticket to be cached after the first dial"
@@ -174,10 +170,7 @@ async fn early_data_session_marked_zero_rtt_capable_when_server_enables_it() {
     drop(first);
 
     let key = specter::transport::session::SessionCacheKey::new("127.0.0.1", addr.port());
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !shared_cache.supports_zero_rtt(&key) && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(shared_cache.wait_for_session(&key, Duration::from_secs(2)).await);
     assert!(
         shared_cache.supports_zero_rtt(&key),
         "TLS session ticket must advertise early-data capability when the server enables 0-RTT"

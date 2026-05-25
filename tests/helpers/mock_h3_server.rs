@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 const SHORT_HEADER_CID_LEN: usize = 16;
 const MOCK_IDLE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -89,12 +89,26 @@ impl MockH3Server {
         F: Fn(MockH3Connection) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        tokio::spawn(async move {
-            self.run(handler).await;
-        })
+        let (handle, _ready) = self.start_with_ready(handler);
+        handle
     }
 
-    async fn run<F, Fut>(&self, handler: F)
+    pub fn start_with_ready<F, Fut>(
+        self,
+        handler: F,
+    ) -> (tokio::task::JoinHandle<()>, oneshot::Receiver<()>)
+    where
+        F: Fn(MockH3Connection) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            self.run(handler, Some(ready_tx)).await;
+        });
+        (handle, ready_rx)
+    }
+
+    async fn run<F, Fut>(&self, handler: F, mut ready_tx: Option<oneshot::Sender<()>>)
     where
         F: Fn(MockH3Connection) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send,
@@ -112,6 +126,9 @@ impl MockH3Server {
         let ticket_keys = self.ticket_keys;
 
         loop {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(());
+            }
             let (len, peer) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -220,9 +237,11 @@ fn spawn_native_connection<F, Fut>(
     tokio::spawn(async move {
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
         let (evt_tx, evt_rx) = mpsc::channel(100);
+        let (application_ready_tx, application_ready_rx) = watch::channel(false);
         let mock_conn = MockH3Connection {
             cmd_tx,
             evt_rx: Arc::new(Mutex::new(evt_rx)),
+            application_ready_rx,
         };
         tokio::spawn(async move {
             handler(mock_conn).await;
@@ -240,6 +259,7 @@ fn spawn_native_connection<F, Fut>(
             rx,
             cmd_rx,
             evt_tx,
+            application_ready_tx,
             stats: MockH3Stats::default(),
             last_activity: Instant::now(),
             finished_client_streams: HashSet::new(),
@@ -265,6 +285,7 @@ struct NativeMockH3Connection {
     rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     cmd_rx: mpsc::Receiver<MockCommand>,
     evt_tx: mpsc::Sender<MockEvent>,
+    application_ready_tx: watch::Sender<bool>,
     stats: MockH3Stats,
     last_activity: Instant,
     finished_client_streams: HashSet<u64>,
@@ -623,8 +644,10 @@ impl NativeMockH3Connection {
         let packet = self
             .handshake
             .build_server_h3_settings_packet(&self.fingerprint)?;
+        self.send_packet(packet.packet).await?;
         self.settings_sent = true;
-        self.send_packet(packet.packet).await
+        let _ = self.application_ready_tx.send(true);
+        Ok(())
     }
 
     async fn apply_client_event(
@@ -973,9 +996,30 @@ pub enum MockEvent {
 pub struct MockH3Connection {
     cmd_tx: mpsc::Sender<MockCommand>,
     evt_rx: Arc<Mutex<mpsc::Receiver<MockEvent>>>,
+    application_ready_rx: watch::Receiver<bool>,
 }
 
 impl MockH3Connection {
+    pub async fn wait_application_ready(&self, timeout: Duration) -> bool {
+        let mut ready_rx = self.application_ready_rx.clone();
+        if *ready_rx.borrow() {
+            return true;
+        }
+
+        tokio::time::timeout(timeout, async move {
+            loop {
+                if ready_rx.changed().await.is_err() {
+                    return false;
+                }
+                if *ready_rx.borrow() {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Send raw bytes to a stream (allows sending headers or malformed frames manually)
     pub async fn send_bytes(&self, stream_id: u64, bytes: &[u8]) {
         let _ = self
