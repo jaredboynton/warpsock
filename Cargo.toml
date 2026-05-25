@@ -152,3 +152,9 @@ debug = 0
 [profile.test.build-override]
 opt-level = 3
 codegen-units = 16
+
+[workspace]
+members = [
+    "bindings/node",
+    "bindings/python",
+]
