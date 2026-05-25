@@ -1772,7 +1772,7 @@ impl NativeQuicServerHandshake {
         );
         let packet = protect_short_header_packet(
             server_application_keys,
-            &self.client_source_cid,
+            &self.server_outbound_peer_cid(),
             packet_number,
             packet_number_len,
             self.write_key_phase,
@@ -1784,7 +1784,7 @@ impl NativeQuicServerHandshake {
         Ok(Some(ServerApplicationAckPacket {
             packet,
             packet_number,
-            packet_number_offset: 1 + self.client_source_cid.as_bytes().len(),
+            packet_number_offset: 1 + self.server_outbound_peer_cid().as_bytes().len(),
         }))
     }
 
@@ -2125,7 +2125,10 @@ impl NativeQuicServerHandshake {
         &mut self,
         data: [u8; 8],
     ) -> Result<ServerApplicationControlPacket> {
-        self.build_server_application_control_packet(QuicFrame::PathResponse(data))
+        self.build_server_application_control_packet_with_min_datagram(
+            QuicFrame::PathResponse(data),
+            MIN_PATH_VALIDATION_DATAGRAM,
+        )
     }
 
     pub fn build_server_path_challenge_packet_for_address(
@@ -2136,7 +2139,53 @@ impl NativeQuicServerHandshake {
         let frame = self
             .server_path_validator
             .path_challenge_for_peer_address(remote_address, data)?;
-        self.build_server_application_control_packet(frame)
+        self.build_server_application_control_packet_with_min_datagram(
+            frame,
+            MIN_PATH_VALIDATION_DATAGRAM,
+        )
+    }
+
+    pub fn build_server_retire_connection_id_packet(
+        &mut self,
+        sequence_number: u64,
+    ) -> Result<ServerApplicationControlPacket> {
+        self.build_server_application_control_packet(QuicFrame::RetireConnectionId {
+            sequence_number,
+        })
+    }
+
+    pub fn build_server_connection_migration_close_packet(
+        &mut self,
+    ) -> Result<ServerApplicationControlPacket> {
+        let packet = self.build_server_application_control_packet(QuicFrame::ConnectionClose {
+            error_code: QUIC_CONNECTION_MIGRATION_ERROR,
+            frame_type: None,
+            reason: Bytes::new(),
+        })?;
+        self.server_enter_closing(Instant::now());
+        Ok(packet)
+    }
+
+    pub fn server_pop_pending_peer_retires(&mut self) -> Vec<u64> {
+        self.cid_inventory.drain_pending_peer_retires()
+    }
+
+    pub fn server_promote_peer_cid(&mut self, sequence_number: u64) -> Result<()> {
+        self.cid_inventory.promote_peer_to_active(sequence_number)
+    }
+
+    pub fn server_outbound_peer_cid(&self) -> ConnectionId {
+        self.cid_inventory
+            .active_peer()
+            .and_then(|entry| ConnectionId::from_bytes(entry.connection_id.clone()).ok())
+            .unwrap_or_else(|| self.client_source_cid.clone())
+    }
+
+    pub fn server_local_cids_for_routing(&self) -> Vec<ConnectionId> {
+        self.cid_inventory
+            .unretired_locals()
+            .map(|entry| entry.connection_id.clone())
+            .collect()
     }
 
     pub fn is_server_path_address_validated(&self, remote_address: &SocketAddr) -> bool {
@@ -2410,6 +2459,7 @@ impl NativeQuicServerHandshake {
 
         let packet_number = self.next_server_application_packet_number;
         let packet_number_len = 2;
+        let peer_cid = self.server_outbound_peer_cid();
         let frame = encode_frame(&QuicFrame::Stream {
             stream_id,
             offset: (stream_offset > 0).then_some(stream_offset),
@@ -2418,7 +2468,7 @@ impl NativeQuicServerHandshake {
         });
         let packet = protect_short_header_packet(
             server_application_keys,
-            &self.client_source_cid,
+            &peer_cid,
             packet_number,
             packet_number_len,
             self.write_key_phase,
@@ -2449,7 +2499,7 @@ impl NativeQuicServerHandshake {
             packet,
             packet_number,
             stream_id,
-            packet_number_offset: 1 + self.client_source_cid.as_bytes().len(),
+            packet_number_offset: 1 + peer_cid.as_bytes().len(),
             data,
         })
     }
@@ -2457,6 +2507,14 @@ impl NativeQuicServerHandshake {
     fn build_server_application_control_packet(
         &mut self,
         frame: QuicFrame,
+    ) -> Result<ServerApplicationControlPacket> {
+        self.build_server_application_control_packet_with_min_datagram(frame, 0)
+    }
+
+    fn build_server_application_control_packet_with_min_datagram(
+        &mut self,
+        frame: QuicFrame,
+        min_datagram: usize,
     ) -> Result<ServerApplicationControlPacket> {
         let Some(server_application_keys) = &self.server_application_keys else {
             return Err(Error::Quic(
@@ -2467,14 +2525,24 @@ impl NativeQuicServerHandshake {
 
         let packet_number = self.next_server_application_packet_number;
         let packet_number_len = 2;
-        let frame = padded_short_header_payload(encode_frame(&frame));
+        let peer_cid = self.server_outbound_peer_cid();
+        let short_header_len = 1 + peer_cid.as_bytes().len() + packet_number_len;
+        let payload = if min_datagram > 0 {
+            pad_short_header_payload_to_min_datagram(
+                padded_short_header_payload(encode_frame(&frame)),
+                short_header_len,
+                min_datagram,
+            )
+        } else {
+            padded_short_header_payload(encode_frame(&frame))
+        };
         let packet = protect_short_header_packet(
             server_application_keys,
-            &self.client_source_cid,
+            &peer_cid,
             packet_number,
             packet_number_len,
             self.write_key_phase,
-            &frame,
+            &payload,
         )?;
         let now = Instant::now();
         let packet_size = packet.len();
@@ -2490,7 +2558,7 @@ impl NativeQuicServerHandshake {
         Ok(ServerApplicationControlPacket {
             packet,
             packet_number,
-            packet_number_offset: 1 + self.client_source_cid.as_bytes().len(),
+            packet_number_offset: 1 + peer_cid.as_bytes().len(),
         })
     }
 }
