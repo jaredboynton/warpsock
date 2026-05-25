@@ -7,6 +7,7 @@ use bytes::Bytes;
 use serde_json::json;
 use specter::{Client, CookieJar};
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -19,6 +20,22 @@ use specter::transport::h2::hpack_impl::Encoder;
 
 fn init_validation_dir() {
     fs::create_dir_all("target/validation/h2").unwrap();
+}
+
+async fn wait_for_true(flag: &AtomicBool) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_later_millis(after: u128) -> u128 {
+    loop {
+        let now = system_time_now_ms();
+        if now > after {
+            return now;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -171,13 +188,16 @@ async fn response_headers_arrive_before_body_completion() {
     let server_sent_last_data_at_clone = server_sent_last_data_at.clone();
     let headers_observed = Arc::new(Notify::new());
     let first_chunk_observed = Arc::new(Notify::new());
+    let header_observed_at = Arc::new(Mutex::new(0u128));
     let headers_observed_server = headers_observed.clone();
     let first_chunk_observed_server = first_chunk_observed.clone();
+    let header_observed_at_server = header_observed_at.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let server_sent_last_data_at = server_sent_last_data_at_clone.clone();
         let headers_observed = headers_observed_server.clone();
         let first_chunk_observed = first_chunk_observed_server.clone();
+        let header_observed_at = header_observed_at_server.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -211,7 +231,8 @@ async fn response_headers_arrive_before_body_completion() {
                             .await
                             .unwrap();
 
-                        let last_data_time = system_time_now_ms();
+                        let last_data_time =
+                            wait_for_later_millis(*header_observed_at.lock().await).await;
                         {
                             let mut lock = server_sent_last_data_at.lock().await;
                             *lock = last_data_time;
@@ -243,6 +264,7 @@ async fn response_headers_arrive_before_body_completion() {
 
     let header_at = system_time_now_ms();
     assert_eq!(response.status().as_u16(), 200);
+    *header_observed_at.lock().await = header_at;
     headers_observed.notify_one();
 
     // Consume body
@@ -309,13 +331,16 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
     let server_sent_last_chunk_at_clone = server_sent_last_chunk_at.clone();
     let headers_observed = Arc::new(Notify::new());
     let first_chunk_observed = Arc::new(Notify::new());
+    let first_chunk_received_at = Arc::new(Mutex::new(0u128));
     let headers_observed_server = headers_observed.clone();
     let first_chunk_observed_server = first_chunk_observed.clone();
+    let first_chunk_received_at_server = first_chunk_received_at.clone();
 
     server.start_tls(acceptor, move |conn: MockH2Connection| {
         let server_sent_last_chunk_at = server_sent_last_chunk_at_clone.clone();
         let headers_observed = headers_observed_server.clone();
         let first_chunk_observed = first_chunk_observed_server.clone();
+        let first_chunk_received_at = first_chunk_received_at_server.clone();
         async move {
             conn.read_preface().await.unwrap();
             let mut settings_sent = false;
@@ -351,7 +376,8 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
                         timeout(Duration::from_secs(2), first_chunk_observed.notified())
                             .await
                             .unwrap();
-                        let last_chunk_time = system_time_now_ms();
+                        let last_chunk_time =
+                            wait_for_later_millis(*first_chunk_received_at.lock().await).await;
                         {
                             let mut lock = server_sent_last_chunk_at.lock().await;
                             *lock = last_chunk_time;
@@ -396,6 +422,7 @@ async fn data_chunks_stream_incrementally_without_full_body_buffering() {
         .unwrap();
     let end_read_chunk_1 = system_time_now_ms();
     assert_eq!(chunk1, Bytes::from("incremental-chunk-1"));
+    *first_chunk_received_at.lock().await = end_read_chunk_1;
     first_chunk_observed.notify_one();
 
     // Read second chunk
@@ -1515,7 +1542,7 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
 
     let rst_received = Arc::new(Mutex::new(false));
     let rst_received_notify = Arc::new(Notify::new());
-    let client_dropped = Arc::new(Notify::new());
+    let client_dropped = Arc::new(AtomicBool::new(false));
     let rst_received_clone = rst_received.clone();
     let rst_received_notify_clone = rst_received_notify.clone();
     let client_dropped_clone = client_dropped.clone();
@@ -1549,7 +1576,7 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
                             .await
                             .unwrap();
 
-                        timeout(Duration::from_secs(2), client_dropped.notified())
+                        timeout(Duration::from_secs(2), wait_for_true(&client_dropped))
                             .await
                             .unwrap();
                         let _ = conn.send_data(stream_id, b"chunk", false).await;
@@ -1581,7 +1608,7 @@ async fn dropped_receiver_does_not_poison_h2_pool() {
 
     // Drop rx1 immediately before consuming anything!
     drop(resp1);
-    client_dropped.notify_one();
+    client_dropped.store(true, Ordering::SeqCst);
 
     timeout(Duration::from_secs(2), rst_received_notify.notified())
         .await
@@ -2011,7 +2038,7 @@ async fn streaming_timeouts_are_enforced_per_phase() {
                         .unwrap_or("");
 
                     if path.contains("ttfb-delayed") {
-                        std::future::pending::<()>().await;
+                        let _ = conn.read_frame().await;
                     } else if path.contains("read-delayed") {
                         let response_headers =
                             encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
@@ -2019,7 +2046,7 @@ async fn streaming_timeouts_are_enforced_per_phase() {
                             .send_headers(stream_id, &response_headers, false, true)
                             .await;
                         let _ = conn.send_data(stream_id, b"chunk-1", false).await;
-                        std::future::pending::<()>().await;
+                        let _ = conn.read_frame().await;
                     } else {
                         let response_headers =
                             encoder.encode(&[(b":status".as_slice(), b"200".as_slice())]);
