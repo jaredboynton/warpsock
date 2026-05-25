@@ -346,5 +346,21 @@
       "reqwest_h3"
     ],
     "missing_required_rows": []
+  },
+  "rfc9220_tunnel_superiority_gate": {
+    "status": "pass",
+    "pass": true,
+    "reason": "specter_native_rfc9220_tunnel_is_faster_than_required_rfc9220_tunnel_competitors",
+    "fastest_non_specter_rfc9220_tunnel_client": "quiche_direct_rfc9220_tunnel",
+    "no_rfc9220_tunnel_superiority_claim_without_all_required_n100_rows": true,
+    "minimum_sample_count": 100,
+    "required_rfc9220_tunnel_clients": [
+      "specter_native_rfc9220_tunnel",
+      "quiche_direct_rfc9220_tunnel",
+      "tokio_quiche_rfc9220_tunnel"
+    ],
+    "missing_required_rfc9220_tunnel_rows": [],
+    "under_sampled_required_rfc9220_tunnel_rows": [],
+    "missing_required_rfc9220_tunnel_metrics": []
   }
 }
