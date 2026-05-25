@@ -597,7 +597,7 @@ impl H1Connection {
         options: H1StreamingOptions,
     ) -> Result<Response> {
         let body_kind = h1_request_body_kind(&body);
-        let request_bytes = Self::build_request_bytes(&method, uri, &headers, body_kind)?;
+        let request_bytes = Self::build_request_bytes(&method, uri, headers, body_kind)?;
 
         if !options.request_head_sent {
             match body {
@@ -645,7 +645,6 @@ impl H1Connection {
     /// - CONNECT uses authority-form (host:port)
     /// - Server-wide OPTIONS uses asterisk-form (*)
     /// - All others use origin-form (/path?query)
-    /// Build the HTTP/1.1 request head as bytes.
     pub(crate) fn build_request_bytes(
         method: &Method,
         uri: &Uri,

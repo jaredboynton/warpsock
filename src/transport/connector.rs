@@ -370,10 +370,7 @@ impl BoringConnector {
             Arc::new(self.build_ssl_connector(AlpnMode::Default)?),
             Arc::new(self.build_ssl_connector(AlpnMode::Http1Only)?),
         ];
-        match self.ssl_connectors.set(cached) {
-            Ok(()) => {}
-            Err(_) => {}
-        }
+        if let Ok(()) = self.ssl_connectors.set(cached) {}
         Ok(self
             .ssl_connectors
             .get()
@@ -515,7 +512,7 @@ impl BoringConnector {
             if let Ok(der) = session.to_der() {
                 let early_data_capable =
                     unsafe { SSL_SESSION_early_data_capable(session.as_ptr()) != 0 };
-                let max_age = Duration::from_secs(session.timeout().max(0) as u64);
+                let max_age = Duration::from_secs(session.timeout() as u64);
                 session_cache.store_session(
                     SessionCacheKey::new(&host, port),
                     der,
@@ -1087,8 +1084,8 @@ fn write_tls_early_data(ssl: &mut boring::ssl::SslRef, data: &[u8]) -> Result<us
             return Ok(written as usize);
         }
         let code = boring_sys::SSL_get_error(ssl.as_ptr(), written);
-        if code == boring_sys::SSL_ERROR_WANT_READ as i32
-            || code == boring_sys::SSL_ERROR_WANT_WRITE as i32
+        if code == boring_sys::SSL_ERROR_WANT_READ
+            || code == boring_sys::SSL_ERROR_WANT_WRITE
         {
             return Ok(0);
         }
