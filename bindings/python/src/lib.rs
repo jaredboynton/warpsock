@@ -513,11 +513,11 @@ impl RequestBuilder {
                             }
 
                             let resp = if streaming {
-                                req_builder.send_streaming().await
+                                let resp = req_builder.send_streaming().await.map_err(to_py_err)?;
+                                buffer_response_body(resp).await?
                             } else {
-                                req_builder.send().await
-                            }
-                            .map_err(to_py_err)?;
+                                req_builder.send().await.map_err(to_py_err)?
+                            };
                             Ok(Response::from_rust(resp))
                         })
                     });
@@ -697,6 +697,19 @@ impl ClientBuilder {
     fn __repr__(&self) -> String {
         "<specter.ClientBuilder>".to_string()
     }
+}
+
+async fn buffer_response_body(mut resp: RustResponse) -> PyResult<RustResponse> {
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let http_version = resp.http_version().to_string();
+    let effective_url = resp.url().cloned();
+    let bytes = resp.body_mut().collect_to_bytes().await.map_err(to_py_err)?;
+    let mut buffered = RustResponse::new(status, headers, bytes, http_version);
+    if let Some(url) = effective_url {
+        buffered = buffered.with_url(url);
+    }
+    Ok(buffered)
 }
 
 async fn pump_python_async_iterable(

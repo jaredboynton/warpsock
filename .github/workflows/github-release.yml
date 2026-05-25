@@ -2,7 +2,7 @@ name: GitHub Release
 
 on:
   workflow_run:
-    workflows: ['Node Release', 'Python Release']
+    workflows: ['Node Release', 'Python Release', 'Crates Release']
     types: [completed]
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
 
           for attempt in {1..30}; do
             ready=true
-            for workflow in "Node Release" "Python Release"; do
+            for workflow in "Node Release" "Python Release" "Crates Release"; do
               run_state="$(
                 gh run list \
                   --workflow "$workflow" \

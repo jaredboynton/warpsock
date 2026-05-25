@@ -1,0 +1,94 @@
+name: Crates Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'src/**'
+      - '.github/workflows/crates-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  package:
+    name: Package crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check release lockfiles
+        run: ./scripts/check-release-lockfiles.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crates-package
+          cache-on-failure: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/boringssl/x86_64-unknown-linux-gnu
+            lib/boringssl/include
+          key: boringssl-crates-x86_64-unknown-linux-gnu-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install prebuilt BoringSSL
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install-boringssl-prebuilt.sh
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: cargo package --locked
+        env:
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu/build
+          BORING_BSSL_INCLUDE_PATH: ${{ github.workspace }}/lib/boringssl/include
+
+  publish:
+    name: Publish to crates.io
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/boringssl/x86_64-unknown-linux-gnu
+            lib/boringssl/include
+          key: boringssl-crates-x86_64-unknown-linux-gnu-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install prebuilt BoringSSL
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install-boringssl-prebuilt.sh
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml x86_64-unknown-linux-gnu
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          BORING_BSSL_PATH: ${{ github.workspace }}/lib/boringssl/x86_64-unknown-linux-gnu/build
+          BORING_BSSL_INCLUDE_PATH: ${{ github.workspace }}/lib/boringssl/include
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -9,7 +9,10 @@ use mock_ws_server::{server_ping_frame, MockWsServer, WsResponse};
 async fn send_text_writes_masked_client_frame() {
     let server = MockWsServer::new().await.unwrap();
     let url = server.ws_url("/send-text");
-    let handle = server.start_once(WsResponse::default());
+    let handle = server.start_once(WsResponse {
+        expected_client_frames: 1,
+        ..WsResponse::default()
+    });
 
     let mut ws = Client::new()
         .unwrap()
@@ -38,6 +41,7 @@ async fn incoming_ping_writes_matching_pong_if_auto_pong_is_supported() {
     let url = server.ws_url("/ping");
     let handle = server.start_once(WsResponse {
         first_frame: Some(server_ping_frame(b"abc")),
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -65,6 +69,7 @@ async fn split_reader_and_writer_operate_independently() {
     let url = server.ws_url("/split");
     let handle = server.start_once(WsResponse {
         first_frame: Some(mock_ws_server::server_text_frame("ready")),
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -140,7 +145,10 @@ async fn next_frame_exposes_raw_fragment_boundaries() {
 async fn prepared_message_sends_fresh_masked_frame() {
     let server = MockWsServer::new().await.unwrap();
     let url = server.ws_url("/prepared");
-    let handle = server.start_once(WsResponse::default());
+    let handle = server.start_once(WsResponse {
+        expected_client_frames: 1,
+        ..WsResponse::default()
+    });
 
     let mut ws = Client::new()
         .unwrap()
@@ -162,7 +170,10 @@ async fn prepared_message_sends_fresh_masked_frame() {
 async fn prepared_batch_writes_multiple_masked_frames() {
     let server = MockWsServer::new().await.unwrap();
     let url = server.ws_url("/prepared-batch");
-    let handle = server.start_once(WsResponse::default());
+    let handle = server.start_once(WsResponse {
+        expected_client_frames: 2,
+        ..WsResponse::default()
+    });
 
     let prepared = [
         PreparedMessage::text("first"),
@@ -269,6 +280,7 @@ async fn max_message_size_violation_triggers_close_1009() {
     let url = server.ws_url("/message-too-large");
     let handle = server.start_once(WsResponse {
         first_frame: Some(server_frame_with_fin(true, 0x1, b"abc")),
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -310,6 +322,7 @@ async fn expect_protocol_error_close(first_frame: Vec<u8>, expected_close_code: 
     let url = server.ws_url("/protocol-error");
     let handle = server.start_once(WsResponse {
         first_frame: Some(first_frame),
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 

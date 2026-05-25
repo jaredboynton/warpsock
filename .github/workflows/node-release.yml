@@ -168,7 +168,7 @@ jobs:
       - name: Test
         run: |
           cd bindings/node
-          npx jest --ci --runInBand --detectOpenHandles --openHandlesTimeout=1000 --forceExit
+          npx jest --ci --runInBand --no-watchman --detectOpenHandles --openHandlesTimeout=1000 --forceExit
 
   test-linux:
     name: Test bindings (Linux ${{ matrix.target }})
@@ -221,7 +221,7 @@ jobs:
         working-directory: bindings/node
         env:
           NODE_ENV: test
-        run: npx jest --ci --runInBand --detectOpenHandles --openHandlesTimeout=1000 --forceExit
+        run: npx jest --ci --runInBand --no-watchman --detectOpenHandles --openHandlesTimeout=1000 --forceExit
 
   publish:
     name: Publish to npm

@@ -54,6 +54,7 @@ pub struct WsResponse {
     pub accept: AcceptMode,
     pub headers: Vec<(String, String)>,
     pub first_frame: Option<Vec<u8>>,
+    pub expected_client_frames: usize,
 }
 
 impl Default for WsResponse {
@@ -63,6 +64,7 @@ impl Default for WsResponse {
             accept: AcceptMode::Valid,
             headers: Vec::new(),
             first_frame: None,
+            expected_client_frames: 0,
         }
     }
 }
@@ -173,10 +175,8 @@ where
         .expect("write websocket handshake response");
     stream.flush().await.expect("flush websocket response");
 
-    let mut client_frames = Vec::new();
-    while let Ok(Ok(frame)) = timeout(Duration::from_millis(100), read_frame(&mut stream)).await {
-        client_frames.push(frame);
-    }
+    let client_frames =
+        read_expected_client_frames(&mut stream, response.expected_client_frames).await;
     let client_frame = client_frames.first().cloned();
 
     WsExchange {
@@ -185,6 +185,23 @@ where
         client_frames,
         selected_alpn,
     }
+}
+
+async fn read_expected_client_frames<S>(
+    stream: &mut S,
+    expected_client_frames: usize,
+) -> Vec<CapturedFrame>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut client_frames = Vec::new();
+    for _ in 0..expected_client_frames {
+        match timeout(Duration::from_secs(1), read_frame(stream)).await {
+            Ok(Ok(frame)) => client_frames.push(frame),
+            _ => break,
+        }
+    }
+    client_frames
 }
 
 pub fn websocket_accept(key: &str) -> String {

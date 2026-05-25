@@ -119,6 +119,53 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
+  test-windows-smoke:
+    name: Test (Windows smoke)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-test-windows-smoke
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/boringssl/x86_64-pc-windows-msvc
+            lib/boringssl/include
+          key: boringssl-x86_64-pc-windows-msvc-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install prebuilt BoringSSL
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install-boringssl-prebuilt.sh
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml x86_64-pc-windows-msvc
+
+      - name: Windows smoke (transport-touching integration tests)
+        run: |
+          cargo nextest run --all-features --profile ci --retries 0 --locked \
+            -E 'binary(=h1_rfc_compliance) | binary(=tls_mock_server) | binary(=rfc6455_websocket) | binary(=rfc8441_handshake) | binary(=h3_native_codec)'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nextest-results-windows-smoke
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
   build-linux:
     name: Build Linux (${{ matrix.target }})
     strategy:
