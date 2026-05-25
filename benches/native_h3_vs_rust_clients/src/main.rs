@@ -3352,13 +3352,16 @@ async fn measure_tokio_quiche_rfc9220_tunnel_mixed_once(
 
     let expected_tunnel_bytes =
         LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE * LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
-    send_tokio_quiche_outbound_frame(
-        &mut tunnel_sender,
-        OutboundFrame::Body(Bytes::from(vec![b'U'; expected_tunnel_bytes]), false),
-        deadline,
-        "tokio_quiche RFC 9220 mixed tunnel",
-    )
-    .await?;
+    for _ in 0..LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES {
+        send_tokio_quiche_outbound_frame(
+            &mut tunnel_sender,
+            OutboundFrame::Body(rfc9220_tunnel_payload(b'U'), false),
+            deadline,
+            "tokio_quiche RFC 9220 mixed tunnel",
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     send_tokio_quiche_outbound_frame(
         &mut tunnel_sender,
         OutboundFrame::Body(Bytes::new(), true),
