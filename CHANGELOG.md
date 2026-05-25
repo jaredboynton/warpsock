@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-05-25
+
 ### Added
 - **TCP-TLS session resumption and 0-RTT**: `BoringConnector` now caches `SslConnector` instances and stores TLS 1.3 session tickets in a host-keyed external cache via BoringSSL's new-session callback. Opt in to TCP 0-RTT with `ClientBuilder::http_tls_early_data(true)` for eligible GET/HEAD/OPTIONS H1 requests on fresh dials.
 - **Happy Eyeballs v2 (RFC 8305)**: Dual-stack connects now interleave IPv6/IPv4 attempts with a 250 ms stagger (configurable via `BoringConnector::happy_eyeballs_delay`).
