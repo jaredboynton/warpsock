@@ -8,6 +8,7 @@ use boring::ssl::SslSession;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Cache key for a TLS session ticket.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -37,6 +38,7 @@ struct CachedSession {
 #[derive(Debug, Clone)]
 pub struct SessionCache {
     inner: Arc<Mutex<SessionCacheInner>>,
+    session_stored: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -53,6 +55,7 @@ impl SessionCache {
                 sessions: HashMap::new(),
                 default_max_age: Duration::from_secs(86400),
             })),
+            session_stored: Arc::new(Notify::new()),
         }
     }
 
@@ -63,6 +66,7 @@ impl SessionCache {
                 sessions: HashMap::new(),
                 default_max_age: max_age,
             })),
+            session_stored: Arc::new(Notify::new()),
         }
     }
 
@@ -74,17 +78,20 @@ impl SessionCache {
         early_data_capable: bool,
         max_age: Option<Duration>,
     ) {
-        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
-        let max_age = max_age.unwrap_or(inner.default_max_age);
-        inner.sessions.insert(
-            key,
-            CachedSession {
-                der,
-                early_data_capable,
-                max_age,
-                received_at: Instant::now(),
-            },
-        );
+        {
+            let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
+            let max_age = max_age.unwrap_or(inner.default_max_age);
+            inner.sessions.insert(
+                key,
+                CachedSession {
+                    der,
+                    early_data_capable,
+                    max_age,
+                    received_at: Instant::now(),
+                },
+            );
+        }
+        self.session_stored.notify_waiters();
     }
 
     /// Legacy host-only store API retained for compatibility.
@@ -106,6 +113,38 @@ impl SessionCache {
             return None;
         }
         SslSession::from_der(&entry.der).ok()
+    }
+
+    /// Wait until a session for `key` is stored or `timeout` elapses.
+    pub async fn wait_for_session(&self, key: &SessionCacheKey, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.has_session(key) {
+                    return;
+                }
+                let notified = self.session_stored.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.has_session(key) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn has_session(&self, key: &SessionCacheKey) -> bool {
+        let mut inner = self.inner.lock().expect("Session cache mutex poisoned");
+        let Some(entry) = inner.sessions.get(key) else {
+            return false;
+        };
+        if entry.received_at.elapsed() >= entry.max_age {
+            inner.sessions.remove(key);
+            return false;
+        }
+        true
     }
 
     /// Whether a cached session advertises TLS 1.3 early-data support.
@@ -199,5 +238,35 @@ mod tests {
         assert_eq!(cache.len(), 2);
         cache.clear();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_observes_preexisting_session() {
+        let cache = SessionCache::new();
+        let key = SessionCacheKey::new("example.com", 443);
+        cache.store_session(key.clone(), vec![1, 2, 3], false, None);
+
+        assert!(cache.wait_for_session(&key, Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn store_session_notifies_after_releasing_cache_lock() {
+        let cache = SessionCache::new();
+        let key = SessionCacheKey::new("example.com", 443);
+        let waiter = {
+            let cache = cache.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                assert!(cache.wait_for_session(&key, Duration::from_secs(1)).await);
+                let _guard = cache.inner.lock().expect("Session cache mutex poisoned");
+            })
+        };
+
+        cache.store_session(key, vec![1, 2, 3], false, None);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must not block on a notification sent while the cache lock is held")
+            .expect("waiter task must not panic");
     }
 }
