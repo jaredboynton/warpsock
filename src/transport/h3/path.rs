@@ -285,13 +285,16 @@ impl QuicConnectionIdInventory {
             .active_peer_sequence
             .is_some_and(|active| active < self.peer_retire_prior_to)
         {
-            self.active_peer_sequence = self.peers.iter().find_map(|(seq, entry)| {
-                if entry.retired {
-                    None
-                } else {
-                    Some(*seq)
-                }
-            });
+            self.active_peer_sequence =
+                self.peers.iter().find_map(
+                    |(seq, entry)| {
+                        if entry.retired {
+                            None
+                        } else {
+                            Some(*seq)
+                        }
+                    },
+                );
         }
         Ok(())
     }
@@ -337,9 +340,10 @@ impl QuicConnectionIdInventory {
     /// Promote a non-retired peer CID to active, for example when migrating
     /// to a probed path (RFC 9000 § 9.5).
     pub fn promote_peer_to_active(&mut self, sequence_number: u64) -> Result<()> {
-        let entry = self.peers.get(&sequence_number).ok_or_else(|| {
-            Error::quic("RFC9000 9.5: cannot promote unknown peer connection ID")
-        })?;
+        let entry = self
+            .peers
+            .get(&sequence_number)
+            .ok_or_else(|| Error::quic("RFC9000 9.5: cannot promote unknown peer connection ID"))?;
         if entry.retired {
             return Err(Error::quic(
                 "RFC9000 9.5: cannot promote a retired peer connection ID",
@@ -608,8 +612,7 @@ mod tests {
         let mut inventory = QuicConnectionIdInventory::new(4);
         let local_seq =
             inventory.install_initial_local(ConnectionId::from_slice(&[1; 8]), [0xAA; 16]);
-        let peer_seq =
-            inventory.install_initial_peer(Bytes::from_static(&[2; 8]), [0xBB; 16]);
+        let peer_seq = inventory.install_initial_peer(Bytes::from_static(&[2; 8]), [0xBB; 16]);
         assert_eq!(local_seq, 0);
         assert_eq!(peer_seq, 0);
         assert_eq!(inventory.active_local().map(|e| e.sequence_number), Some(0));
@@ -769,7 +772,10 @@ mod tests {
     fn local_entries_default_to_active_local() {
         let mut inventory = QuicConnectionIdInventory::new(4);
         let seq = inventory.install_initial_local(local_entry(0).connection_id, [0xAA; 16]);
-        assert_eq!(inventory.active_local().map(|e| e.sequence_number), Some(seq));
+        assert_eq!(
+            inventory.active_local().map(|e| e.sequence_number),
+            Some(seq)
+        );
     }
 
     fn addr(port: u16) -> SocketAddr {
@@ -847,10 +853,7 @@ mod tests {
             "non-matching token must be ignored"
         );
         assert!(
-            !set.path(addr(7001))
-                .unwrap()
-                .anti_amplification
-                .validated(),
+            !set.path(addr(7001)).unwrap().anti_amplification.validated(),
             "validation must not be claimed on a bad token"
         );
     }
