@@ -118,7 +118,7 @@ impl FrameDecoder {
     #[inline]
     pub(crate) fn decode_message(
         &mut self,
-        url: &url::Url,
+        url: &crate::url::Url,
         frame: Frame,
         config: FrameConfig,
     ) -> WebSocketResult<Option<Message>> {
@@ -160,7 +160,7 @@ impl FrameDecoder {
 
     fn push_fragment(
         &mut self,
-        url: &url::Url,
+        url: &crate::url::Url,
         payload: Bytes,
         config: FrameConfig,
     ) -> WebSocketResult<()> {
@@ -176,7 +176,7 @@ impl FrameDecoder {
 
     fn data_message(
         &self,
-        url: &url::Url,
+        url: &crate::url::Url,
         opcode: OpCode,
         payload: Bytes,
         config: FrameConfig,
@@ -274,7 +274,7 @@ fn mask_payload_words(payload: &mut [u8], key: [u8; 4]) {
 
 #[inline]
 pub(crate) fn decode_frame(
-    url: &url::Url,
+    url: &crate::url::Url,
     buffer: &mut BytesMut,
     config: FrameConfig,
 ) -> WebSocketResult<Option<Frame>> {

@@ -4,7 +4,7 @@ use http::Uri;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout as tokio_timeout;
-use url::Url;
+use crate::url::{Host, Url};
 
 use crate::headers::Headers;
 use crate::transport::connector::MaybeHttpsStream;
@@ -379,7 +379,7 @@ fn origin_form_target(url: &Url) -> String {
 
 fn host_header(url: &Url) -> String {
     let host = match url.host() {
-        Some(url::Host::Ipv6(addr)) => format!("[{}]", addr),
+        Some(Host::Ipv6(addr)) => format!("[{}]", addr),
         Some(host) => host.to_string(),
         None => "localhost".to_string(),
     };

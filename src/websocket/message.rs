@@ -122,7 +122,7 @@ impl CloseCode {
 }
 
 impl CloseFrame {
-    pub(crate) fn encode(&self, url: &url::Url) -> WebSocketResult<Vec<u8>> {
+    pub(crate) fn encode(&self, url: &crate::url::Url) -> WebSocketResult<Vec<u8>> {
         self.validate_for_send(url)?;
         let mut payload = Vec::with_capacity(2 + self.reason.len());
         payload.extend_from_slice(&self.code.as_u16().to_be_bytes());
@@ -130,7 +130,7 @@ impl CloseFrame {
         Ok(payload)
     }
 
-    pub(crate) fn validate_for_send(&self, url: &url::Url) -> WebSocketResult<()> {
+    pub(crate) fn validate_for_send(&self, url: &crate::url::Url) -> WebSocketResult<()> {
         let code = self.code.as_u16();
         if !is_valid_wire_close_code(code) {
             return Err(WebSocketError::protocol(
@@ -149,7 +149,7 @@ impl CloseFrame {
         Ok(())
     }
 
-    pub(crate) fn decode(url: &url::Url, payload: &[u8]) -> WebSocketResult<Option<Self>> {
+    pub(crate) fn decode(url: &crate::url::Url, payload: &[u8]) -> WebSocketResult<Option<Self>> {
         if payload.is_empty() {
             return Ok(None);
         }

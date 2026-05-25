@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tokio::time::timeout as tokio_timeout;
-use url::Url;
+use crate::url::Url;
 
 use crate::cookie::CookieJar;
 use crate::headers::Headers;
