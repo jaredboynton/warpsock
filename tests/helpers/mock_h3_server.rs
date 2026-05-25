@@ -4,6 +4,7 @@ use bytes::Bytes;
 use specter::fingerprint::Http3Fingerprint;
 use specter::transport::h3::handshake::{ClientH3Event, NativeQuicServerHandshake};
 use specter::transport::h3::native::{decode_header_block, encode_frame, H3Frame, H3Header};
+use specter::transport::h3::path::QuicServerPathRuntime;
 use specter::transport::h3::quic::{split_long_header_datagram, ConnectionId, LongHeaderType};
 use specter::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use specter::transport::h3::tls::NATIVE_H3_TICKET_KEY_LEN;
@@ -99,7 +100,9 @@ impl MockH3Server {
         Fut: std::future::Future<Output = ()> + Send,
     {
         let mut buf = [0u8; 65535];
-        let connections = Arc::new(Mutex::new(HashMap::<Vec<u8>, mpsc::Sender<Vec<u8>>>::new()));
+        let connections = Arc::new(Mutex::new(
+            HashMap::<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<u8>)>>::new(),
+        ));
         let handler = Arc::new(handler);
         let socket = self.socket.clone();
         let enable_extended_connect = self.enable_extended_connect;
@@ -142,7 +145,7 @@ impl MockH3Server {
                         first.destination_cid.clone(),
                         first.source_cid.clone(),
                     );
-                    let _ = tx.send(packet).await;
+                    let _ = tx.send((peer, packet)).await;
                     continue;
                 }
             }
@@ -161,7 +164,7 @@ impl MockH3Server {
             };
 
             if let Some(tx) = tx_to_send {
-                let _ = tx.send(packet).await;
+                let _ = tx.send((peer, packet)).await;
             }
         }
     }
@@ -170,7 +173,7 @@ impl MockH3Server {
 fn spawn_native_connection<F, Fut>(
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     handler: Arc<F>,
     enable_extended_connect: bool,
     mut fingerprint: Http3Fingerprint,
@@ -226,10 +229,13 @@ fn spawn_native_connection<F, Fut>(
 
         NativeMockH3Connection {
             socket,
-            peer,
+            path_runtime: QuicServerPathRuntime::new(peer),
             handshake: server,
             fingerprint,
             settings_sent: false,
+            handshake_done_sent: false,
+            new_connection_id_sent: false,
+            path_challenge_counter: 0,
             rx,
             cmd_rx,
             evt_tx,
@@ -248,11 +254,14 @@ fn spawn_native_connection<F, Fut>(
 
 struct NativeMockH3Connection {
     socket: Arc<UdpSocket>,
-    peer: SocketAddr,
+    path_runtime: QuicServerPathRuntime,
     handshake: NativeQuicServerHandshake,
     fingerprint: Http3Fingerprint,
     settings_sent: bool,
-    rx: mpsc::Receiver<Vec<u8>>,
+    handshake_done_sent: bool,
+    new_connection_id_sent: bool,
+    path_challenge_counter: u64,
+    rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     cmd_rx: mpsc::Receiver<MockCommand>,
     evt_tx: mpsc::Sender<MockEvent>,
     stats: MockH3Stats,
@@ -339,9 +348,9 @@ impl NativeMockH3Connection {
                         tracing::debug!("native mock H3 loss detection error: {}", err);
                     }
                 }
-                packet = self.rx.recv() => {
-                    let Some(packet) = packet else { break };
-                    match self.process_datagram(&packet).await {
+                inbound = self.rx.recv() => {
+                    let Some((remote, packet)) = inbound else { break };
+                    match self.process_datagram(remote, &packet).await {
                         Ok(true) => self.last_activity = Instant::now(),
                         Ok(false) => {}
                         Err(err) => tracing::debug!("native mock H3 process_datagram error: {}", err),
@@ -358,7 +367,11 @@ impl NativeMockH3Connection {
         }
     }
 
-    async fn process_datagram(&mut self, packet: &[u8]) -> specter::Result<bool> {
+    async fn process_datagram(
+        &mut self,
+        remote: SocketAddr,
+        packet: &[u8],
+    ) -> specter::Result<bool> {
         if self.handshake.close_state().is_closing() {
             self.handshake.server_observe_inbound_packet_for_close();
             if self
@@ -397,7 +410,7 @@ impl NativeMockH3Connection {
                     .handshake
                     .open_client_zero_rtt_h3_event_packet(packet)?
                 {
-                    if self.apply_client_event(event).await? {
+                    if self.apply_client_event(remote, event).await? {
                         active = true;
                     }
                 }
@@ -416,7 +429,44 @@ impl NativeMockH3Connection {
             return Ok(active);
         }
 
-        let events = self.handshake.open_client_h3_event_packet(packet)?;
+        self.path_runtime
+            .process_inbound(remote, packet.len(), Instant::now());
+        if remote != self.path_runtime.primary_peer()
+            && self.path_runtime.is_new_address(remote)
+        {
+            if self.fingerprint.transport.disable_active_migration {
+                let close = self
+                    .handshake
+                    .build_server_connection_migration_close_packet()?;
+                self.send_packet_to_path(remote, close.packet).await?;
+                self.closed = true;
+                return Ok(false);
+            }
+            self.path_challenge_counter = self.path_challenge_counter.wrapping_add(1);
+            let token = self.path_challenge_counter.to_be_bytes();
+            if self.path_runtime.issue_challenge(remote, token) {
+                let challenge = self
+                    .handshake
+                    .build_server_path_challenge_packet_for_address(remote, token)?;
+                self.send_packet_to_path(remote, challenge.packet).await?;
+            }
+        }
+
+        let events = self
+            .handshake
+            .open_client_h3_event_packet_from(packet, remote)?;
+        if self.handshake.is_server_path_address_validated(&remote) {
+            self.path_runtime.mark_validated(remote);
+            self.path_runtime.promote_primary(remote);
+            if let Some(sequence) = self
+                .handshake
+                .server_pop_pending_peer_retires()
+                .into_iter()
+                .next()
+            {
+                let _ = self.handshake.server_promote_peer_cid(sequence);
+            }
+        }
         if self.handshake.close_state().is_draining() {
             return Ok(false);
         }
@@ -460,7 +510,7 @@ impl NativeMockH3Connection {
         }
         let mut active = false;
         for event in events {
-            if self.apply_client_event(event).await? {
+            if self.apply_client_event(remote, event).await? {
                 active = true;
             }
         }
@@ -549,7 +599,26 @@ impl NativeMockH3Connection {
     }
 
     async fn send_settings_if_ready(&mut self) -> specter::Result<()> {
-        if self.settings_sent || !self.handshake.is_application_ready() {
+        if !self.handshake.is_application_ready() {
+            return Ok(());
+        }
+        if !self.handshake_done_sent {
+            let packet = self.handshake.build_server_handshake_done_packet()?;
+            self.handshake_done_sent = true;
+            self.send_packet(packet.packet).await?;
+        }
+        if !self.new_connection_id_sent {
+            let migration_cid = ConnectionId::from_static(b"mock-migrate");
+            let packet = self.handshake.build_server_new_connection_id_packet(
+                1,
+                0,
+                migration_cid,
+                [0x5c; 16],
+            )?;
+            self.new_connection_id_sent = true;
+            self.send_packet(packet.packet).await?;
+        }
+        if self.settings_sent {
             return Ok(());
         }
         let packet = self
@@ -559,7 +628,11 @@ impl NativeMockH3Connection {
         self.send_packet(packet.packet).await
     }
 
-    async fn apply_client_event(&mut self, event: ClientH3Event) -> specter::Result<bool> {
+    async fn apply_client_event(
+        &mut self,
+        remote: SocketAddr,
+        event: ClientH3Event,
+    ) -> specter::Result<bool> {
         match event {
             ClientH3Event::Stream(event) => {
                 let mut active = false;
@@ -645,7 +718,12 @@ impl NativeMockH3Connection {
                 self.stats.stopped_stream_count_remote += 1;
                 Ok(true)
             }
-            ClientH3Event::ConnectionClose { .. } | ClientH3Event::PathChallenge(_) => Ok(true),
+            ClientH3Event::ConnectionClose { .. } => Ok(true),
+            ClientH3Event::PathChallenge(data) => {
+                let packet = self.handshake.build_server_path_response_packet(data)?;
+                self.send_packet_to_path(remote, packet.packet).await?;
+                Ok(true)
+            }
         }
     }
 
@@ -767,11 +845,26 @@ impl NativeMockH3Connection {
         Ok(())
     }
 
-    async fn send_packet(&self, packet: Bytes) -> specter::Result<()> {
+    async fn send_packet(&mut self, packet: Bytes) -> specter::Result<()> {
+        self.send_packet_to_path(self.path_runtime.primary_peer(), packet)
+            .await
+    }
+
+    async fn send_packet_to_path(
+        &mut self,
+        remote: SocketAddr,
+        packet: Bytes,
+    ) -> specter::Result<()> {
+        if !self.path_runtime.may_send_to(remote, packet.len()) {
+            return Err(specter::Error::Quic(
+                "native mock H3 server anti-amplification budget exhausted".into(),
+            ));
+        }
         self.socket
-            .send_to(packet.as_ref(), self.peer)
+            .send_to(packet.as_ref(), remote)
             .await
             .map_err(specter::Error::Io)?;
+        self.path_runtime.record_sent_to(remote, packet.len());
         Ok(())
     }
 }

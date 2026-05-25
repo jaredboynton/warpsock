@@ -17,7 +17,7 @@ fn chrome_http3_fingerprint_exposes_quic_h3_and_grease_knobs() {
     assert_eq!(fingerprint.transport.initial_max_streams_bidi, 100);
     assert_eq!(fingerprint.transport.ack_delay_exponent, 3);
     assert_eq!(fingerprint.transport.max_ack_delay_ms, 25);
-    assert_eq!(fingerprint.transport.ack_eliciting_threshold, 16);
+    assert_eq!(fingerprint.transport.ack_eliciting_threshold, 10);
     assert_eq!(fingerprint.transport.active_connection_id_limit, 2);
     assert!(fingerprint.transport.disable_active_migration);
     assert!(fingerprint.transport.grease);
@@ -31,6 +31,25 @@ fn chrome_http3_fingerprint_exposes_quic_h3_and_grease_knobs() {
     assert_eq!(
         FingerprintProfile::Chrome148.http3_fingerprint(),
         fingerprint
+    );
+}
+
+#[test]
+fn browser_http3_fingerprints_expose_distinct_ack_cadence() {
+    let chrome = Http3Fingerprint::chrome();
+    let firefox = Http3Fingerprint::firefox();
+
+    assert_eq!(chrome.transport.max_ack_delay_ms, 25);
+    assert_eq!(chrome.transport.ack_eliciting_threshold, 10);
+    assert_eq!(firefox.transport.max_ack_delay_ms, 20);
+    assert_eq!(firefox.transport.ack_eliciting_threshold, 2);
+    assert_ne!(
+        chrome.transport.ack_eliciting_threshold,
+        firefox.transport.ack_eliciting_threshold
+    );
+    assert_ne!(
+        chrome.transport.max_ack_delay_ms,
+        firefox.transport.max_ack_delay_ms
     );
 }
 
