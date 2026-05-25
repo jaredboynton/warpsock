@@ -43,6 +43,8 @@ pub enum WebSocketError {
 }
 
 impl WebSocketError {
+    #[cold]
+    #[inline(never)]
     pub(crate) fn protocol(url: &crate::url::Url, message: impl Into<String>) -> Self {
         Self::Protocol {
             url: url.to_string(),
@@ -50,6 +52,8 @@ impl WebSocketError {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn utf8(url: &crate::url::Url, message: impl Into<String>) -> Self {
         Self::Utf8 {
             url: url.to_string(),
@@ -57,6 +61,8 @@ impl WebSocketError {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn limit_exceeded(url: &crate::url::Url, message: impl Into<String>) -> Self {
         Self::LimitExceeded {
             url: url.to_string(),
@@ -64,12 +70,16 @@ impl WebSocketError {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn connection_closed(url: &crate::url::Url) -> Self {
         Self::ConnectionClosed {
             url: url.to_string(),
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn io(url: &crate::url::Url, source: io::Error) -> Self {
         Self::Io {
             url: url.to_string(),
