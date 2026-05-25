@@ -15,7 +15,8 @@ use crate::transport::h3::quic::{
     open_short_header_packet, protect_long_header_packet, protect_short_header_packet,
     split_long_header_datagram, validate_retry_integrity_tag_v1, ConnectionId, LongHeaderPacket,
     LongHeaderType, OpenedShortHeaderPacket, QuicAckTracker, QuicCloseState, QuicCryptoAssembler,
-    QuicFrame, QuicLossDetector, QuicPacketKeyMaterial, QuicPathValidator, TransportParameter,
+    QuicEcnMark, QuicFrame, QuicLossDetector, QuicPacketKeyMaterial, QuicPathValidator,
+    TransportParameter,
 };
 use crate::transport::h3::recovery::{
     LossDetectionOutcome, PacketNumberSpace, RecoveryState, SentPacketInfo,
@@ -37,6 +38,19 @@ fn recovery_state_from_transport(params: &QuicTransportParams) -> RecoveryState 
     let max_ack_delay = Duration::from_millis(params.max_ack_delay_ms);
     let datagram = params.max_recv_udp_payload_size.max(1200) as u64;
     RecoveryState::new(max_ack_delay, datagram)
+}
+
+fn observe_packet_with_ecn(
+    tracker: &mut QuicAckTracker,
+    packet_number: u64,
+    ecn_mark: Option<QuicEcnMark>,
+    now: Instant,
+) {
+    if let Some(mark) = ecn_mark {
+        tracker.observe_ecn_at(packet_number, mark, now);
+    } else {
+        tracker.observe_at(packet_number, now);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1288,6 +1302,14 @@ impl NativeQuicServerHandshake {
     }
 
     pub fn process_client_initial(&mut self, datagram: &[u8]) -> Result<ServerHandshakeFlight> {
+        self.process_client_initial_with_ecn(datagram, None)
+    }
+
+    pub fn process_client_initial_with_ecn(
+        &mut self,
+        datagram: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<ServerHandshakeFlight> {
         let mut server_initial_crypto = Bytes::new();
         let mut server_handshake_crypto = Bytes::new();
 
@@ -1302,8 +1324,12 @@ impl NativeQuicServerHandshake {
                 packet.packet_number_offset,
                 self.next_client_initial_packet_number,
             )?;
-            self.client_initial_ack_tracker
-                .observe(opened.packet_number);
+            observe_packet_with_ecn(
+                &mut self.client_initial_ack_tracker,
+                opened.packet_number,
+                ecn_mark,
+                Instant::now(),
+            );
             self.next_client_initial_packet_number = opened.packet_number + 1;
 
             for frame in decode_frames(&opened.payload)? {
@@ -1400,6 +1426,14 @@ impl NativeQuicServerHandshake {
         &mut self,
         datagram: &[u8],
     ) -> Result<ProcessedClientHandshake> {
+        self.process_client_handshake_with_ecn(datagram, None)
+    }
+
+    pub fn process_client_handshake_with_ecn(
+        &mut self,
+        datagram: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<ProcessedClientHandshake> {
         let Some(client_handshake_keys) = &self.client_handshake_keys else {
             return Err(Error::Quic(
                 "native server Handshake packet decryption is waiting for TLS Handshake keys"
@@ -1420,8 +1454,12 @@ impl NativeQuicServerHandshake {
                 self.next_client_handshake_packet_number,
             )?;
             packet_number = opened.packet_number;
-            self.client_handshake_ack_tracker
-                .observe(opened.packet_number);
+            observe_packet_with_ecn(
+                &mut self.client_handshake_ack_tracker,
+                opened.packet_number,
+                ecn_mark,
+                Instant::now(),
+            );
             self.next_client_handshake_packet_number = opened.packet_number + 1;
 
             for frame in decode_frames(&opened.payload)? {
@@ -1458,6 +1496,14 @@ impl NativeQuicServerHandshake {
     }
 
     pub fn open_client_application_packet(&mut self, packet: &[u8]) -> Result<Vec<QuicFrame>> {
+        self.open_client_application_packet_with_ecn(packet, None)
+    }
+
+    pub fn open_client_application_packet_with_ecn(
+        &mut self,
+        packet: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<QuicFrame>> {
         // RFC9000 § 10.2: stop parsing inbound packets once we have entered
         // the draining phase. Closing-phase parsing is preserved so the
         // server can take the MAY-optimisation path (§ 10.2: closing -> draining
@@ -1488,12 +1534,20 @@ impl NativeQuicServerHandshake {
         let opened = opened.opened;
         self.next_client_application_packet_number = opened.packet_number + 1;
         let frames = decode_frames(&opened.payload)?;
-        self.apply_opened_client_application_frames(opened.packet_number, frames, now)
+        self.apply_opened_client_application_frames(opened.packet_number, frames, now, ecn_mark)
     }
 
     pub fn open_client_zero_rtt_h3_event_packet(
         &mut self,
         datagram: &[u8],
+    ) -> Result<Vec<ClientH3Event>> {
+        self.open_client_zero_rtt_h3_event_packet_with_ecn(datagram, None)
+    }
+
+    pub fn open_client_zero_rtt_h3_event_packet_with_ecn(
+        &mut self,
+        datagram: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
     ) -> Result<Vec<ClientH3Event>> {
         if self.close_state.is_draining() || !self.handshake_status().early_data_accepted() {
             return Ok(Vec::new());
@@ -1516,8 +1570,12 @@ impl NativeQuicServerHandshake {
             )?;
             self.next_client_application_packet_number = opened.packet_number + 1;
             let frames = decode_frames(&opened.payload)?;
-            let frames =
-                self.apply_opened_client_application_frames(opened.packet_number, frames, now)?;
+            let frames = self.apply_opened_client_application_frames(
+                opened.packet_number,
+                frames,
+                now,
+                ecn_mark,
+            )?;
             events.extend(self.client_h3_events_from_frames(frames)?);
         }
         Ok(events)
@@ -1528,6 +1586,7 @@ impl NativeQuicServerHandshake {
         packet_number: u64,
         frames: Vec<QuicFrame>,
         now: Instant,
+        ecn_mark: Option<QuicEcnMark>,
     ) -> Result<Vec<QuicFrame>> {
         for frame in &frames {
             if let QuicFrame::Stream {
@@ -1583,7 +1642,12 @@ impl NativeQuicServerHandshake {
             }
         }
         if frames.iter().any(is_ack_eliciting_quic_frame) {
-            self.client_application_ack_tracker.observe(packet_number);
+            observe_packet_with_ecn(
+                &mut self.client_application_ack_tracker,
+                packet_number,
+                ecn_mark,
+                now,
+            );
         }
         Ok(frames.into_iter().filter(is_not_padding_frame).collect())
     }
@@ -3865,6 +3929,14 @@ impl NativeQuicHandshake {
     }
 
     pub fn open_server_application_packet(&mut self, packet: &[u8]) -> Result<Vec<QuicFrame>> {
+        self.open_server_application_packet_with_ecn(packet, None)
+    }
+
+    pub fn open_server_application_packet_with_ecn(
+        &mut self,
+        packet: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<QuicFrame>> {
         // RFC9000 § 10.2: stop decrypting peer packets once we are draining;
         // closing-phase decryption is preserved so we can still apply the
         // § 10.2 MAY-optimisation (closing -> draining on peer CONNECTION_CLOSE).
@@ -3953,7 +4025,12 @@ impl NativeQuicHandshake {
             }
         }
         if frames.iter().any(is_ack_eliciting_quic_frame) {
-            self.application_ack_tracker.observe(opened.packet_number);
+            observe_packet_with_ecn(
+                &mut self.application_ack_tracker,
+                opened.packet_number,
+                ecn_mark,
+                now,
+            );
         }
         Ok(frames.into_iter().filter(is_not_padding_frame).collect())
     }
@@ -3976,6 +4053,14 @@ impl NativeQuicHandshake {
     }
 
     pub fn open_server_h3_event_packet(&mut self, packet: &[u8]) -> Result<Vec<ServerH3Event>> {
+        self.open_server_h3_event_packet_with_ecn(packet, None)
+    }
+
+    pub fn open_server_h3_event_packet_with_ecn(
+        &mut self,
+        packet: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<ServerH3Event>> {
         // RFC9000 § 10.2: once we are draining we MUST drop inbound packets.
         // Closing-phase parsing remains active so the MAY optimisation in
         // § 10.2 ("transition from closing to draining if you can confirm
@@ -3985,7 +4070,7 @@ impl NativeQuicHandshake {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        for frame in self.open_server_application_packet(packet)? {
+        for frame in self.open_server_application_packet_with_ecn(packet, ecn_mark)? {
             match frame {
                 QuicFrame::Stream {
                     stream_id,
@@ -4076,6 +4161,14 @@ impl NativeQuicHandshake {
         &mut self,
         datagram: &[u8],
     ) -> Result<Vec<ProcessedServerInitial>> {
+        self.process_server_datagram_with_ecn(datagram, None)
+    }
+
+    pub fn process_server_datagram_with_ecn(
+        &mut self,
+        datagram: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<ProcessedServerInitial>> {
         if is_version_negotiation_datagram(datagram) {
             return self.process_version_negotiation_datagram(datagram);
         }
@@ -4092,7 +4185,12 @@ impl NativeQuicHandshake {
                     )?;
                     self.destination_cid = packet.source_cid.clone();
                     self.server_initial_or_handshake_seen = true;
-                    self.initial_ack_tracker.observe(opened.packet_number);
+                    observe_packet_with_ecn(
+                        &mut self.initial_ack_tracker,
+                        opened.packet_number,
+                        ecn_mark,
+                        Instant::now(),
+                    );
                     self.next_server_initial_packet_number = opened.packet_number + 1;
 
                     for frame in decode_frames(&opened.payload)? {
@@ -4147,7 +4245,12 @@ impl NativeQuicHandshake {
                         self.next_server_handshake_packet_number,
                     )?;
                     self.server_initial_or_handshake_seen = true;
-                    self.handshake_ack_tracker.observe(opened.packet_number);
+                    observe_packet_with_ecn(
+                        &mut self.handshake_ack_tracker,
+                        opened.packet_number,
+                        ecn_mark,
+                        Instant::now(),
+                    );
                     self.next_server_handshake_packet_number = opened.packet_number + 1;
 
                     for frame in decode_frames(&opened.payload)? {

@@ -20,8 +20,10 @@ use crate::transport::h3::handshake::{NativeQuicHandshake, ServerH3Event, Server
 use crate::transport::h3::native::{
     decode_header_block, H3Frame, H3Header, H3Setting, H3StreamType,
 };
+use crate::transport::h3::quic::QuicEcnMark;
 use crate::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use crate::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
+use crate::transport::h3::udp_ecn::recv_from_with_ecn;
 use crate::transport::h3::{
     H3TransportConfig, H3Tunnel, H3TunnelCredit, H3TunnelEvent, H3TunnelOutbound,
 };
@@ -673,7 +675,7 @@ pub fn spawn_native_h3_driver(
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     max_idle_timeout_ms: u64,
-    initial_datagram: Option<Bytes>,
+    initial_datagram: Option<(Bytes, Option<QuicEcnMark>)>,
     transport_config: H3TransportConfig,
     session_cache: NativeH3SessionCache,
     session_cache_key: NativeH3SessionCacheKey,
@@ -756,7 +758,7 @@ struct NativeH3Driver {
     session_cache_key: NativeH3SessionCacheKey,
     max_idle_timeout: Duration,
     last_activity: Instant,
-    initial_datagram: Option<Bytes>,
+    initial_datagram: Option<(Bytes, Option<QuicEcnMark>)>,
 }
 
 struct NativeDriverStreamingResponseState {
@@ -1043,8 +1045,8 @@ impl NativeH3Driver {
 
     async fn drive_loop(&mut self) -> Result<()> {
         self.send_preface().await?;
-        if let Some(datagram) = self.initial_datagram.take() {
-            self.process_datagram(&datagram).await?;
+        if let Some((datagram, ecn_mark)) = self.initial_datagram.take() {
+            self.process_datagram(&datagram, ecn_mark).await?;
             self.process_pending_commands().await?;
         }
 
@@ -1117,11 +1119,11 @@ impl NativeH3Driver {
                         }
                     }
                 }
-                recv = self.socket.recv_from(&mut buf), if !receive_paused_for_body => {
+                recv = recv_from_with_ecn(&self.socket, &mut buf), if !receive_paused_for_body => {
                     self.last_activity = Instant::now();
-                    let (len, from) = recv.map_err(Error::Io)?;
-                    if from == self.peer_addr {
-                        self.process_datagram(&buf[..len]).await?;
+                    let received = recv.map_err(Error::Io)?;
+                    if received.peer == self.peer_addr {
+                        self.process_datagram(&buf[..received.len], received.ecn_mark).await?;
                     }
                 }
                 _ = tokio::time::sleep(remaining_idle), if !has_pending_work => {
@@ -1972,7 +1974,11 @@ impl NativeH3Driver {
         }
     }
 
-    async fn process_datagram(&mut self, datagram: &[u8]) -> Result<()> {
+    async fn process_datagram(
+        &mut self,
+        datagram: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<()> {
         // RFC9000 § 10.2: once we are draining we MUST drop all incoming
         // packets without further processing.
         if self.handshake.close_state().is_draining() {
@@ -2012,7 +2018,9 @@ impl NativeH3Driver {
         }
 
         if datagram.first().is_some_and(|first| first & 0x80 != 0) {
-            let processed_packets = self.handshake.process_server_datagram(datagram)?;
+            let processed_packets = self
+                .handshake
+                .process_server_datagram_with_ecn(datagram, ecn_mark)?;
             self.drain_session_tickets();
             if let Some(packet) = self.handshake.build_client_initial_ack_packet()? {
                 self.socket
@@ -2040,7 +2048,9 @@ impl NativeH3Driver {
             return Ok(());
         }
 
-        let events = self.handshake.open_server_h3_event_packet(datagram)?;
+        let events = self
+            .handshake
+            .open_server_h3_event_packet_with_ecn(datagram, ecn_mark)?;
         self.drain_session_tickets();
         if let Some(packet) = self
             .handshake
