@@ -232,7 +232,7 @@ Implementation rule:
 - Nextest config includes `h3-stateful` and `streaming-heavy` test groups in `.config/nextest.toml`.
 - Default parallelism remains `num-cpus`; CI uses `test-threads = 4`.
 - CI invokes `cargo nextest run --all-features --profile ci --locked`.
-- Existing selective-test practice is manual, with docs using explicit `cargo test --test <stem>` commands.
+- `just test-changed` now provides a conservative changed-file selector; manual exact filters remain useful for focused debugging.
 
 ### Design Guidance
 
