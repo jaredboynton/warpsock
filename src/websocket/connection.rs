@@ -1,10 +1,10 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::url::Url;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::timeout as tokio_timeout;
-use crate::url::Url;
 
 use crate::transport::connector::MaybeHttpsStream;
 use crate::websocket::error::{WebSocketError, WebSocketResult};

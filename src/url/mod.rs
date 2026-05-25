@@ -203,12 +203,7 @@ impl Url {
         }
 
         if let Some(query) = reference.strip_prefix('?') {
-            return Self::assemble_with_query(
-                base_scheme,
-                base_authority,
-                base_path,
-                Some(query),
-            );
+            return Self::assemble_with_query(base_scheme, base_authority, base_path, Some(query));
         }
 
         if reference.is_empty() {

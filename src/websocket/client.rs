@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::url::Url;
 use tokio::sync::RwLock;
 use tokio::time::timeout as tokio_timeout;
-use crate::url::Url;
 
 use crate::cookie::CookieJar;
 use crate::headers::Headers;

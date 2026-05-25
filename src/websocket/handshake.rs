@@ -1,10 +1,10 @@
+use crate::url::{Host, Url};
 use base64::Engine;
 use bytes::Bytes;
 use http::Uri;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout as tokio_timeout;
-use crate::url::{Host, Url};
 
 use crate::headers::Headers;
 use crate::transport::connector::MaybeHttpsStream;
