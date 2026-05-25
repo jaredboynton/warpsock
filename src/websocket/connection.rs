@@ -9,13 +9,53 @@ use url::Url;
 use crate::transport::connector::MaybeHttpsStream;
 use crate::websocket::error::{WebSocketError, WebSocketResult};
 use crate::websocket::frame::{
-    decode_frame, encode_frame_into, FrameConfig, FrameDecoder, MaskRng, OpCode,
+    decode_frame, encode_frame_into, Frame, FrameConfig, FrameDecoder, MaskRng, OpCode,
 };
-use crate::websocket::message::{CloseFrame, Message};
+use crate::websocket::message::{CloseFrame, Message, PreparedMessage};
 use crate::websocket::WebSocketConfig;
 
 const READ_CHUNK_SIZE: usize = 16 * 1024;
 const INITIAL_READ_CAPACITY: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketFrameOpcode {
+    Continuation,
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketFrame {
+    pub fin: bool,
+    pub opcode: WebSocketFrameOpcode,
+    pub payload: Bytes,
+}
+
+impl From<OpCode> for WebSocketFrameOpcode {
+    fn from(value: OpCode) -> Self {
+        match value {
+            OpCode::Continuation => Self::Continuation,
+            OpCode::Text => Self::Text,
+            OpCode::Binary => Self::Binary,
+            OpCode::Close => Self::Close,
+            OpCode::Ping => Self::Ping,
+            OpCode::Pong => Self::Pong,
+        }
+    }
+}
+
+impl From<Frame> for WebSocketFrame {
+    fn from(frame: Frame) -> Self {
+        Self {
+            fin: frame.fin,
+            opcode: WebSocketFrameOpcode::from(frame.opcode),
+            payload: frame.payload,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct WebSocket {
@@ -141,6 +181,31 @@ impl WebSocket {
         self.send(Message::Binary(bytes.into())).await
     }
 
+    pub async fn send_prepared(&mut self, message: &PreparedMessage) -> WebSocketResult<()> {
+        match message {
+            PreparedMessage::Text(bytes) => self.write_frame(OpCode::Text, bytes).await,
+            PreparedMessage::Binary(bytes) => self.write_frame(OpCode::Binary, bytes).await,
+        }
+    }
+
+    pub async fn send_prepared_batch<'a>(
+        &mut self,
+        messages: impl IntoIterator<Item = &'a PreparedMessage>,
+    ) -> WebSocketResult<()> {
+        self.write_prepared_batch(messages).await
+    }
+
+    pub async fn next_frame(&mut self) -> WebSocketResult<Option<WebSocketFrame>> {
+        Self::read_next_frame(
+            &self.url,
+            self.read_timeout,
+            &mut self.stream,
+            &mut self.read_buffer,
+            self.frame_config,
+        )
+        .await
+    }
+
     pub async fn next(&mut self) -> WebSocketResult<Option<Message>> {
         loop {
             let frame = match decode_frame(&self.url, &mut self.read_buffer, self.frame_config) {
@@ -202,29 +267,39 @@ impl WebSocket {
     }
 
     async fn write_frame(&mut self, opcode: OpCode, payload: &[u8]) -> WebSocketResult<()> {
-        if payload.len() > self.frame_config.max_frame_size {
-            return Err(WebSocketError::limit_exceeded(
-                &self.url,
-                format!("frame exceeds {} bytes", self.frame_config.max_frame_size),
-            ));
-        }
-        if matches!(opcode, OpCode::Text | OpCode::Binary)
-            && payload.len() > self.frame_config.max_message_size
-        {
-            return Err(WebSocketError::limit_exceeded(
-                &self.url,
-                format!(
-                    "message exceeds {} bytes",
-                    self.frame_config.max_message_size
-                ),
-            ));
-        }
+        validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
         encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
         Self::io_with_timeout(
             &self.url,
             self.write_timeout,
             "write",
             self.stream.write_all(&self.write_buffer),
+        )
+        .await
+    }
+
+    async fn write_prepared_batch<'a>(
+        &mut self,
+        messages: impl IntoIterator<Item = &'a PreparedMessage>,
+    ) -> WebSocketResult<()> {
+        let mut batch = BytesMut::new();
+        for message in messages {
+            let (opcode, payload) = match message {
+                PreparedMessage::Text(bytes) => (OpCode::Text, bytes.as_ref()),
+                PreparedMessage::Binary(bytes) => (OpCode::Binary, bytes.as_ref()),
+            };
+            validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
+            encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
+            batch.extend_from_slice(&self.write_buffer);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        Self::io_with_timeout(
+            &self.url,
+            self.write_timeout,
+            "write",
+            self.stream.write_all(&batch),
         )
         .await
     }
@@ -286,9 +361,52 @@ impl WebSocket {
 
         result.map_err(|error| WebSocketError::io(url, error))
     }
+
+    async fn read_next_frame<S>(
+        url: &Url,
+        read_timeout: Option<Duration>,
+        stream: &mut S,
+        read_buffer: &mut BytesMut,
+        frame_config: FrameConfig,
+    ) -> WebSocketResult<Option<WebSocketFrame>>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(frame) = decode_frame(url, read_buffer, frame_config)? {
+                return Ok(Some(WebSocketFrame {
+                    fin: frame.fin,
+                    opcode: frame.opcode.into(),
+                    payload: frame.payload,
+                }));
+            }
+            read_buffer.reserve(READ_CHUNK_SIZE);
+            let n = Self::io_with_timeout(
+                url,
+                read_timeout,
+                "read",
+                stream.read_buf(read_buffer),
+            )
+            .await?;
+            if n == 0 {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 impl WebSocketReader {
+    pub async fn next_frame(&mut self) -> WebSocketResult<Option<WebSocketFrame>> {
+        WebSocket::read_next_frame(
+            &self.url,
+            self.read_timeout,
+            &mut self.stream,
+            &mut self.read_buffer,
+            self.frame_config,
+        )
+        .await
+    }
+
     pub async fn next(&mut self) -> WebSocketResult<Option<Message>> {
         loop {
             let frame = decode_frame(&self.url, &mut self.read_buffer, self.frame_config)?;
@@ -323,6 +441,7 @@ impl WebSocketReader {
             }
         }
     }
+
 }
 
 impl WebSocketWriter {
@@ -351,6 +470,20 @@ impl WebSocketWriter {
         self.send(Message::Binary(bytes.into())).await
     }
 
+    pub async fn send_prepared(&mut self, message: &PreparedMessage) -> WebSocketResult<()> {
+        match message {
+            PreparedMessage::Text(bytes) => self.write_frame(OpCode::Text, bytes).await,
+            PreparedMessage::Binary(bytes) => self.write_frame(OpCode::Binary, bytes).await,
+        }
+    }
+
+    pub async fn send_prepared_batch<'a>(
+        &mut self,
+        messages: impl IntoIterator<Item = &'a PreparedMessage>,
+    ) -> WebSocketResult<()> {
+        self.write_prepared_batch(messages).await
+    }
+
     pub async fn send_ping(&mut self, bytes: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send(Message::Ping(bytes.into())).await
     }
@@ -367,29 +500,39 @@ impl WebSocketWriter {
     }
 
     async fn write_frame(&mut self, opcode: OpCode, payload: &[u8]) -> WebSocketResult<()> {
-        if payload.len() > self.frame_config.max_frame_size {
-            return Err(WebSocketError::limit_exceeded(
-                &self.url,
-                format!("frame exceeds {} bytes", self.frame_config.max_frame_size),
-            ));
-        }
-        if matches!(opcode, OpCode::Text | OpCode::Binary)
-            && payload.len() > self.frame_config.max_message_size
-        {
-            return Err(WebSocketError::limit_exceeded(
-                &self.url,
-                format!(
-                    "message exceeds {} bytes",
-                    self.frame_config.max_message_size
-                ),
-            ));
-        }
+        validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
         encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
         WebSocket::io_with_timeout(
             &self.url,
             self.write_timeout,
             "write",
             self.stream.write_all(&self.write_buffer),
+        )
+        .await
+    }
+
+    async fn write_prepared_batch<'a>(
+        &mut self,
+        messages: impl IntoIterator<Item = &'a PreparedMessage>,
+    ) -> WebSocketResult<()> {
+        let mut batch = BytesMut::new();
+        for message in messages {
+            let (opcode, payload) = match message {
+                PreparedMessage::Text(bytes) => (OpCode::Text, bytes.as_ref()),
+                PreparedMessage::Binary(bytes) => (OpCode::Binary, bytes.as_ref()),
+            };
+            validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
+            encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
+            batch.extend_from_slice(&self.write_buffer);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        WebSocket::io_with_timeout(
+            &self.url,
+            self.write_timeout,
+            "write",
+            self.stream.write_all(&batch),
         )
         .await
     }
@@ -415,4 +558,27 @@ impl WebSocketWriter {
         self.close_sent = true;
         Ok(())
     }
+}
+
+fn validate_outbound_payload(
+    url: &Url,
+    frame_config: FrameConfig,
+    opcode: OpCode,
+    payload: &[u8],
+) -> WebSocketResult<()> {
+    if payload.len() > frame_config.max_frame_size {
+        return Err(WebSocketError::limit_exceeded(
+            url,
+            format!("frame exceeds {} bytes", frame_config.max_frame_size),
+        ));
+    }
+    if matches!(opcode, OpCode::Text | OpCode::Binary)
+        && payload.len() > frame_config.max_message_size
+    {
+        return Err(WebSocketError::limit_exceeded(
+            url,
+            format!("message exceeds {} bytes", frame_config.max_message_size),
+        ));
+    }
+    Ok(())
 }
