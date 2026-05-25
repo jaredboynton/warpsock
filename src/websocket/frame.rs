@@ -209,6 +209,20 @@ pub(crate) fn encode_frame_into(
     out: &mut BytesMut,
 ) {
     out.clear();
+    encode_frame_append(opcode, payload, mask_rng, out);
+}
+
+/// Append a masked frame to the existing contents of `out` without clearing
+/// it first. Lets a batched-send path encode multiple frames into a single
+/// contiguous buffer and issue one `write_all`, saving the per-frame memcpy
+/// that a separate batch staging buffer would impose.
+#[inline]
+pub(crate) fn encode_frame_append(
+    opcode: OpCode,
+    payload: &[u8],
+    mask_rng: &mut MaskRng,
+    out: &mut BytesMut,
+) {
     out.reserve(14 + payload.len());
     out.extend_from_slice(&[0x80 | opcode as u8]);
 

@@ -9,7 +9,8 @@ use url::Url;
 use crate::transport::connector::MaybeHttpsStream;
 use crate::websocket::error::{WebSocketError, WebSocketResult};
 use crate::websocket::frame::{
-    decode_frame, encode_frame_into, Frame, FrameConfig, FrameDecoder, MaskRng, OpCode,
+    decode_frame, encode_frame_append, encode_frame_into, Frame, FrameConfig, FrameDecoder,
+    MaskRng, OpCode,
 };
 use crate::websocket::message::{CloseFrame, Message, PreparedMessage};
 use crate::websocket::WebSocketConfig;
@@ -282,24 +283,28 @@ impl WebSocket {
         &mut self,
         messages: impl IntoIterator<Item = &'a PreparedMessage>,
     ) -> WebSocketResult<()> {
-        let mut batch = BytesMut::new();
+        // Encode all frames into the per-connection write_buffer in one pass.
+        // The earlier implementation built a fresh BytesMut for the batch and
+        // copied each encoded frame into it; with encode_frame_append we
+        // write into the live buffer directly, saving an allocation per call
+        // and a full memcpy per batched frame.
+        self.write_buffer.clear();
         for message in messages {
             let (opcode, payload) = match message {
                 PreparedMessage::Text(bytes) => (OpCode::Text, bytes.as_ref()),
                 PreparedMessage::Binary(bytes) => (OpCode::Binary, bytes.as_ref()),
             };
             validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
-            encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
-            batch.extend_from_slice(&self.write_buffer);
+            encode_frame_append(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
         }
-        if batch.is_empty() {
+        if self.write_buffer.is_empty() {
             return Ok(());
         }
         Self::io_with_timeout(
             &self.url,
             self.write_timeout,
             "write",
-            self.stream.write_all(&batch),
+            self.stream.write_all(&self.write_buffer),
         )
         .await
     }
@@ -509,24 +514,27 @@ impl WebSocketWriter {
         &mut self,
         messages: impl IntoIterator<Item = &'a PreparedMessage>,
     ) -> WebSocketResult<()> {
-        let mut batch = BytesMut::new();
+        // See WebSocket::write_prepared_batch for the rationale: encode all
+        // frames into the per-writer write_buffer in one pass via
+        // encode_frame_append, saving the batch allocation and per-frame
+        // memcpy that the prior implementation paid.
+        self.write_buffer.clear();
         for message in messages {
             let (opcode, payload) = match message {
                 PreparedMessage::Text(bytes) => (OpCode::Text, bytes.as_ref()),
                 PreparedMessage::Binary(bytes) => (OpCode::Binary, bytes.as_ref()),
             };
             validate_outbound_payload(&self.url, self.frame_config, opcode, payload)?;
-            encode_frame_into(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
-            batch.extend_from_slice(&self.write_buffer);
+            encode_frame_append(opcode, payload, &mut self.mask_rng, &mut self.write_buffer);
         }
-        if batch.is_empty() {
+        if self.write_buffer.is_empty() {
             return Ok(());
         }
         WebSocket::io_with_timeout(
             &self.url,
             self.write_timeout,
             "write",
-            self.stream.write_all(&batch),
+            self.stream.write_all(&self.write_buffer),
         )
         .await
     }
