@@ -79,6 +79,7 @@ async fn wrong_accept_header_fails_the_handshake() {
     let url = server.ws_url("/bad-accept");
     let handle = server.start_once(WsResponse {
         accept: AcceptMode::Wrong,
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -106,6 +107,7 @@ async fn unexpected_extension_header_fails_the_handshake() {
             "Sec-WebSocket-Extensions".to_string(),
             "permessage-deflate".to_string(),
         )],
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -130,6 +132,7 @@ async fn unexpected_subprotocol_header_fails_when_none_was_offered() {
     let url = server.ws_url("/subprotocol");
     let handle = server.start_once(WsResponse {
         headers: vec![("Sec-WebSocket-Protocol".to_string(), "chat".to_string())],
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 

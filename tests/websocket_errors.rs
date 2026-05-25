@@ -13,6 +13,7 @@ async fn invalid_accept_returns_handshake_error_without_close_frame() {
     let url = server.ws_url("/invalid-accept");
     let handle = server.start_once(WsResponse {
         accept: AcceptMode::Wrong,
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -39,6 +40,7 @@ async fn extension_response_returns_unexpected_extension_without_close_frame() {
             "Sec-WebSocket-Extensions".to_string(),
             "permessage-deflate".to_string(),
         )],
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -65,6 +67,7 @@ async fn unoffered_subprotocol_returns_unexpected_subprotocol_without_close_fram
             "Sec-WebSocket-Protocol".to_string(),
             "superchat".to_string(),
         )],
+        expected_client_frames: 1,
         ..WsResponse::default()
     });
 
@@ -94,7 +97,10 @@ async fn invalid_outbound_close_codes_are_rejected_without_sending_frame() {
     ] {
         let server = MockWsServer::new().await.unwrap();
         let url = server.ws_url("/invalid-close-code");
-        let handle = server.start_once(WsResponse::default());
+        let handle = server.start_once(WsResponse {
+            expected_client_frames: 1,
+            ..WsResponse::default()
+        });
 
         let mut ws = Client::new()
             .unwrap()
@@ -112,6 +118,7 @@ async fn invalid_outbound_close_codes_are_rejected_without_sending_frame() {
             .expect_err("invalid close code must fail before sending");
 
         assert_error_mentions(&err, &["close code", "must not be sent"]);
+        drop(ws);
         assert!(
             handle.await.unwrap().client_frame.is_none(),
             "invalid outbound close code must not write a close frame"
@@ -123,7 +130,10 @@ async fn invalid_outbound_close_codes_are_rejected_without_sending_frame() {
 async fn established_read_timeout_returns_timeout_error() {
     let server = MockWsServer::new().await.unwrap();
     let url = server.ws_url("/read-timeout");
-    let handle = server.start_once(WsResponse::default());
+    let handle = server.start_once(WsResponse {
+        expected_client_frames: 1,
+        ..WsResponse::default()
+    });
 
     let mut ws = Client::new()
         .unwrap()
@@ -136,6 +146,7 @@ async fn established_read_timeout_returns_timeout_error() {
     let err = ws.next().await.expect_err("read timeout must fail");
     assert_error_mentions(&err, &["Timeout", "read"]);
 
+    drop(ws);
     let _ = handle.await.unwrap();
 }
 
