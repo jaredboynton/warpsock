@@ -1,6 +1,7 @@
 //! Native QUIC handshake state for HTTP/3.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -2990,6 +2991,19 @@ impl NativeQuicHandshake {
         self.client_path_validator.is_validated(data)
     }
 
+    pub fn is_client_path_address_validated(&self, remote_address: &SocketAddr) -> bool {
+        self.client_path_validator
+            .is_address_validated(remote_address)
+    }
+
+    pub fn client_path_migration_connection_id(
+        &self,
+        remote_address: &SocketAddr,
+    ) -> Option<&ConnectionId> {
+        self.client_path_validator
+            .migration_connection_id(remote_address)
+    }
+
     pub fn client_pmtu_current_size(&self) -> usize {
         self.client_pmtu_probe.current_size()
     }
@@ -3822,6 +3836,20 @@ impl NativeQuicHandshake {
         self.build_client_application_control_packet(frame)
     }
 
+    pub fn build_client_path_challenge_packet_for_address(
+        &mut self,
+        remote_address: SocketAddr,
+        connection_id_sequence: u64,
+        data: [u8; 8],
+    ) -> Result<ClientApplicationControlPacket> {
+        let frame = self.client_path_validator.path_challenge_for_address(
+            remote_address,
+            connection_id_sequence,
+            data,
+        )?;
+        self.build_client_application_control_packet(frame)
+    }
+
     pub fn build_client_pmtu_probe_packet(
         &mut self,
         now: Instant,
@@ -3997,6 +4025,15 @@ impl NativeQuicHandshake {
         packet: &[u8],
         ecn_mark: Option<QuicEcnMark>,
     ) -> Result<Vec<QuicFrame>> {
+        self.open_server_application_packet_with_path(packet, None, ecn_mark)
+    }
+
+    fn open_server_application_packet_with_path(
+        &mut self,
+        packet: &[u8],
+        remote_address: Option<SocketAddr>,
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<QuicFrame>> {
         // RFC9000 § 10.2: stop decrypting peer packets once we are draining;
         // closing-phase decryption is preserved so we can still apply the
         // § 10.2 MAY-optimisation (closing -> draining on peer CONNECTION_CLOSE).
@@ -4083,8 +4120,24 @@ impl NativeQuicHandshake {
                 } => self
                     .client_application_flow_control
                     .apply_max_streams(*bidirectional, *max_streams),
+                QuicFrame::NewConnectionId {
+                    sequence_number,
+                    retire_prior_to,
+                    connection_id,
+                    stateless_reset_token,
+                } => self.client_path_validator.register_connection_id(
+                    *sequence_number,
+                    *retire_prior_to,
+                    ConnectionId::from_bytes(connection_id.clone())?,
+                    *stateless_reset_token,
+                )?,
                 QuicFrame::PathResponse(data) => {
-                    self.client_path_validator.on_path_response(*data);
+                    if let Some(remote_address) = remote_address {
+                        self.client_path_validator
+                            .on_path_response_from(remote_address, *data);
+                    } else {
+                        self.client_path_validator.on_path_response(*data);
+                    }
                 }
                 _ => {}
             }
@@ -4121,9 +4174,26 @@ impl NativeQuicHandshake {
         self.open_server_h3_event_packet_with_ecn(packet, None)
     }
 
+    pub fn open_server_h3_event_packet_from(
+        &mut self,
+        packet: &[u8],
+        remote_address: SocketAddr,
+    ) -> Result<Vec<ServerH3Event>> {
+        self.open_server_h3_event_packet_with_path_ecn(packet, Some(remote_address), None)
+    }
+
     pub fn open_server_h3_event_packet_with_ecn(
         &mut self,
         packet: &[u8],
+        ecn_mark: Option<QuicEcnMark>,
+    ) -> Result<Vec<ServerH3Event>> {
+        self.open_server_h3_event_packet_with_path_ecn(packet, None, ecn_mark)
+    }
+
+    fn open_server_h3_event_packet_with_path_ecn(
+        &mut self,
+        packet: &[u8],
+        remote_address: Option<SocketAddr>,
         ecn_mark: Option<QuicEcnMark>,
     ) -> Result<Vec<ServerH3Event>> {
         // RFC9000 § 10.2: once we are draining we MUST drop inbound packets.
@@ -4135,7 +4205,7 @@ impl NativeQuicHandshake {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        for frame in self.open_server_application_packet_with_ecn(packet, ecn_mark)? {
+        for frame in self.open_server_application_packet_with_path(packet, remote_address, ecn_mark)? {
             match frame {
                 QuicFrame::Stream {
                     stream_id,
