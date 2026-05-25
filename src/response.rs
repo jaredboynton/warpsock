@@ -125,6 +125,15 @@ impl Body {
         }
     }
 
+    /// Snapshot H3 streaming response buffer pressure when this body is backed
+    /// by the native HTTP/3 transport.
+    pub fn h3_capacity(&self) -> Option<crate::transport::h3::H3BodyCapacity> {
+        match &self.inner {
+            BodyInner::H3(body) => Some(body.capacity()),
+            _ => None,
+        }
+    }
+
     /// Convenience accessor for buffered bodies. Returns `0` for streaming
     /// bodies; callers wanting to detect streaming should use
     /// [`Body::buffered_len`] or [`Body::is_streaming`].

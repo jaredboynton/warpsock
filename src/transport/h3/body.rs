@@ -29,12 +29,23 @@ pub(crate) enum H3BodyPush {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct H3BodyCapacity {
+    pub buffer_capacity: usize,
+    pub buffered_chunks: usize,
+    pub available_slots: usize,
+    pub buffered_bytes: usize,
+    pub closed: bool,
+    pub ended: bool,
+}
+
 /// Default bounded in-flight DATA item capacity per H3 stream body.
 pub(crate) const DEFAULT_H3_BODY_SLOT_CAPACITY: usize = 64;
 
 struct H3BodyState {
     slots: VecDeque<std::result::Result<Bytes, Error>>,
     cap: usize,
+    buffered_bytes: usize,
     terminal_error: Option<Error>,
     ended: bool,
     closed: bool,
@@ -54,6 +65,7 @@ impl H3BodyState {
         Self {
             slots: VecDeque::with_capacity(capacity),
             cap: capacity,
+            buffered_bytes: 0,
             terminal_error: None,
             ended: false,
             closed: false,
@@ -102,6 +114,9 @@ impl H3BodyShared {
         }
         if state.slots.len() >= state.cap {
             return H3BodyPush::Full;
+        }
+        if let Ok(bytes) = &item {
+            state.buffered_bytes = state.buffered_bytes.saturating_add(bytes.len());
         }
         state.transitions.push_back("driver_slot_fill");
         state.slots.push_back(item);
@@ -156,6 +171,18 @@ impl H3BodyShared {
         self.released_recv_bytes.swap(0, Ordering::Relaxed)
     }
 
+    pub(crate) fn capacity(&self) -> H3BodyCapacity {
+        let state = self.state.lock().expect("h3 body state poisoned");
+        H3BodyCapacity {
+            buffer_capacity: state.cap,
+            buffered_chunks: state.slots.len(),
+            available_slots: state.cap.saturating_sub(state.slots.len()),
+            buffered_bytes: state.buffered_bytes,
+            closed: state.closed,
+            ended: state.ended,
+        }
+    }
+
     fn close(&self) {
         let mut state = self.state.lock().expect("h3 body state poisoned");
         if !state.closed {
@@ -193,6 +220,10 @@ impl H3Body {
 
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    pub(crate) fn capacity(&self) -> H3BodyCapacity {
+        self.shared.capacity()
     }
 
     fn reset_read_idle(&mut self) {
@@ -242,6 +273,9 @@ impl HttpBody for H3Body {
             let mut state = self.shared.state.lock().expect("h3 body state poisoned");
             if let Some(item) = state.slots.pop_front() {
                 state.transitions.push_back("consumer_slot_take");
+                if let Ok(bytes) = &item {
+                    state.buffered_bytes = state.buffered_bytes.saturating_sub(bytes.len());
+                }
                 StatePoll::Item(item)
             } else if let Some(error) = state.terminal_error.take() {
                 state.closed = true;

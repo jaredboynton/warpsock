@@ -31,6 +31,16 @@ pub enum H3TunnelEvent {
 pub(crate) const MAX_TUNNEL_OUTBOUND_BYTE_BUDGET: usize = u32::MAX as usize;
 pub(crate) const MAX_TUNNEL_INBOUND_BYTE_BUDGET: usize = u32::MAX as usize;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct H3TunnelCapacity {
+    pub outbound_budget: usize,
+    pub outbound_available_bytes: usize,
+    pub outbound_pending_bytes: usize,
+    pub inbound_budget: usize,
+    pub inbound_available_bytes: usize,
+    pub inbound_pending_bytes: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct H3TunnelCredit {
     released_recv_bytes: AtomicUsize,
@@ -103,6 +113,19 @@ impl H3TunnelCredit {
 
     pub(crate) fn has_inbound_capacity(&self) -> bool {
         self.recv_semaphore.available_permits() > 0
+    }
+
+    pub(crate) fn capacity(&self) -> H3TunnelCapacity {
+        let outbound_available_bytes = self.send_semaphore.available_permits().min(self.send_budget);
+        let inbound_available_bytes = self.recv_semaphore.available_permits().min(self.recv_budget);
+        H3TunnelCapacity {
+            outbound_budget: self.send_budget,
+            outbound_available_bytes,
+            outbound_pending_bytes: self.send_budget.saturating_sub(outbound_available_bytes),
+            inbound_budget: self.recv_budget,
+            inbound_available_bytes,
+            inbound_pending_bytes: self.recv_budget.saturating_sub(inbound_available_bytes),
+        }
     }
 
     #[cfg(test)]
@@ -184,6 +207,13 @@ impl H3Tunnel {
 
     pub async fn close_send(&self) -> Result<()> {
         self.send_bytes(Bytes::new(), true).await
+    }
+
+    pub fn capacity(&self) -> H3TunnelCapacity {
+        self.credit
+            .as_ref()
+            .map(|credit| credit.capacity())
+            .unwrap_or_default()
     }
 
     pub async fn recv_event(&mut self) -> Option<Result<H3TunnelEvent>> {
