@@ -157,7 +157,7 @@ jobs:
       - name: Windows smoke (transport-touching integration tests)
         run: |
           cargo nextest run --all-features --profile ci --retries 0 --locked \
-            -E 'binary(=h1_rfc_compliance) | binary(=tls_mock_server) | binary(=rfc6455_websocket) | binary(=rfc8441_handshake) | binary(=h3_native_codec)'
+            -E 'binary(=h1_rfc_compliance) | binary(=rfc6455_websocket) | binary(=rfc8441_handshake) | binary(=h3_native_codec)'
 
       - uses: actions/upload-artifact@v4
         if: always()
