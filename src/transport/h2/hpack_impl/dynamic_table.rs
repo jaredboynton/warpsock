@@ -3,6 +3,8 @@
 //! The dynamic table is a FIFO buffer that stores recently used header fields
 //! to improve compression efficiency.
 
+use super::static_table::bytes_eq_ignore_ascii_case;
+
 /// Dynamic table entry.
 #[derive(Clone)]
 pub struct DynamicEntry {
@@ -109,7 +111,7 @@ impl DynamicTable {
     pub fn find(&self, name: &[u8], value: &[u8]) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| e.name() == name && e.value() == value)
+            .position(|e| bytes_eq_ignore_ascii_case(e.name(), name) && e.value() == value)
             .map(|idx| idx + 1)
     }
 
@@ -119,7 +121,7 @@ impl DynamicTable {
     pub fn find_by_name(&self, name: &[u8]) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| e.name() == name)
+            .position(|e| bytes_eq_ignore_ascii_case(e.name(), name))
             .map(|idx| idx + 1)
     }
 

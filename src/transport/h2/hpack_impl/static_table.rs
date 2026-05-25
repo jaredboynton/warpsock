@@ -145,13 +145,18 @@ pub fn get_static_entry(index: usize) -> Option<StaticEntry> {
     }
 }
 
+/// Case-insensitive ASCII byte comparison for HPACK static table lookup.
+pub(crate) fn bytes_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
 /// Find a static table entry by name and value.
 ///
 /// Returns the index (1-61) if found, None otherwise.
 pub fn find_static_entry(name: &[u8], value: &[u8]) -> Option<usize> {
     STATIC_TABLE
         .iter()
-        .position(|(n, v)| n == &name && v == &value)
+        .position(|(n, v)| bytes_eq_ignore_ascii_case(n, name) && *v == value)
         .map(|idx| idx + 1)
 }
 
@@ -161,7 +166,7 @@ pub fn find_static_entry(name: &[u8], value: &[u8]) -> Option<usize> {
 pub fn find_static_entry_by_name(name: &[u8]) -> Option<usize> {
     STATIC_TABLE
         .iter()
-        .position(|(n, _)| n == &name)
+        .position(|(n, _)| bytes_eq_ignore_ascii_case(n, name))
         .map(|idx| idx + 1)
 }
 

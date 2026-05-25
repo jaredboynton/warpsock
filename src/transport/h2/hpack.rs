@@ -6,7 +6,12 @@
 //! - Complete Huffman encoding support
 
 use crate::transport::h2::hpack_impl::{Decoder, Encoder};
+use crate::headers::Headers;
 use bytes::Bytes;
+
+fn bytes_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
 
 /// Pseudo-header ordering for HTTP/2 fingerprinting.
 ///
@@ -97,7 +102,7 @@ impl HpackEncoder {
         scheme: &str,
         authority: &str,
         path: &str,
-        headers: &[(String, String)],
+        headers: &Headers,
     ) -> Bytes {
         // Build pseudo-headers in configured order
         let pseudo_headers: [(&[u8], &[u8]); 4] = [
@@ -113,42 +118,39 @@ impl HpackEncoder {
         // Storage for processed valid headers (lowercased name, value ref)
         // We need this intermediate storage to ensure the Strings live long enough
         // and to avoid borrow checker issues (references into a growing Vec).
-        let mut valid_headers: Vec<(String, &str)> = Vec::with_capacity(headers.len());
+        let mut valid_headers: Vec<(Vec<u8>, &[u8])> = Vec::with_capacity(headers.len());
 
-        // Filter and process headers first
-        for (name, value) in headers {
-            // Skip any pseudo-headers that were incorrectly passed in
-            if name.starts_with(':') {
+        for (name, value) in headers.iter_bytes() {
+            if name.first() == Some(&b':') {
                 continue;
             }
 
-            // RFC 9113 Section 8.1.2: Validate header name
             if name.is_empty() {
                 continue;
             }
             if name
-                .as_bytes()
                 .iter()
                 .any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F))
             {
                 continue;
             }
 
-            // HTTP/2 requires header names to be lowercase
-            let name_lower = name.to_lowercase();
+            let name_lower = if name.iter().all(|b| b.is_ascii_lowercase()) {
+                name.to_vec()
+            } else {
+                name.iter().map(|b| b.to_ascii_lowercase()).collect()
+            };
 
-            // Skip connection-specific headers forbidden in HTTP/2
-            if name_lower == "connection"
-                || name_lower == "keep-alive"
-                || name_lower == "proxy-connection"
-                || name_lower == "transfer-encoding"
-                || name_lower == "upgrade"
+            if name_lower == b"connection"
+                || name_lower == b"keep-alive"
+                || name_lower == b"proxy-connection"
+                || name_lower == b"transfer-encoding"
+                || name_lower == b"upgrade"
             {
                 continue;
             }
 
-            // RFC 9113 Section 8.1.2.2: TE header allowed ONLY if value is "trailers"
-            if name_lower == "te" && value.to_lowercase() != "trailers" {
+            if name_lower == b"te" && !bytes_eq_ignore_ascii_case(value, b"trailers") {
                 continue;
             }
 
@@ -163,7 +165,7 @@ impl HpackEncoder {
 
         // Add regular headers from the validated list
         for (n, v) in &valid_headers {
-            all_headers.push((n.as_bytes(), v.as_bytes()));
+            all_headers.push((n.as_slice(), *v));
         }
 
         // Encode all headers
@@ -180,7 +182,7 @@ impl HpackEncoder {
         authority: &str,
         scheme: &str,
         path: &str,
-        headers: &[(String, String)],
+        headers: &Headers,
     ) -> Result<Bytes, String> {
         if authority.is_empty() {
             return Err(":authority must not be empty".to_string());
@@ -200,41 +202,53 @@ impl HpackEncoder {
             (b":authority", authority.as_bytes()),
         ];
 
-        let mut valid_headers: Vec<(String, &str)> = Vec::with_capacity(headers.len());
+        let mut valid_headers: Vec<(Vec<u8>, &[u8])> = Vec::with_capacity(headers.len());
 
-        for (name, value) in headers {
-            if name.starts_with(':') {
-                return Err(format!("RFC 8441 user pseudo-header rejected: {name}"));
+        for (name, value) in headers.iter_bytes() {
+            if name.first() == Some(&b':') {
+                return Err(format!(
+                    "RFC 8441 user pseudo-header rejected: {}",
+                    String::from_utf8_lossy(name)
+                ));
             }
 
             if name.is_empty() {
                 return Err("RFC 8441 header name must not be empty".to_string());
             }
             if name
-                .as_bytes()
                 .iter()
                 .any(|&b| b < 0x21 || (b > 0x7E && b != 0x7F))
             {
-                return Err(format!("RFC 8441 invalid header name rejected: {name}"));
+                return Err(format!(
+                    "RFC 8441 invalid header name rejected: {}",
+                    String::from_utf8_lossy(name)
+                ));
             }
 
-            let name_lower = name.to_lowercase();
+            let name_lower = if name.iter().all(|b| b.is_ascii_lowercase()) {
+                name.to_vec()
+            } else {
+                name.iter().map(|b| b.to_ascii_lowercase()).collect()
+            };
             if matches!(
-                name_lower.as_str(),
-                "connection"
-                    | "upgrade"
-                    | "host"
-                    | "sec-websocket-key"
-                    | "sec-websocket-accept"
-                    | "sec-websocket-extensions"
-                    | "keep-alive"
-                    | "proxy-connection"
-                    | "transfer-encoding"
+                name_lower.as_slice(),
+                b"connection"
+                    | b"upgrade"
+                    | b"host"
+                    | b"sec-websocket-key"
+                    | b"sec-websocket-accept"
+                    | b"sec-websocket-extensions"
+                    | b"keep-alive"
+                    | b"proxy-connection"
+                    | b"transfer-encoding"
             ) {
-                return Err(format!("RFC 8441 forbidden header rejected: {name_lower}"));
+                return Err(format!(
+                    "RFC 8441 forbidden header rejected: {}",
+                    String::from_utf8_lossy(&name_lower)
+                ));
             }
 
-            if name_lower == "te" && value.to_lowercase() != "trailers" {
+            if name_lower == b"te" && !bytes_eq_ignore_ascii_case(value, b"trailers") {
                 return Err("RFC 8441 forbids TE values other than trailers".to_string());
             }
 
@@ -245,7 +259,7 @@ impl HpackEncoder {
             Vec::with_capacity(pseudo_headers.len() + valid_headers.len());
         all_headers.extend_from_slice(&pseudo_headers);
         for (name, value) in &valid_headers {
-            all_headers.push((name.as_bytes(), value.as_bytes()));
+            all_headers.push((name.as_slice(), *value));
         }
 
         let encoded = self.encoder.encode(&all_headers);
@@ -340,7 +354,7 @@ mod tests {
             "https",
             "example.com",
             "/",
-            &[("user-agent".to_string(), "test".to_string())],
+            &Headers::from(vec![("user-agent".to_string(), "test".to_string())]),
         );
 
         // Block should be non-empty
@@ -369,7 +383,7 @@ mod tests {
     #[test]
     fn test_encoder_standard_order() {
         let mut encoder = HpackEncoder::new(PseudoHeaderOrder::Standard);
-        let block = encoder.encode_request("GET", "https", "example.com", "/", &[]);
+        let block = encoder.encode_request("GET", "https", "example.com", "/", &Headers::new());
 
         let mut decoder = HpackDecoder::new();
         let headers = decoder.decode(&block).unwrap();
@@ -389,11 +403,11 @@ mod tests {
             "https",
             "example.com",
             "/",
-            &[
+            &Headers::from(vec![
                 ("connection".to_string(), "keep-alive".to_string()),
                 ("keep-alive".to_string(), "timeout=5".to_string()),
                 ("user-agent".to_string(), "test".to_string()),
-            ],
+            ]),
         );
 
         let mut decoder = HpackDecoder::new();
