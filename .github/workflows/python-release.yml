@@ -127,6 +127,7 @@ jobs:
           docker-options: |
             -e BORING_BSSL_PATH=${{ github.workspace }}/lib/boringssl/${{ matrix.target }}/build
             -e BORING_BSSL_INCLUDE_PATH=${{ github.workspace }}/lib/boringssl/include
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
