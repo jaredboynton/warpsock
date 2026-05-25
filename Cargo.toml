@@ -115,3 +115,16 @@ split-debuginfo = "unpacked"
 
 [profile.test.package."*"]
 debug = 0
+
+[profile.fast-test]
+inherits = "dev"
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+lto = false
+codegen-units = 256
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.fast-test.package."*"]
+debug = 0
