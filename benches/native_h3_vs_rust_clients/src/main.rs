@@ -3519,7 +3519,9 @@ async fn read_tokio_quiche_rfc9220_tunnel_mixed_slow(
             if echoed == expected_tunnel_bytes {
                 return Ok(echoed as u64);
             }
-            anyhow::bail!("tokio_quiche RFC 9220 mixed tunnel stream closed");
+            anyhow::bail!(
+                "tokio_quiche RFC 9220 mixed tunnel stream closed after {echoed} of {expected_tunnel_bytes} bytes"
+            );
         };
         match frame {
             tokio_quiche::http3::driver::InboundFrame::Body(chunk, fin) => {
