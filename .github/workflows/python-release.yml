@@ -114,6 +114,10 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: '2014'
           args: --release --locked --out dist -m bindings/python/Cargo.toml
+          # manylinux2014 image lacks clang; bindgen (used by boring-sys) needs libclang.
+          # The action runs this script inside the container before the maturin build.
+          before-script-linux: |
+            yum install -y clang
           # The action mounts $GITHUB_WORKSPACE at the same absolute path inside the
           # container (NOT /io -- that's the raw `docker run` convention). BORING_*
           # env vars are NOT in the action's ALLOWED_ENV_PREFIXES, so they must be

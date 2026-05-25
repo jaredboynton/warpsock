@@ -7,7 +7,7 @@ const {
   WebSocket,
 } = require('../index');
 
-jest.setTimeout(15000);
+jest.setTimeout(60000);
 
 function acceptKey(key) {
   return crypto

@@ -12,7 +12,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   test-linux:
@@ -29,9 +28,6 @@ jobs:
 
       - name: Check release lockfiles
         run: ./scripts/check-release-lockfiles.sh
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -91,9 +87,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-test-macos
@@ -145,9 +138,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-build-${{ matrix.target }}
@@ -192,9 +182,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
         with:
