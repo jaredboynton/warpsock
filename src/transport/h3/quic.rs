@@ -236,6 +236,17 @@ pub enum QuicEcnMark {
     Ce,
 }
 
+impl QuicEcnMark {
+    pub fn from_ip_tos_bits(bits: u8) -> Option<Self> {
+        match bits & 0b11 {
+            0b10 => Some(Self::Ect0),
+            0b01 => Some(Self::Ect1),
+            0b11 => Some(Self::Ce),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuicFrame {
     Padding,
