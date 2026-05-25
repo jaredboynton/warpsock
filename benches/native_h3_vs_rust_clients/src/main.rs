@@ -2787,6 +2787,8 @@ fn measure_quiche_direct_rfc9220_tunnel_mixed_once(
     let expected_tunnel_bytes =
         LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE * LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
     let tunnel_payload = Bytes::from(vec![b'M'; expected_tunnel_bytes]);
+    let mut tunnel_payload_offset = 0usize;
+    let mut tunnel_fin_sent = false;
     let start = Instant::now();
     let deadline = start + adapter_timeout();
     let tunnel_headers = quiche_rfc9220_tunnel_headers(&tunnel_url)?;
@@ -2831,101 +2833,44 @@ fn measure_quiche_direct_rfc9220_tunnel_mixed_once(
             if !reqs_sent {
                 let opened_tunnel_stream_id =
                     http3.send_request(&mut conn, &tunnel_headers, false)?;
-                let mut payload_offset = 0usize;
-                while payload_offset < tunnel_payload.len() && Instant::now() < deadline {
-                    let chunk_end = payload_offset
-                        .saturating_add(LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE)
-                        .min(tunnel_payload.len());
-                    match http3.send_body(
-                        &mut conn,
-                        opened_tunnel_stream_id,
-                        &tunnel_payload.as_ref()[payload_offset..chunk_end],
-                        false,
-                    ) {
-                        Ok(0) | Err(quiche::h3::Error::Done) => {
-                            flush_quiche_packets(&socket, &mut conn, &mut out)?;
-                            loop {
-                                match socket.recv_from(&mut recv_buf) {
-                                    Ok((len, from)) => {
-                                        let recv_info = quiche::RecvInfo {
-                                            to: local_addr,
-                                            from,
-                                        };
-                                        if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info)
-                                        {
-                                            if err != quiche::Error::Done {
-                                                return Err(anyhow::anyhow!(
-                                                    "quiche RFC 9220 mixed recv while sending tunnel body failed: {err:?}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(err) => return Err(err.into()),
-                                }
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Ok(written) => {
-                            payload_offset = payload_offset.saturating_add(written);
-                            flush_quiche_packets(&socket, &mut conn, &mut out)?;
-                        }
-                        Err(err) => {
-                            return Err(anyhow::anyhow!(
-                                "quiche RFC 9220 mixed tunnel body send failed: {err:?}"
-                            ));
-                        }
-                    }
-                }
-                if payload_offset != tunnel_payload.len() {
-                    anyhow::bail!(
-                        "quiche RFC 9220 mixed partial tunnel write: expected {}, wrote {}",
-                        tunnel_payload.len(),
-                        payload_offset
-                    );
-                }
-                let mut fin_sent = false;
-                while !fin_sent && Instant::now() < deadline {
-                    match http3.send_body(&mut conn, opened_tunnel_stream_id, &[], true) {
-                        Ok(_) => fin_sent = true,
-                        Err(quiche::h3::Error::Done) => {
-                            flush_quiche_packets(&socket, &mut conn, &mut out)?;
-                            loop {
-                                match socket.recv_from(&mut recv_buf) {
-                                    Ok((len, from)) => {
-                                        let recv_info = quiche::RecvInfo {
-                                            to: local_addr,
-                                            from,
-                                        };
-                                        if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info)
-                                        {
-                                            if err != quiche::Error::Done {
-                                                return Err(anyhow::anyhow!(
-                                                    "quiche RFC 9220 mixed recv while sending tunnel FIN failed: {err:?}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(err) => return Err(err.into()),
-                                }
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(err) => {
-                            return Err(anyhow::anyhow!(
-                                "quiche RFC 9220 mixed tunnel FIN send failed: {err:?}"
-                            ));
-                        }
-                    }
-                }
-                if !fin_sent {
-                    anyhow::bail!("quiche RFC 9220 mixed tunnel FIN send timed out");
-                }
                 let opened_stream_id = http3.send_request(&mut conn, &stream_headers, true)?;
                 tunnel_stream_id = Some(opened_tunnel_stream_id);
                 stream_stream_id = Some(opened_stream_id);
                 reqs_sent = true;
+            }
+
+            if let Some(opened_tunnel_stream_id) = tunnel_stream_id {
+                if !tunnel_fin_sent {
+                    let sending_data = tunnel_payload_offset < tunnel_payload.len();
+                    let chunk_end = if sending_data {
+                        tunnel_payload_offset
+                            .saturating_add(LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE)
+                            .min(tunnel_payload.len())
+                    } else {
+                        tunnel_payload_offset
+                    };
+                    let body = if sending_data {
+                        &tunnel_payload.as_ref()[tunnel_payload_offset..chunk_end]
+                    } else {
+                        &[]
+                    };
+                    match http3.send_body(&mut conn, opened_tunnel_stream_id, body, !sending_data) {
+                        Ok(written) => {
+                            if sending_data {
+                                tunnel_payload_offset =
+                                    tunnel_payload_offset.saturating_add(written);
+                            } else {
+                                tunnel_fin_sent = true;
+                            }
+                        }
+                        Err(quiche::h3::Error::Done) => {}
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(
+                                "quiche RFC 9220 mixed tunnel send failed: {err:?}"
+                            ));
+                        }
+                    }
+                }
             }
 
             loop {
@@ -2968,6 +2913,7 @@ fn measure_quiche_direct_rfc9220_tunnel_mixed_once(
                                 match http3.recv_body(&mut conn, event_stream_id, &mut recv_buf) {
                                     Ok(read) => {
                                         tunnel_echoed = tunnel_echoed.saturating_add(read);
+                                        flush_quiche_packets(&socket, &mut conn, &mut out)?;
                                     }
                                     Err(quiche::h3::Error::Done) => break,
                                     Err(err) => {
