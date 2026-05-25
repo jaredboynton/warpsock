@@ -5673,6 +5673,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tokio_quiche_local_fixture_measures_repeated_rfc9220_tunnel_slow_consumer_mixed_workload()
+    {
+        let measurements =
+            super::measure_local_native_fixture(0, 2, Some("tokio_quiche_rfc9220_tunnel_mixed"))
+                .await
+                .unwrap();
+
+        assert!(measurements.fixture_events.is_empty());
+        assert_eq!(measurements.rows.len(), 1);
+        let row = &measurements.rows[0];
+        assert_eq!(row.competitor_id, "tokio_quiche_rfc9220_tunnel_mixed");
+        assert_eq!(row.status, "measured_pass");
+        assert_eq!(row.source, "tokio_quiche_rfc9220_tunnel_mixed_adapter");
+        assert_eq!(row.sample_count, Some(2));
+        assert!(row.bytes_per_sec.is_some_and(|throughput| throughput > 0.0));
+    }
+
+    #[tokio::test]
     async fn quinn_transport_fixture_measures_bidirectional_echo() {
         let fixture = super::LocalQuinnTransportFixture::start().await.unwrap();
 
