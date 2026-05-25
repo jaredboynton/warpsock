@@ -232,6 +232,48 @@ impl QuicConnectionIdInventory {
         Some(entry)
     }
 
+    /// Register a locally issued connection ID at an explicit sequence number.
+    pub fn register_local_issued(
+        &mut self,
+        sequence_number: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [u8; 16],
+    ) -> Result<()> {
+        if connection_id.as_bytes().is_empty() {
+            return Err(Error::quic(
+                "RFC9000 19.15: NEW_CONNECTION_ID cannot carry an empty connection id",
+            ));
+        }
+        if let Some(existing) = self.locals.get(&sequence_number) {
+            if existing.connection_id != connection_id
+                || existing.stateless_reset_token != stateless_reset_token
+            {
+                return Err(Error::quic(
+                    "RFC9000 19.15: NEW_CONNECTION_ID reuses sequence number with different CID",
+                ));
+            }
+            return Ok(());
+        }
+        if self.unretired_local_count() >= self.active_connection_id_limit as usize {
+            return Err(Error::quic(
+                "RFC9000 18.2: exceeded active_connection_id_limit",
+            ));
+        }
+        self.locals.insert(
+            sequence_number,
+            LocalConnectionIdEntry {
+                sequence_number,
+                connection_id,
+                stateless_reset_token,
+                retired: false,
+            },
+        );
+        if self.next_local_sequence <= sequence_number {
+            self.next_local_sequence = sequence_number.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// Process an inbound NEW_CONNECTION_ID frame (RFC 9000 § 19.15). Validates
     /// that the sequence number is novel, that `retire_prior_to` does not
     /// exceed `sequence_number`, and enforces the `active_connection_id_limit`.
@@ -361,6 +403,10 @@ impl QuicConnectionIdInventory {
         self.peers.values().filter(|entry| !entry.retired).count()
     }
 
+    pub fn unretired_locals(&self) -> impl Iterator<Item = &LocalConnectionIdEntry> {
+        self.locals.values().filter(|entry| !entry.retired)
+    }
+
     fn retire_peer_below(&mut self, threshold: u64) {
         for (sequence, entry) in self.peers.iter_mut() {
             if *sequence < threshold && !entry.retired {
@@ -369,6 +415,28 @@ impl QuicConnectionIdInventory {
             }
         }
     }
+}
+
+/// Match an inbound short-header packet's destination CID against locally
+/// issued connection IDs. Returns the matched CID and its byte length using
+/// longest-prefix selection when multiple local CIDs match.
+pub fn match_local_connection_id<'a>(
+    packet: &[u8],
+    locals: impl Iterator<Item = &'a LocalConnectionIdEntry>,
+) -> Option<(ConnectionId, usize)> {
+    if packet.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return None;
+    }
+    let mut best: Option<(ConnectionId, usize)> = None;
+    for entry in locals {
+        let cid = entry.connection_id.as_bytes();
+        if packet.len() >= 1 + cid.len() && packet[1..1 + cid.len()] == cid[..] {
+            if best.as_ref().map_or(true, |(_, len)| cid.len() > *len) {
+                best = Some((entry.connection_id.clone(), cid.len()));
+            }
+        }
+    }
+    best
 }
 
 /// RFC 9000 § 9 lifecycle of a single path for a QUIC connection. A
@@ -567,6 +635,124 @@ impl QuicPathSet {
 
     pub fn paths(&self) -> &[QuicPath] {
         &self.paths
+    }
+
+    /// Mark a known path as validated without requiring a PATH_RESPONSE token
+    /// match. Used when handshake-level validation state is authoritative.
+    pub fn mark_validated(&mut self, peer_addr: SocketAddr) -> bool {
+        let Some(path) = self
+            .paths
+            .iter_mut()
+            .find(|path| path.peer_addr == peer_addr)
+        else {
+            return false;
+        };
+        path.state = QuicPathState::Validated;
+        path.anti_amplification.mark_validated();
+        true
+    }
+
+    pub fn is_known_address(&self, peer_addr: SocketAddr) -> bool {
+        self.path(peer_addr).is_some()
+    }
+
+    pub fn is_probing_address(&self, peer_addr: SocketAddr) -> bool {
+        self.path(peer_addr).is_some_and(|path| {
+            matches!(
+                path.state,
+                QuicPathState::Probing | QuicPathState::Validating
+            )
+        })
+    }
+}
+
+/// Server-side path migration runtime: tracks primary vs probing peer
+/// addresses and anti-amplification budgets during active migration.
+#[derive(Debug)]
+pub struct QuicServerPathRuntime {
+    primary_peer: SocketAddr,
+    path_set: QuicPathSet,
+    probing_peer: Option<SocketAddr>,
+}
+
+impl QuicServerPathRuntime {
+    pub fn new(primary_peer: SocketAddr) -> Self {
+        let mut path_set = QuicPathSet::new();
+        path_set.install_primary(primary_peer);
+        Self {
+            primary_peer,
+            path_set,
+            probing_peer: None,
+        }
+    }
+
+    pub fn install_primary(&mut self, peer: SocketAddr) {
+        self.path_set.install_primary(peer);
+        self.primary_peer = peer;
+        self.probing_peer = None;
+    }
+
+    pub fn process_inbound(&mut self, remote: SocketAddr, len: usize, now: Instant) {
+        self.path_set.observe_packet_from(remote, len, now);
+    }
+
+    pub fn primary_peer(&self) -> SocketAddr {
+        self.primary_peer
+    }
+
+    pub fn probing_peer(&self) -> Option<SocketAddr> {
+        self.probing_peer
+    }
+
+    pub fn set_probing_peer(&mut self, addr: SocketAddr) {
+        self.probing_peer = Some(addr);
+    }
+
+    pub fn clear_probing_peer(&mut self) {
+        self.probing_peer = None;
+    }
+
+    pub fn may_send_to(&self, remote: SocketAddr, bytes: usize) -> bool {
+        self.path_set.may_send_to(remote, bytes)
+    }
+
+    pub fn record_sent_to(&mut self, remote: SocketAddr, len: usize) {
+        self.path_set.record_sent_to(remote, len);
+    }
+
+    pub fn issue_challenge(&mut self, remote: SocketAddr, token: [u8; 8]) -> bool {
+        self.set_probing_peer(remote);
+        self.path_set.issue_challenge(remote, token)
+    }
+
+    pub fn on_path_response(&mut self, remote: SocketAddr, token: [u8; 8]) -> bool {
+        self.path_set.observe_path_response(remote, token)
+    }
+
+    pub fn promote_primary(&mut self, remote: SocketAddr) -> bool {
+        if self.path_set.promote_to_primary(remote) {
+            self.primary_peer = remote;
+            self.clear_probing_peer();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_validated(&mut self, remote: SocketAddr) -> bool {
+        self.path_set.mark_validated(remote)
+    }
+
+    pub fn is_new_address(&self, remote: SocketAddr) -> bool {
+        !self.path_set.is_known_address(remote)
+    }
+
+    pub fn path_set(&self) -> &QuicPathSet {
+        &self.path_set
+    }
+
+    pub fn path_set_mut(&mut self) -> &mut QuicPathSet {
+        &mut self.path_set
     }
 }
 
@@ -856,5 +1042,55 @@ mod tests {
             !set.path(addr(7001)).unwrap().anti_amplification.validated(),
             "validation must not be claimed on a bad token"
         );
+    }
+
+    #[test]
+    fn pathset_mark_validated_clears_anti_amplification_cap() {
+        let mut set = QuicPathSet::new();
+        set.install_primary(addr(7000));
+        set.observe_packet_from(addr(7001), 1200, Instant::now());
+        assert!(!set.may_send_to(addr(7001), 3601));
+        assert!(set.mark_validated(addr(7001)));
+        assert!(set.may_send_to(addr(7001), 1_000_000));
+    }
+
+    #[test]
+    fn match_local_connection_id_prefers_longest_prefix() {
+        let short = LocalConnectionIdEntry {
+            sequence_number: 0,
+            connection_id: ConnectionId::from_slice(b"abc"),
+            stateless_reset_token: [0; 16],
+            retired: false,
+        };
+        let long = LocalConnectionIdEntry {
+            sequence_number: 1,
+            connection_id: ConnectionId::from_slice(b"abcdefgh"),
+            stateless_reset_token: [0; 16],
+            retired: false,
+        };
+        let mut packet = vec![0x40];
+        packet.extend_from_slice(b"abcdefgh");
+        packet.push(0x42);
+
+        let matched = match_local_connection_id(&packet, [short, long].iter())
+            .expect("longest local CID should match");
+        assert_eq!(matched.0.as_bytes(), b"abcdefgh");
+        assert_eq!(matched.1, b"abcdefgh".len());
+    }
+
+    #[test]
+    fn server_path_runtime_promotes_primary_after_validation() {
+        let primary = addr(7000);
+        let migrated = addr(7001);
+        let mut runtime = QuicServerPathRuntime::new(primary);
+        runtime.process_inbound(migrated, 1200, Instant::now());
+        let token = [0xEF; 8];
+        assert!(runtime.issue_challenge(migrated, token));
+        assert_eq!(runtime.probing_peer(), Some(migrated));
+        assert!(runtime.on_path_response(migrated, token));
+        assert!(runtime.promote_primary(migrated));
+        assert_eq!(runtime.primary_peer(), migrated);
+        assert_eq!(runtime.probing_peer(), None);
+        assert!(runtime.may_send_to(migrated, 1_000_000));
     }
 }
