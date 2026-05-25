@@ -3296,17 +3296,6 @@ async fn measure_tokio_quiche_rfc9220_tunnel_mixed_once(
     .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 mixed body writer timed out"))?
     .map_err(|_| anyhow::anyhow!("tokio_quiche RFC 9220 mixed body writer dropped"))?;
 
-    controller
-        .request_sender()
-        .send(NewClientRequest {
-            request_id: 1,
-            headers: stream_headers,
-            body_writer: None,
-        })
-        .map_err(|_| {
-            anyhow::anyhow!("tokio_quiche RFC 9220 mixed stream request driver is closed")
-        })?;
-
     for _ in 0..LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES {
         send_tokio_quiche_outbound_frame(
             &mut tunnel_sender,
@@ -3323,6 +3312,17 @@ async fn measure_tokio_quiche_rfc9220_tunnel_mixed_once(
         "tokio_quiche RFC 9220 mixed tunnel fin",
     )
     .await?;
+
+    controller
+        .request_sender()
+        .send(NewClientRequest {
+            request_id: 1,
+            headers: stream_headers,
+            body_writer: None,
+        })
+        .map_err(|_| {
+            anyhow::anyhow!("tokio_quiche RFC 9220 mixed stream request driver is closed")
+        })?;
 
     let mut tunnel_stream_id = None;
     let mut stream_stream_id = None;
