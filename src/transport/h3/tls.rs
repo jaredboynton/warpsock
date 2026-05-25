@@ -459,6 +459,38 @@ impl NativeQuicTlsSession {
         Ok(session)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn client_with_initial_source_connection_id_and_zero_rtt_offer(
+        server_name: &str,
+        fingerprint: &Http3Fingerprint,
+        initial_source_connection_id: &ConnectionId,
+        tls_fingerprint: Option<&TlsFingerprint>,
+        verify_peer: bool,
+        root_certs: &[Vec<u8>],
+        use_platform_roots: bool,
+        session_ticket_der: &[u8],
+        early_data: &[u8],
+    ) -> Result<Self> {
+        let mut session = Self::new_client(
+            server_name,
+            fingerprint,
+            Some(initial_source_connection_id),
+            tls_fingerprint,
+            verify_peer,
+            root_certs,
+            use_platform_roots,
+            Some(session_ticket_der),
+            Some(early_data),
+        )?;
+        session.drive_handshake("QUIC ClientHello capture handshake")?;
+        if session.crypto_len(QuicEncryptionLevel::Initial) == 0 {
+            return Err(Error::Tls(
+                "QUIC ClientHello capture produced no CRYPTO data".into(),
+            ));
+        }
+        Ok(session)
+    }
+
     pub fn provide_crypto(&mut self, level: QuicEncryptionLevel, data: &[u8]) -> Result<()> {
         unsafe {
             if ffi::SSL_provide_quic_data(

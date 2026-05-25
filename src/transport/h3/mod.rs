@@ -49,6 +49,8 @@ use crate::pool::multiplexer::OriginKey;
 use crate::request::RequestBody;
 use crate::response::Response;
 use crate::transport::dns::DnsConfig;
+use crate::transport::h3::command::StreamResponse;
+use crate::transport::h3::connection::NativeH3ZeroRttRequest;
 use crate::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -368,10 +370,7 @@ impl H3Client {
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
         let is_idempotent = is_idempotent_method(method);
-        let (mut handle, tried_pooled, key) = self.resolve_handle_for_request(url).await?;
-
         let body_bytes = body.map(bytes::Bytes::from);
-
         let uri: http::Uri = url
             .parse()
             .map_err(|e| Error::HttpProtocol(format!("Invalid URI: {}", e)))?;
@@ -379,6 +378,20 @@ impl H3Client {
             .parse()
             .map_err(|_| Error::HttpProtocol("Invalid Method".into()))?;
 
+        if let Some(response) = self
+            .try_send_request_with_zero_rtt(
+                url,
+                method_http.clone(),
+                uri.clone(),
+                headers.clone(),
+                body_bytes.clone(),
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+
+        let (mut handle, tried_pooled, key) = self.resolve_handle_for_request(url).await?;
         let res = handle
             .send_request(
                 method_http.clone(),
@@ -489,6 +502,103 @@ impl H3Client {
     pub async fn handle(&self, url: &str) -> Result<H3Handle> {
         let (handle, _, _) = self.resolve_handle_for_request(url).await?;
         Ok(handle)
+    }
+
+    async fn try_send_request_with_zero_rtt(
+        &self,
+        url: &str,
+        method: http::Method,
+        uri: http::Uri,
+        headers: Vec<(String, String)>,
+        body: Option<bytes::Bytes>,
+    ) -> Result<Option<Response>> {
+        if !is_zero_rtt_safe_request(method.as_str(), body.as_ref()) {
+            return Ok(None);
+        }
+
+        let key = self.pool_key(url)?;
+        if self.cached_hot_handle(url).is_some() {
+            return Ok(None);
+        }
+        if let Some(handle) = self.pool.read().await.get(&key) {
+            if !handle.is_closed() && !handle.is_draining() {
+                return Ok(None);
+            }
+        }
+
+        let session_cache_key = self.session_cache_key(&key);
+        let Some(entry) = self.session_cache.get(&session_cache_key) else {
+            return Ok(None);
+        };
+        if !entry.supports_zero_rtt() {
+            return Ok(None);
+        }
+
+        let request = NativeH3ZeroRttRequest::new(
+            &self.http3_fingerprint,
+            method,
+            uri,
+            headers,
+            body,
+        )?;
+        if request.payload.len() > entry.max_early_data as usize {
+            return Ok(None);
+        }
+
+        let origin = key.origin_key();
+        let _ticket = self.dispatcher.acquire(origin).await;
+        {
+            let mut pool = self.pool.write().await;
+            if let Some(handle) = pool.get(&key).cloned() {
+                if !handle.is_closed() && !handle.is_draining() {
+                    self.record_native_handshake_report(&handle);
+                    self.store_hot_handle(url, &key, &handle);
+                    return Ok(None);
+                }
+                pool.remove(&key);
+            }
+        }
+
+        let result = match H3Connection::connect_with_zero_rtt_request(
+            url,
+            self.tls_fingerprint.clone(),
+            self.http3_fingerprint.clone(),
+            self.max_idle_timeout.unwrap_or(30_000),
+            self.verify_peer,
+            self.root_certs.clone(),
+            self.use_platform_roots,
+            &self.dns_config,
+            self.transport_config,
+            self.session_cache.clone(),
+            session_cache_key,
+            request,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::debug!(
+                    "H3: 0-RTT request path unavailable for {url}: {error}. Falling back to ordinary H3"
+                );
+                return Ok(None);
+            }
+        };
+        let hot_key = key.clone();
+        let handle = result.handle.clone();
+        let mut pool = self.pool.write().await;
+        pool.insert(key, handle.clone());
+        drop(pool);
+
+        self.record_native_handshake_report(&handle);
+        self.store_hot_handle(url, &hot_key, &handle);
+
+        let Some(response_rx) = result.zero_rtt_response_rx else {
+            return Ok(None);
+        };
+        let stream_response = response_rx
+            .await
+            .map_err(|_| Error::HttpProtocol("H3 0-RTT response channel closed".into()))??;
+        Ok(Some(response_from_stream_response(stream_response)))
     }
 
     fn cached_hot_handle(&self, url: &str) -> Option<(H3PoolKey, H3Handle)> {
@@ -671,6 +781,20 @@ fn parse_url_host(url: &str) -> Result<(String, u16, String)> {
     let port = u.port_or_known_default().unwrap_or(443);
     let path = u.path().to_string();
     Ok((host, port, path))
+}
+
+fn response_from_stream_response(stream_response: StreamResponse) -> Response {
+    Response::new(
+        stream_response.status,
+        crate::headers::Headers::from(stream_response.headers),
+        stream_response.body,
+        "HTTP/3".to_string(),
+    )
+}
+
+fn is_zero_rtt_safe_request(method: &str, body: Option<&bytes::Bytes>) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS")
+        && body.is_none_or(|body| body.is_empty())
 }
 
 fn is_idempotent_method(method: &str) -> bool {

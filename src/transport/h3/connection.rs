@@ -4,18 +4,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
 use crate::fingerprint::{Http3Fingerprint, QuicTransportParams, TlsFingerprint};
 use crate::transport::dns::DnsConfig;
+use crate::transport::h3::command::StreamResponse;
 use crate::transport::h3::handle::H3Handle;
 use crate::transport::h3::handshake::NativeQuicHandshake;
+use crate::transport::h3::native;
 use crate::transport::h3::quic::ConnectionId;
 use crate::transport::h3::recovery::{LossDetectionOutcome, PacketNumberSpace};
 use crate::transport::h3::session_cache::{NativeH3SessionCache, NativeH3SessionCacheKey};
 use crate::transport::h3::H3TransportConfig;
 
-use crate::transport::h3::native_driver::spawn_native_h3_driver;
+use crate::transport::h3::native_driver::{spawn_native_h3_driver, NativeH3PendingResponse};
 use bytes::Bytes;
 use getrandom::fill as getrandom_fill;
 
@@ -23,6 +26,41 @@ const MAX_CONNECTION_ID_LEN: usize = 20;
 const H3_UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct H3Connection;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeH3ZeroRttRequest {
+    pub method: http::Method,
+    pub uri: http::Uri,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Bytes>,
+    pub payload: Bytes,
+}
+
+pub(crate) struct H3ConnectResult {
+    pub handle: H3Handle,
+    pub zero_rtt_response_rx: Option<oneshot::Receiver<Result<StreamResponse>>>,
+}
+
+impl NativeH3ZeroRttRequest {
+    pub(crate) fn new(
+        fingerprint: &Http3Fingerprint,
+        method: http::Method,
+        uri: http::Uri,
+        headers: Vec<(String, String)>,
+        body: Option<Bytes>,
+    ) -> Result<Self> {
+        let h3_headers = native::build_request_headers(&method, &uri, &headers)?;
+        let payload =
+            native::encode_request_stream_with_fingerprint(&h3_headers, body.clone(), fingerprint);
+        Ok(Self {
+            method,
+            uri,
+            headers,
+            body,
+            payload,
+        })
+    }
+}
 
 struct NativeH3Connect {
     host: String,
@@ -37,6 +75,13 @@ struct NativeH3Connect {
     transport_config: H3TransportConfig,
     session_cache: NativeH3SessionCache,
     session_cache_key: NativeH3SessionCacheKey,
+    zero_rtt_request: Option<NativeH3ZeroRttRequest>,
+}
+
+struct PendingZeroRttRequest {
+    request: NativeH3ZeroRttRequest,
+    stream_id: u64,
+    packet_number: u64,
 }
 
 impl H3Connection {
@@ -56,6 +101,71 @@ impl H3Connection {
         session_cache: NativeH3SessionCache,
         session_cache_key: NativeH3SessionCacheKey,
     ) -> Result<H3Handle> {
+        Ok(Self::connect_internal(
+            url,
+            tls_fingerprint,
+            fingerprint,
+            max_idle_timeout,
+            verify_peer,
+            root_certs,
+            use_platform_roots,
+            dns_config,
+            transport_config,
+            session_cache,
+            session_cache_key,
+            None,
+        )
+        .await?
+        .handle)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_with_zero_rtt_request(
+        url: &str,
+        tls_fingerprint: Option<TlsFingerprint>,
+        fingerprint: Http3Fingerprint,
+        max_idle_timeout: u64,
+        verify_peer: bool,
+        root_certs: Vec<Vec<u8>>,
+        use_platform_roots: bool,
+        dns_config: &DnsConfig,
+        transport_config: H3TransportConfig,
+        session_cache: NativeH3SessionCache,
+        session_cache_key: NativeH3SessionCacheKey,
+        zero_rtt_request: NativeH3ZeroRttRequest,
+    ) -> Result<H3ConnectResult> {
+        Self::connect_internal(
+            url,
+            tls_fingerprint,
+            fingerprint,
+            max_idle_timeout,
+            verify_peer,
+            root_certs,
+            use_platform_roots,
+            dns_config,
+            transport_config,
+            session_cache,
+            session_cache_key,
+            Some(zero_rtt_request),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_internal(
+        url: &str,
+        tls_fingerprint: Option<TlsFingerprint>,
+        fingerprint: Http3Fingerprint,
+        max_idle_timeout: u64,
+        verify_peer: bool,
+        root_certs: Vec<Vec<u8>>,
+        use_platform_roots: bool,
+        dns_config: &DnsConfig,
+        transport_config: H3TransportConfig,
+        session_cache: NativeH3SessionCache,
+        session_cache_key: NativeH3SessionCacheKey,
+        zero_rtt_request: Option<NativeH3ZeroRttRequest>,
+    ) -> Result<H3ConnectResult> {
         let (host, port, _path) = parse_url(url)?;
 
         // Resolve peer
@@ -87,11 +197,12 @@ impl H3Connection {
             transport_config,
             session_cache,
             session_cache_key,
+            zero_rtt_request,
         })
         .await
     }
 
-    async fn connect_native(request: NativeH3Connect) -> Result<H3Handle> {
+    async fn connect_native(request: NativeH3Connect) -> Result<H3ConnectResult> {
         let NativeH3Connect {
             host,
             socket,
@@ -105,32 +216,60 @@ impl H3Connection {
             transport_config,
             session_cache,
             session_cache_key,
+            zero_rtt_request,
         } = request;
         let destination_cid =
             random_connection_id(fingerprint.transport.destination_connection_id_len)?;
         let source_cid = random_connection_id(fingerprint.transport.source_connection_id_len)?;
 
         let cached_session = session_cache.get(&session_cache_key);
-        let mut handshake = match NativeQuicHandshake::client_with_tls_fingerprint_and_session(
-            &host,
-            &fingerprint,
-            tls_fingerprint.as_ref(),
-            destination_cid,
-            source_cid,
-            verify_peer,
-            &root_certs,
-            use_platform_roots,
-            cached_session.as_ref().map(|entry| entry.der.as_ref()),
-        ) {
+        let zero_rtt_request = zero_rtt_request.filter(|request| {
+            cached_session.as_ref().is_some_and(|entry| {
+                entry.supports_zero_rtt() && request.payload.len() <= entry.max_early_data as usize
+            })
+        });
+        let zero_rtt_session = cached_session
+            .as_ref()
+            .zip(zero_rtt_request.as_ref())
+            .map(|(entry, request)| (entry.der.as_ref(), request.payload.as_ref()));
+        let handshake_result = if let Some((session_der, early_data)) = zero_rtt_session {
+            NativeQuicHandshake::client_with_tls_fingerprint_and_zero_rtt_request(
+                &host,
+                &fingerprint,
+                tls_fingerprint.as_ref(),
+                destination_cid.clone(),
+                source_cid.clone(),
+                verify_peer,
+                &root_certs,
+                use_platform_roots,
+                session_der,
+                early_data,
+            )
+        } else {
+            NativeQuicHandshake::client_with_tls_fingerprint_and_session(
+                &host,
+                &fingerprint,
+                tls_fingerprint.as_ref(),
+                destination_cid.clone(),
+                source_cid.clone(),
+                verify_peer,
+                &root_certs,
+                use_platform_roots,
+                cached_session.as_ref().map(|entry| entry.der.as_ref()),
+            )
+        };
+        let mut zero_rtt_request = zero_rtt_request;
+        let mut handshake = match handshake_result {
             Ok(handshake) => handshake,
             Err(err) if cached_session.is_some() => {
                 session_cache.evict(&session_cache_key);
+                zero_rtt_request = None;
                 NativeQuicHandshake::client_with_tls_fingerprint(
                     &host,
                     &fingerprint,
                     tls_fingerprint.as_ref(),
-                    random_connection_id(fingerprint.transport.destination_connection_id_len)?,
-                    random_connection_id(fingerprint.transport.source_connection_id_len)?,
+                    destination_cid,
+                    source_cid,
                     verify_peer,
                     &root_certs,
                     use_platform_roots,
@@ -145,6 +284,25 @@ impl H3Connection {
             .await
             .map_err(Error::Io)?;
         handshake.record_client_initial_sent_at(Instant::now());
+        let mut pending_zero_rtt = if let Some(request) = zero_rtt_request {
+            let packet = handshake.build_client_h3_zero_rtt_request_packet(
+                &request.method,
+                &request.uri,
+                &request.headers,
+                request.body.clone(),
+            )?;
+            socket
+                .send_to(packet.packet.as_ref(), peer_addr)
+                .await
+                .map_err(Error::Io)?;
+            Some(PendingZeroRttRequest {
+                request,
+                stream_id: packet.stream_id,
+                packet_number: packet.packet_number,
+            })
+        } else {
+            None
+        };
 
         let deadline = Instant::now() + Duration::from_millis(max_idle_timeout.max(1));
         let mut buf = vec![0u8; fingerprint.transport.max_recv_udp_payload_size.max(1200)];
@@ -167,7 +325,7 @@ impl H3Connection {
                 Ok(Ok((len, from))) if from == peer_addr => {
                     if buf[..len].first().is_some_and(|first| first & 0x80 == 0) {
                         if handshake.is_application_ready() {
-                            return spawn_native_h3_driver(
+                            return Self::finish_native_connect(
                                 handshake,
                                 fingerprint,
                                 socket,
@@ -177,7 +335,9 @@ impl H3Connection {
                                 transport_config,
                                 session_cache.clone(),
                                 session_cache_key.clone(),
-                            );
+                                pending_zero_rtt.take(),
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -212,7 +372,7 @@ impl H3Connection {
                         }
                     }
                     if handshake.is_application_ready() {
-                        return spawn_native_h3_driver(
+                        return Self::finish_native_connect(
                             handshake,
                             fingerprint,
                             socket,
@@ -222,7 +382,9 @@ impl H3Connection {
                             transport_config,
                             session_cache.clone(),
                             session_cache_key.clone(),
-                        );
+                            pending_zero_rtt.take(),
+                        )
+                        .await;
                     }
                 }
                 Ok(Ok(_)) => {}
@@ -237,6 +399,67 @@ impl H3Connection {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_native_connect(
+        mut handshake: NativeQuicHandshake,
+        fingerprint: Http3Fingerprint,
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        max_idle_timeout: u64,
+        initial_datagram: Option<Bytes>,
+        transport_config: H3TransportConfig,
+        session_cache: NativeH3SessionCache,
+        session_cache_key: NativeH3SessionCacheKey,
+        pending_zero_rtt: Option<PendingZeroRttRequest>,
+    ) -> Result<H3ConnectResult> {
+        let mut zero_rtt_response_rx = None;
+        let mut pending_zero_rtt_response = None;
+        if let Some(pending) = pending_zero_rtt {
+            let status = handshake.handshake_status();
+            if !status.early_data_accepted() {
+                if status.early_data_rejected() {
+                    session_cache.evict(&session_cache_key);
+                }
+                handshake.retire_client_application_packet(pending.packet_number);
+                let packet = handshake.build_client_h3_replay_request_packet(
+                    pending.stream_id,
+                    &pending.request.method,
+                    &pending.request.uri,
+                    &pending.request.headers,
+                    pending.request.body,
+                )?;
+                socket
+                    .send_to(packet.packet.as_ref(), peer_addr)
+                    .await
+                    .map_err(Error::Io)?;
+            }
+            let (response_tx, response_rx) = oneshot::channel();
+            pending_zero_rtt_response = Some(NativeH3PendingResponse {
+                stream_id: pending.stream_id,
+                response_tx,
+            });
+            zero_rtt_response_rx = Some(response_rx);
+        }
+
+        let handle = spawn_native_h3_driver(
+            handshake,
+            fingerprint,
+            socket,
+            peer_addr,
+            max_idle_timeout,
+            initial_datagram,
+            transport_config,
+            session_cache,
+            session_cache_key,
+            pending_zero_rtt_response,
+        )?;
+
+        Ok(H3ConnectResult {
+            handle,
+            zero_rtt_response_rx,
+        })
     }
 
     async fn handle_client_loss_detection_timeout(

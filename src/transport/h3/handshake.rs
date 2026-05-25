@@ -716,6 +716,7 @@ pub struct NativeQuicHandshake {
     client_initial_keys: QuicPacketKeyMaterial,
     server_initial_keys: QuicPacketKeyMaterial,
     client_handshake_keys: Option<QuicPacketKeyMaterial>,
+    client_early_data_keys: Option<QuicPacketKeyMaterial>,
     server_handshake_keys: Option<QuicPacketKeyMaterial>,
     client_application_keys: Option<QuicPacketKeyMaterial>,
     server_application_keys: Option<QuicPacketKeyMaterial>,
@@ -767,6 +768,7 @@ pub struct NativeQuicServerHandshake {
     client_initial_keys: QuicPacketKeyMaterial,
     server_initial_keys: QuicPacketKeyMaterial,
     client_handshake_keys: Option<QuicPacketKeyMaterial>,
+    client_early_data_keys: Option<QuicPacketKeyMaterial>,
     server_handshake_keys: Option<QuicPacketKeyMaterial>,
     client_initial_crypto: QuicCryptoAssembler,
     client_handshake_crypto: QuicCryptoAssembler,
@@ -833,6 +835,7 @@ impl NativeQuicServerHandshake {
             client_initial_keys: initial_keys.client,
             server_initial_keys: initial_keys.server,
             client_handshake_keys: None,
+            client_early_data_keys: None,
             server_handshake_keys: None,
             client_initial_crypto: QuicCryptoAssembler::default(),
             client_handshake_crypto: QuicCryptoAssembler::default(),
@@ -907,6 +910,7 @@ impl NativeQuicServerHandshake {
             client_initial_keys: initial_keys.client,
             server_initial_keys: initial_keys.server,
             client_handshake_keys: None,
+            client_early_data_keys: None,
             server_handshake_keys: None,
             client_initial_crypto: QuicCryptoAssembler::default(),
             client_handshake_crypto: QuicCryptoAssembler::default(),
@@ -1411,6 +1415,47 @@ impl NativeQuicServerHandshake {
         let opened = opened.opened;
         self.next_client_application_packet_number = opened.packet_number + 1;
         let frames = decode_frames(&opened.payload)?;
+        self.apply_opened_client_application_frames(opened.packet_number, frames, now)
+    }
+
+    pub fn open_client_zero_rtt_h3_event_packet(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Vec<ClientH3Event>> {
+        if self.close_state.is_draining() || !self.handshake_status().early_data_accepted() {
+            return Ok(Vec::new());
+        }
+        let Some(client_early_data_keys) = self.client_early_data_keys.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut events = Vec::new();
+        for packet in split_long_header_datagram(datagram)? {
+            if packet.packet_type != LongHeaderType::ZeroRtt {
+                continue;
+            }
+            let now = Instant::now();
+            let opened = open_long_header_packet(
+                client_early_data_keys,
+                &packet.packet,
+                packet.packet_number_offset,
+                self.next_client_application_packet_number,
+            )?;
+            self.next_client_application_packet_number = opened.packet_number + 1;
+            let frames = decode_frames(&opened.payload)?;
+            let frames =
+                self.apply_opened_client_application_frames(opened.packet_number, frames, now)?;
+            events.extend(self.client_h3_events_from_frames(frames)?);
+        }
+        Ok(events)
+    }
+
+    fn apply_opened_client_application_frames(
+        &mut self,
+        packet_number: u64,
+        frames: Vec<QuicFrame>,
+        now: Instant,
+    ) -> Result<Vec<QuicFrame>> {
         for frame in &frames {
             if let QuicFrame::Stream {
                 stream_id,
@@ -1465,8 +1510,7 @@ impl NativeQuicServerHandshake {
             }
         }
         if frames.iter().any(is_ack_eliciting_quic_frame) {
-            self.client_application_ack_tracker
-                .observe(opened.packet_number);
+            self.client_application_ack_tracker.observe(packet_number);
         }
         Ok(frames.into_iter().filter(is_not_padding_frame).collect())
     }
@@ -1576,8 +1620,16 @@ impl NativeQuicServerHandshake {
         if self.close_state.is_draining() {
             return Ok(Vec::new());
         }
+        let frames = self.open_client_application_packet(packet)?;
+        self.client_h3_events_from_frames(frames)
+    }
+
+    fn client_h3_events_from_frames(
+        &mut self,
+        frames: Vec<QuicFrame>,
+    ) -> Result<Vec<ClientH3Event>> {
         let mut events = Vec::new();
-        for frame in self.open_client_application_packet(packet)? {
+        for frame in frames {
             match frame {
                 QuicFrame::Stream {
                     stream_id,
@@ -1837,6 +1889,9 @@ impl NativeQuicServerHandshake {
                 (QuicSecretDirection::Read, QuicEncryptionLevel::Handshake) => {
                     self.client_handshake_keys = Some(secret.packet_key_material()?);
                     self.recovery.set_has_handshake_keys(true);
+                }
+                (QuicSecretDirection::Read, QuicEncryptionLevel::EarlyData) => {
+                    self.client_early_data_keys = Some(secret.packet_key_material()?);
                 }
                 (QuicSecretDirection::Write, QuicEncryptionLevel::Handshake) => {
                     self.server_handshake_keys = Some(secret.packet_key_material()?);
@@ -2210,6 +2265,120 @@ impl NativeQuicHandshake {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn client_with_tls_fingerprint_and_zero_rtt_request(
+        server_name: &str,
+        fingerprint: &Http3Fingerprint,
+        tls_fingerprint: Option<&TlsFingerprint>,
+        destination_cid: ConnectionId,
+        source_cid: ConnectionId,
+        verify_peer: bool,
+        root_certs: &[Vec<u8>],
+        use_platform_roots: bool,
+        session_der: &[u8],
+        early_data: &[u8],
+    ) -> Result<Self> {
+        let initial_keys = derive_initial_key_material(destination_cid.as_bytes())?;
+        let mut tls =
+            NativeQuicTlsSession::client_with_initial_source_connection_id_and_zero_rtt_offer(
+                server_name,
+                fingerprint,
+                &source_cid,
+                tls_fingerprint,
+                verify_peer,
+                root_certs,
+                use_platform_roots,
+                session_der,
+                early_data,
+            )?;
+        let client_initial = build_client_initial_packet_from_capture_with_size(
+            tls.take_client_initial(),
+            destination_cid.clone(),
+            source_cid.clone(),
+            fingerprint.transport.initial_datagram_size,
+        )?;
+        let client_early_data_keys = client_initial
+            .secrets
+            .iter()
+            .find(|secret| {
+                secret.direction == QuicSecretDirection::Write
+                    && secret.level == QuicEncryptionLevel::EarlyData
+            })
+            .map(QuicTlsSecret::packet_key_material)
+            .transpose()?;
+
+        Ok(Self {
+            client_initial,
+            pending_client_initial: None,
+            tls,
+            fingerprint: fingerprint.clone(),
+            server_name: server_name.to_string(),
+            tls_fingerprint: tls_fingerprint.cloned(),
+            verify_peer,
+            root_certs: root_certs.to_vec(),
+            use_platform_roots,
+            supported_versions: vec![QUIC_VERSION_1],
+            client_initial_version: QUIC_VERSION_1,
+            retry_received: false,
+            vn_received: false,
+            server_initial_or_handshake_seen: false,
+            original_destination_cid: destination_cid.clone(),
+            retry_source_cid: None,
+            destination_cid,
+            source_cid,
+            client_initial_keys: initial_keys.client,
+            server_initial_keys: initial_keys.server,
+            client_handshake_keys: None,
+            client_early_data_keys,
+            server_handshake_keys: None,
+            client_application_keys: None,
+            server_application_keys: None,
+            client_application_next_keys: None,
+            server_application_next_keys: None,
+            server_application_previous: None,
+            write_key_phase: false,
+            read_key_phase: false,
+            application_key_update: OneRttKeyUpdate::default(),
+            initial_crypto: QuicCryptoAssembler::default(),
+            handshake_crypto: QuicCryptoAssembler::default(),
+            initial_ack_tracker: QuicAckTracker::default(),
+            handshake_ack_tracker: QuicAckTracker::default(),
+            application_ack_tracker: QuicAckTracker::default(),
+            client_initial_loss_detector: QuicLossDetector::default(),
+            client_handshake_loss_detector: QuicLossDetector::default(),
+            client_application_loss_detector: QuicLossDetector::default(),
+            client_application_flow_control: QuicApplicationFlowControl::client(
+                &fingerprint.transport,
+            ),
+            client_application_receive_flow_control: QuicReceiveFlowControl::client(
+                &fingerprint.transport,
+            ),
+            client_initial_sent_crypto: BTreeMap::new(),
+            client_handshake_sent_crypto: BTreeMap::new(),
+            client_application_sent_streams: BTreeMap::new(),
+            client_application_recovery_lost_packets: Vec::new(),
+            client_application_ecn_congestion: false,
+            client_path_validator: QuicPathValidator::default(),
+            server_transport_parameters_validated: false,
+            recovery: recovery_state_from_transport(&fingerprint.transport),
+            next_client_initial_packet_number: 1,
+            next_server_initial_packet_number: 0,
+            next_server_handshake_packet_number: 0,
+            next_client_handshake_packet_number: 0,
+            next_server_application_packet_number: 0,
+            next_client_application_packet_number: 0,
+            next_client_bidirectional_stream_id: 0,
+            next_client_unidirectional_stream_id: 2,
+            client_handshake_crypto_offset: 0,
+            client_stream_offsets: BTreeMap::new(),
+            server_h3_stream_buffers: BTreeMap::new(),
+            server_h3_stream_buffer_offsets: BTreeMap::new(),
+            server_h3_stream_types: BTreeMap::new(),
+            close_draining: false,
+            close_state: QuicCloseState::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn client_with_tls_fingerprint(
         server_name: &str,
         fingerprint: &Http3Fingerprint,
@@ -2260,6 +2429,7 @@ impl NativeQuicHandshake {
             client_initial_keys: initial_keys.client,
             server_initial_keys: initial_keys.server,
             client_handshake_keys: None,
+            client_early_data_keys: None,
             server_handshake_keys: None,
             client_application_keys: None,
             server_application_keys: None,
@@ -2362,6 +2532,7 @@ impl NativeQuicHandshake {
             client_initial_keys: initial_keys.client,
             server_initial_keys: initial_keys.server,
             client_handshake_keys: None,
+            client_early_data_keys: None,
             server_handshake_keys: None,
             client_application_keys: None,
             server_application_keys: None,
@@ -2476,6 +2647,10 @@ impl NativeQuicHandshake {
                 && secret.level == QuicEncryptionLevel::Handshake
             {
                 self.server_handshake_keys = Some(secret.packet_key_material()?);
+            } else if secret.direction == QuicSecretDirection::Write
+                && secret.level == QuicEncryptionLevel::EarlyData
+            {
+                self.client_early_data_keys = Some(secret.packet_key_material()?);
             } else if secret.direction == QuicSecretDirection::Write
                 && secret.level == QuicEncryptionLevel::Handshake
             {
@@ -3146,6 +3321,128 @@ impl NativeQuicHandshake {
         Ok(Some(packet))
     }
 
+    pub fn build_client_h3_zero_rtt_request_packet(
+        &mut self,
+        method: &http::Method,
+        uri: &http::Uri,
+        headers: &[(String, String)],
+        body: Option<Bytes>,
+    ) -> Result<ClientApplicationPacket> {
+        let stream_id = self.next_client_bidirectional_stream_id;
+        let h3_headers = native::build_request_headers(method, uri, headers)?;
+        let payload =
+            native::encode_request_stream_with_fingerprint(&h3_headers, body, &self.fingerprint);
+
+        let packet = self
+            .build_client_zero_rtt_stream_packet(stream_id, payload, true)?
+            .ok_or_else(|| {
+                Error::HttpProtocol("native H3 0-RTT request produced no payload".into())
+            })?;
+        self.next_client_bidirectional_stream_id += 4;
+        Ok(packet)
+    }
+
+    pub fn build_client_h3_replay_request_packet(
+        &mut self,
+        stream_id: u64,
+        method: &http::Method,
+        uri: &http::Uri,
+        headers: &[(String, String)],
+        body: Option<Bytes>,
+    ) -> Result<ClientApplicationPacket> {
+        let h3_headers = native::build_request_headers(method, uri, headers)?;
+        let payload =
+            native::encode_request_stream_with_fingerprint(&h3_headers, body, &self.fingerprint);
+        let payload_len = payload.len() as u64;
+        let packet =
+            self.build_client_application_stream_packet_at_offset(stream_id, 0, payload, true)?;
+        self.client_stream_offsets.insert(stream_id, payload_len);
+        Ok(packet)
+    }
+
+    fn build_client_zero_rtt_stream_packet(
+        &mut self,
+        stream_id: u64,
+        data: Bytes,
+        fin: bool,
+    ) -> Result<Option<ClientApplicationPacket>> {
+        if data.is_empty() && !fin {
+            return Ok(None);
+        }
+        let stream_offset = *self.client_stream_offsets.get(&stream_id).unwrap_or(&0);
+        self.client_application_flow_control.consume_stream_data(
+            stream_id,
+            stream_offset,
+            data.len(),
+        )?;
+        let Some(client_early_data_keys) = &self.client_early_data_keys else {
+            return Err(Error::Quic(
+                "native 0-RTT packet encryption is waiting for TLS early-data keys".into(),
+            ));
+        };
+
+        let packet_number = self.next_client_application_packet_number;
+        let packet_number_len = 2;
+        let frame = encode_frame(&QuicFrame::Stream {
+            stream_id,
+            offset: (stream_offset > 0).then_some(stream_offset),
+            fin,
+            data: data.clone(),
+        });
+        let header = encode_long_header(&LongHeaderPacket {
+            packet_type: LongHeaderType::ZeroRtt,
+            version: QUIC_VERSION_1,
+            destination_cid: self.destination_cid.clone(),
+            source_cid: self.source_cid.clone(),
+            token: Bytes::new(),
+            packet_number,
+            packet_number_len,
+            payload_len: frame.len() + AES_GCM_TAG_LEN,
+        })?;
+        let packet_number_offset = header
+            .len()
+            .checked_sub(packet_number_len)
+            .ok_or_else(|| Error::HttpProtocol("invalid QUIC 0-RTT header length".into()))?;
+        let packet = protect_long_header_packet(
+            client_early_data_keys,
+            packet_number,
+            &header,
+            packet_number_offset,
+            packet_number_len,
+            &frame,
+        )?;
+
+        let now = Instant::now();
+        let packet_size = packet.len();
+        self.client_application_loss_detector
+            .on_packet_sent_at(packet_number, now);
+        self.client_application_sent_streams.insert(
+            packet_number,
+            SentApplicationStreamPacket {
+                stream_id,
+                stream_offset,
+                fin,
+                data: data.clone(),
+            },
+        );
+        self.recovery.on_packet_sent(
+            PacketNumberSpace::Application,
+            packet_number,
+            SentPacketInfo::new(now, packet_size, true, true),
+        );
+        self.next_client_application_packet_number += 1;
+        self.client_stream_offsets
+            .insert(stream_id, stream_offset + data.len() as u64);
+
+        Ok(Some(ClientApplicationPacket {
+            packet,
+            packet_number,
+            stream_id,
+            packet_number_offset,
+            data,
+        }))
+    }
+
     fn build_client_application_stream_packet_at_offset(
         &mut self,
         stream_id: u64,
@@ -3243,9 +3540,7 @@ impl NativeQuicHandshake {
         }
 
         let stream_id = self.next_client_bidirectional_stream_id;
-        let h3_headers = native::build_request_headers(method, uri, headers)?;
-        let payload =
-            native::encode_request_stream_with_fingerprint(&h3_headers, body, &self.fingerprint);
+        let payload = self.encode_client_h3_request_payload(method, uri, headers, body)?;
 
         let packet = self
             .build_client_application_stream_packet(stream_id, payload, true)?
@@ -3269,9 +3564,7 @@ impl NativeQuicHandshake {
         }
 
         let stream_id = self.next_client_bidirectional_stream_id;
-        let h3_headers = native::build_request_headers(method, uri, headers)?;
-        let payload =
-            native::encode_request_stream_with_fingerprint(&h3_headers, body, &self.fingerprint);
+        let payload = self.encode_client_h3_request_payload(method, uri, headers, body)?;
 
         let packet = self
             .build_client_application_stream_packet(stream_id, payload, fin)?
@@ -3280,6 +3573,27 @@ impl NativeQuicHandshake {
             })?;
         self.next_client_bidirectional_stream_id += 4;
         Ok(packet)
+    }
+
+    pub fn retire_client_application_packet(&mut self, packet_number: u64) {
+        self.client_application_loss_detector
+            .retire_packet(packet_number);
+        self.client_application_sent_streams.remove(&packet_number);
+    }
+
+    fn encode_client_h3_request_payload(
+        &self,
+        method: &http::Method,
+        uri: &http::Uri,
+        headers: &[(String, String)],
+        body: Option<Bytes>,
+    ) -> Result<Bytes> {
+        let h3_headers = native::build_request_headers(method, uri, headers)?;
+        Ok(native::encode_request_stream_with_fingerprint(
+            &h3_headers,
+            body,
+            &self.fingerprint,
+        ))
     }
 
     pub fn build_client_h3_websocket_connect_packet(

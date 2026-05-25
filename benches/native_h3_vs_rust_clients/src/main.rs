@@ -2219,9 +2219,12 @@ async fn measure_specter_native_rfc9220_tunnel_mixed_once(
     let expected_tunnel_bytes =
         LOCAL_FIXTURE_TUNNEL_PAYLOAD_SIZE * LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES;
     let start = Instant::now();
-    let mut tunnel = tokio::time::timeout(adapter_timeout(), client.websocket_h3(tunnel_url).open())
-        .await
-        .map_err(|_| anyhow::anyhow!("specter_native RFC 9220 mixed tunnel open timed out"))??;
+    let mut tunnel =
+        tokio::time::timeout(adapter_timeout(), client.websocket_h3(tunnel_url).open())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("specter_native RFC 9220 mixed tunnel open timed out")
+            })??;
 
     for index in 0..LOCAL_FIXTURE_TUNNEL_MIXED_MESSAGES {
         tunnel
@@ -2832,9 +2835,12 @@ async fn measure_s2n_quic_transport_once(
 ) -> anyhow::Result<AdapterSample> {
     let payload = Bytes::from(vec![b's'; LOCAL_FIXTURE_TRANSPORT_PAYLOAD_SIZE]);
     let start = Instant::now();
-    let mut stream = tokio::time::timeout(adapter_timeout(), connection.open_bidirectional_stream())
-        .await
-        .map_err(|_| anyhow::anyhow!("s2n_quic_transport open_bidirectional_stream timed out"))??;
+    let mut stream =
+        tokio::time::timeout(adapter_timeout(), connection.open_bidirectional_stream())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("s2n_quic_transport open_bidirectional_stream timed out")
+            })??;
 
     stream.send(payload.clone()).await?;
     stream.finish()?;
@@ -3785,9 +3791,13 @@ mod tests {
             },
         ];
 
-        let artifact = super::artifact_with_competitor_rows(None, &Vec::<&str>::new(), &measured_rows);
+        let artifact =
+            super::artifact_with_competitor_rows(None, &Vec::<&str>::new(), &measured_rows);
 
-        for competitor_id in ["quiche_direct_rfc9220_tunnel", "tokio_quiche_rfc9220_tunnel"] {
+        for competitor_id in [
+            "quiche_direct_rfc9220_tunnel",
+            "tokio_quiche_rfc9220_tunnel",
+        ] {
             let row = artifact
                 .rows
                 .iter()

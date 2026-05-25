@@ -281,6 +281,11 @@ pub struct NativeH3Response {
     pub body: Bytes,
 }
 
+pub(crate) struct NativeH3PendingResponse {
+    pub stream_id: u64,
+    pub response_tx: oneshot::Sender<Result<StreamResponse>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeH3StreamingResponseEvent {
     Headers {
@@ -672,6 +677,7 @@ pub fn spawn_native_h3_driver(
     transport_config: H3TransportConfig,
     session_cache: NativeH3SessionCache,
     session_cache_key: NativeH3SessionCacheKey,
+    pending_zero_rtt_response: Option<NativeH3PendingResponse>,
 ) -> Result<H3Handle> {
     let (command_tx, command_rx) = mpsc::channel(32);
     let is_draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -680,6 +686,12 @@ pub fn spawn_native_h3_driver(
         status: handshake.handshake_status(),
         early_data_reason: handshake.early_data_reason(),
     };
+    let mut state = NativeH3DriverState::default();
+    let mut pending_responses = HashMap::new();
+    if let Some(pending) = pending_zero_rtt_response {
+        state.track_response_stream(pending.stream_id);
+        pending_responses.insert(pending.stream_id, pending.response_tx);
+    }
     let driver = NativeH3Driver {
         command_tx: command_tx.clone(),
         command_rx,
@@ -687,8 +699,8 @@ pub fn spawn_native_h3_driver(
         fingerprint,
         socket,
         peer_addr,
-        state: NativeH3DriverState::default(),
-        pending_responses: HashMap::new(),
+        state,
+        pending_responses,
         pending_streaming_responses: HashMap::new(),
         pending_tunnels: HashMap::new(),
         pending_commands: VecDeque::new(),
