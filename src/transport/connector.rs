@@ -184,10 +184,18 @@ where
 #[derive(Clone, Copy, Debug)]
 struct ConnectPort(u16);
 
+#[derive(Clone, Debug)]
+struct ConnectHost(String);
+
 static CONNECT_PORT_INDEX: OnceLock<Index<Ssl, ConnectPort>> = OnceLock::new();
+static CONNECT_HOST_INDEX: OnceLock<Index<Ssl, ConnectHost>> = OnceLock::new();
 
 fn connect_port_index() -> &'static Index<Ssl, ConnectPort> {
     CONNECT_PORT_INDEX.get_or_init(|| Ssl::new_ex_index().expect("SSL ex index"))
+}
+
+fn connect_host_index() -> &'static Index<Ssl, ConnectHost> {
+    CONNECT_HOST_INDEX.get_or_init(|| Ssl::new_ex_index().expect("SSL ex index"))
 }
 
 const DEFAULT_HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
@@ -498,10 +506,14 @@ impl BoringConnector {
         let session_cache = self.session_cache.clone();
         builder.set_new_session_callback(move |ssl, session| {
             let host = ssl
-                .servername(NameType::HOST_NAME)
-                .unwrap_or("")
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
+                .ex_data(*connect_host_index())
+                .map(|ConnectHost(h)| h.clone())
+                .or_else(|| {
+                    ssl.servername(NameType::HOST_NAME).map(|s| {
+                        s.trim_end_matches('.').to_ascii_lowercase()
+                    })
+                })
+                .unwrap_or_default();
             let port = ssl
                 .ex_data(*connect_port_index())
                 .map(|ConnectPort(port)| *port)
