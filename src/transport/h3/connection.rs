@@ -426,6 +426,7 @@ impl H3Connection {
         let mut native_handshake_report_override = None;
         if let Some(pending) = pending_zero_rtt {
             let status = handshake.handshake_status();
+            eprintln!("finish zero-rtt status={status:?}");
             if !status.early_data_accepted() {
                 if status.early_data_rejected() {
                     session_cache.evict(&session_cache_key);
