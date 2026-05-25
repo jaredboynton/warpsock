@@ -285,6 +285,7 @@ impl H3Connection {
             .send_to(handshake.client_initial().packet.as_ref(), peer_addr)
             .await
             .map_err(Error::Io)?;
+        eprintln!("temporary client sent initial");
         handshake.record_client_initial_sent_at(Instant::now());
         let mut pending_zero_rtt = if let Some(request) = zero_rtt_request {
             let packet = handshake.build_client_h3_zero_rtt_request_packet(
@@ -297,6 +298,7 @@ impl H3Connection {
                 .send_to(packet.packet.as_ref(), peer_addr)
                 .await
                 .map_err(Error::Io)?;
+            eprintln!("temporary client sent zero-rtt pn {}", packet.packet_number);
             Some(PendingZeroRttRequest {
                 request,
                 stream_id: packet.stream_id,
@@ -329,8 +331,13 @@ impl H3Connection {
                 Ok(Ok(received)) if received.peer == peer_addr => {
                     let len = received.len;
                     let ecn_mark = received.ecn_mark;
+                    eprintln!(
+                        "temporary client recv len {len} long={}",
+                        buf[..len].first().is_some_and(|first| first & 0x80 != 0)
+                    );
                     if buf[..len].first().is_some_and(|first| first & 0x80 == 0) {
                         if handshake.is_application_ready() {
+                            eprintln!("temporary client finish on short");
                             return Self::finish_native_connect(
                                 handshake,
                                 fingerprint,
@@ -379,6 +386,10 @@ impl H3Connection {
                         }
                     }
                     if handshake.is_application_ready() {
+                        eprintln!(
+                            "temporary client application ready status {:?}",
+                            handshake.handshake_status()
+                        );
                         return Self::finish_native_connect(
                             handshake,
                             fingerprint,

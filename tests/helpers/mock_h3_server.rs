@@ -344,7 +344,10 @@ impl NativeMockH3Connection {
                     match self.process_datagram(&packet).await {
                         Ok(true) => self.last_activity = Instant::now(),
                         Ok(false) => {}
-                        Err(err) => tracing::debug!("native mock H3 process_datagram error: {}", err),
+                        Err(err) => {
+                            eprintln!("temporary mock H3 process_datagram error: {err}");
+                            tracing::debug!("native mock H3 process_datagram error: {}", err);
+                        }
                     }
                 }
                 command = self.cmd_rx.recv(), if !self.closed => {
