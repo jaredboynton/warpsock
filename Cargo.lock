@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "specter-node"
-version = "4.1.8"
+version = "4.1.9"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "specter-python"
-version = "4.1.8"
+version = "4.1.9"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "specters"
-version = "4.1.8"
+version = "4.1.9"
 dependencies = [
  "atomic-waker",
  "base64",

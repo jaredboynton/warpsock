@@ -1,10 +1,10 @@
 # Specter Python Bindings
 
-Python bindings for Specter, a high-performance async HTTP client with TLS, HTTP/2, HTTP/3, RFC 6455 WebSocket, and RFC 8441 Extended CONNECT support.
+Python bindings for Specter, a high-performance HTTP client with TLS, HTTP/2, HTTP/3, RFC 6455 WebSocket, and RFC 8441 Extended CONNECT support.
 
 ## Features
 
-- Async HTTP, RFC 6455 WebSocket, and RFC 8441 raw tunnel APIs
+- Synchronous and async HTTP APIs, plus async RFC 6455 WebSocket and RFC 8441 raw tunnel APIs
 - Browser fingerprinting for Chrome, Firefox, or default TLS settings
 - HTTP/2, HTTP/3, connection pooling, and automatic decompression
 - Cookie store and shared cookie jar support across HTTP and WebSocket handshakes
@@ -20,10 +20,31 @@ pip install specters
 
 ## HTTP
 
+Synchronous HTTP is the default ergonomic path for scripts, tools, and agents:
+
 ```python
 import specter
 
-builder = specter.Client.builder()
+builder = specter.SyncClient.builder()
+builder.fingerprint(specter.FingerprintProfile.Chrome148)
+builder.cookie_store(True)
+client = builder.build()
+
+request = client.post("https://example.com/items")
+request.header("Authorization", "Bearer token")
+request.json('{"name": "example"}')
+response = request.send()
+
+print(response.status)
+print(response.text())
+```
+
+Use `AsyncClient` when your application already owns an event loop:
+
+```python
+import specter
+
+builder = specter.AsyncClient.builder()
 builder.fingerprint(specter.FingerprintProfile.Chrome148)
 builder.cookie_store(True)
 client = builder.build()
@@ -34,7 +55,7 @@ request.json('{"name": "example"}')
 response = await request.send()
 
 print(response.status)
-print(await response.text())
+print(response.text())
 ```
 
 ## RFC 6455 WebSockets

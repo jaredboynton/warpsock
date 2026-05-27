@@ -12,16 +12,32 @@ pip install specters
 
 ## HTTP
 
+Synchronous HTTP:
+
 ```python
 import specter
 
-builder = specter.Client.builder()
+builder = specter.SyncClient.builder()
+builder.fingerprint(specter.FingerprintProfile.Chrome148)
+client = builder.build()
+
+response = client.get("https://example.com/").send()
+print(response.status)
+print(response.text())
+```
+
+Async HTTP:
+
+```python
+import specter
+
+builder = specter.AsyncClient.builder()
 builder.fingerprint(specter.FingerprintProfile.Chrome148)
 client = builder.build()
 
 response = await client.get("https://example.com/").send()
 print(response.status)
-print(await response.text())
+print(response.text())
 ```
 
 ## RFC 6455 WebSockets

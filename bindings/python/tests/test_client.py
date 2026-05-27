@@ -5,6 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl
 
+import asyncio
 import pytest
 import specter
 
@@ -370,3 +371,34 @@ class TestAsyncRequests:
             response_chunks.append(chunk)
         body = json.loads(b"".join(response_chunks).decode())
         assert body["data"] == "one-two-three"
+
+
+class TestSyncRequests:
+    """Test synchronous HTTP requests against a local fixture."""
+
+    def test_sync_client_get_json_without_running_event_loop(self, http_server):
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+
+        client = specter.SyncClient.builder().build()
+        response = client.get(f"{http_server}/get").send()
+
+        assert response.status == 200
+        assert response.is_success
+        assert response.json()["url"] == f"{http_server}/get"
+
+    def test_sync_client_post_json_and_text_helpers_are_sync(self, http_server):
+        client = specter.SyncClient.builder().build()
+        request = client.post(f"{http_server}/post")
+        request.json('{"name": "sync", "value": 456}')
+
+        response = request.send()
+        body = response.json()
+
+        assert body["json"]["name"] == "sync"
+        assert body["json"]["value"] == 456
+        assert isinstance(response.text(), str)
+        assert isinstance(response.bytes(), bytes)
+
+    def test_async_client_alias_preserves_existing_client(self):
+        assert specter.AsyncClient is specter.Client

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "specters"
-version = "4.1.8"
+version = "4.1.9"
 description = "Python bindings for Specter, a Chrome-accurate HTTP client with TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSocket fingerprinting. Improved TTFT/TPS over reqwest for LLM providers."
 readme = "README_PYPI.md"
 license = { text = "MIT" }

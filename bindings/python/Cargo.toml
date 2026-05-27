@@ -1,6 +1,6 @@
 [package]
 name = "specter-python"
-version = "4.1.8"
+version = "4.1.9"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for Specter HTTP client"

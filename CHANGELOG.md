@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.9] - 2026-05-27
+
+### Added
+
+- Added Python `SyncClient`/`SyncRequestBuilder`/`SyncResponse` wrappers for no-event-loop HTTP calls, plus an explicit `AsyncClient` alias for the existing async client.
+
+### Fixed
+
+- Corrected Python docs and type stubs so sync HTTP is the default PyPI quickstart and async response helper annotations match runtime behavior.
+
 ## [4.1.8] - 2026-05-27
 
 ### Fixed
