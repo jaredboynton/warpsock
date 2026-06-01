@@ -20,6 +20,15 @@ use crate::transport::h2::connection::{
 };
 use crate::transport::h2::frame::FrameHeader;
 
+/// Out-of-band HTTP/2 trailer block delivered from the driver: `(name, value)`
+/// header pairs on success. Defined here (the lower-level body module) so both
+/// the Body receiver side and the driver sender side share one definition.
+pub(crate) type TrailerResult = Result<Vec<(String, String)>>;
+/// Sender half of the conditional trailer side channel (held by the driver).
+pub(crate) type TrailerSender = tokio::sync::oneshot::Sender<TrailerResult>;
+/// Receiver half of the conditional trailer side channel (held by the Body).
+pub(crate) type TrailerReceiver = tokio::sync::oneshot::Receiver<TrailerResult>;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct H2BodyTimeouts {
     pub(crate) read_idle: Option<Duration>,
@@ -323,14 +332,14 @@ pub(crate) struct H2Body {
     /// Side-channel receiver for HTTP/2 response trailers. `Some` only when the
     /// caller requested trailers (`te: trailers`). Consumed on first `trailers()`
     /// await. Never an item in the SPSC ring; off the DATA hot path entirely.
-    trailers_rx: Option<tokio::sync::oneshot::Receiver<Result<Vec<(String, String)>>>>,
+    trailers_rx: Option<TrailerReceiver>,
 }
 
 impl H2Body {
     pub(crate) fn new_with_trailers(
         shared: Arc<H2BodyShared>,
         timeouts: H2BodyTimeouts,
-        trailers_rx: Option<tokio::sync::oneshot::Receiver<Result<Vec<(String, String)>>>>,
+        trailers_rx: Option<TrailerReceiver>,
     ) -> Self {
         Self {
             shared,
@@ -663,9 +672,7 @@ mod tests {
         assert!(!capacity.ended);
     }
 
-    fn test_body(
-        trailers_rx: Option<tokio::sync::oneshot::Receiver<Result<Vec<(String, String)>>>>,
-    ) -> H2Body {
+    fn test_body(trailers_rx: Option<TrailerReceiver>) -> H2Body {
         let shared = H2BodyShared::new_with_capacity(Arc::new(Notify::new()), 65_535, 2);
         H2Body::new_with_trailers(shared, H2BodyTimeouts::default(), trailers_rx)
     }

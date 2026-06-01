@@ -22,7 +22,7 @@ pub type StreamingHeadersResult = Result<(u16, Vec<(String, String)>)>;
 use crate::error::{Error, Result};
 use crate::headers::Headers;
 use crate::request::{RequestBody, RequestBodyStream};
-use crate::transport::h2::body::{H2BodyDataPush, H2BodyPush, H2BodyShared};
+use crate::transport::h2::body::{H2BodyDataPush, H2BodyPush, H2BodyShared, TrailerSender};
 use crate::transport::h2::connection::{
     ControlAction, H2Connection as RawH2Connection, StreamResponse,
 };
@@ -55,7 +55,7 @@ pub enum DriverCommand {
         /// Side-channel sender for HTTP/2 response trailers. `Some` only when
         /// the caller requested trailers (request carried `te: trailers`);
         /// `None` keeps the warm streaming path allocation-free.
-        trailers_tx: Option<oneshot::Sender<Result<Vec<(String, String)>>>>,
+        trailers_tx: Option<TrailerSender>,
     },
     /// Open an RFC 8441 WebSocket tunnel on a pooled HTTP/2 stream.
     OpenWebSocketTunnel {
@@ -129,7 +129,7 @@ pub struct InlineRegistration {
     /// Side-channel sender for HTTP/2 response trailers. `Some` only when the
     /// inline caller requested trailers (`te: trailers`); `None` otherwise so
     /// the warm inline path allocates no extra channel.
-    pub trailers_tx: Option<oneshot::Sender<Result<Vec<(String, String)>>>>,
+    pub trailers_tx: Option<TrailerSender>,
 }
 
 struct NotifyWake(Arc<Notify>);
@@ -178,7 +178,7 @@ struct DriverStreamState {
     /// caller requested trailers (`te: trailers`). Sent on the trailers HEADERS
     /// branch (`Ok`) or on reset via `fail_stream` (`Err`); dropped un-sent on a
     /// clean trailer-less end, which the receiver maps to `Ok(None)`.
-    trailers_tx: Option<oneshot::Sender<Result<Vec<(String, String)>>>>,
+    trailers_tx: Option<TrailerSender>,
     /// Streaming response body state shared with the public Body poller.
     streaming_body: Option<Arc<H2BodyShared>>,
     /// Accumulated response status
@@ -238,7 +238,7 @@ impl DriverStreamState {
 
     fn streaming(
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        trailers_tx: Option<oneshot::Sender<Result<Vec<(String, String)>>>>,
+        trailers_tx: Option<TrailerSender>,
         body_shared: Arc<H2BodyShared>,
         pending_body: Bytes,
         request_stream: Option<DriverStreamingRequestBody>,
@@ -265,7 +265,7 @@ impl DriverStreamState {
 
     fn streaming_inline(
         headers_tx: oneshot::Sender<StreamingHeadersResult>,
-        trailers_tx: Option<oneshot::Sender<Result<Vec<(String, String)>>>>,
+        trailers_tx: Option<TrailerSender>,
         body_shared: Arc<H2BodyShared>,
         recv_window: i32,
     ) -> Self {
