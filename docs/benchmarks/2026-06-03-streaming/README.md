@@ -8,7 +8,7 @@ mixes hardware.
 ## Environment
 
 - Host: AWS `c8g`-class Graviton4 (aarch64), 48 vCPU, load average 0.18-0.71 during the run
-- Commit: `26d5a78` (`perf/rebench-quietbox`), gRPC feature off
+- Commit: `25395a8` on `main` (tree-identical to the artifacts' recorded `commit_sha` `26d5a78`, the pre-cherry-pick SHA), gRPC feature off
 - BoringSSL: in-tree prebuilt at `lib/boringssl/aarch64-unknown-linux-gnu/build`
 - Bench profile: thin LTO + `codegen-units = 1`
 - 3 repeats per workload, 100 paired interleaved samples each, 5 warmups

@@ -16,7 +16,7 @@ Date: 2026-06-03 (single-environment AWS Graviton4 re-baseline; prior 2026-05-25
 
 ## Current Proof
 
-- `2026-06-03-graviton4-suite-rep1.json` (and `-rep2.json`) are the current release-grade combined H3 HTTP + RFC9220 full-suite artifacts, measured on a single quiet AWS Graviton4 host (aarch64), commit `26d5a78`, as one same-process all-client capture per rep (`--measure-local-native-fixture --warmups 5 --samples 100`).
+- `2026-06-03-graviton4-suite-rep1.json` (and `-rep2.json`) are the current release-grade combined H3 HTTP + RFC9220 full-suite artifacts, measured on a single quiet AWS Graviton4 host (aarch64), commit `25395a8`, as one same-process all-client capture per rep (`--measure-local-native-fixture --warmups 5 --samples 100`).
 - The H3 HTTP gate passes with `specter_native_is_faster_than_required_h3_competitors`. Specter native H3 leads every required comparator on p50 TTFB, p95 TTFB, and throughput (median of 2 reps: Specter 0.380 ms / 0.997 ms / 9.11 MiB/s; next-fastest p50 is `h3_quinn` at 1.194 ms, next-lowest p95 is `tokio_quiche` at 1.992 ms).
 - The RFC9220 full-suite gate does not pass on this host (`status = fail`, `fastest_non_specter_rfc9220_tunnel_client = tokio_quiche_rfc9220_tunnel_close`). Specter leads p50 TTFB and throughput on all three tunnel workloads and wins the slow-consumer mixed workload outright on every metric, while `tokio_quiche` holds a lower p95 tail on the echo and client-DATA+FIN workloads:
   - echo: Specter p95 2.954 ms vs `tokio_quiche` 2.026 ms (Specter p50 0.961 ms vs 1.959 ms; throughput 0.79 vs 0.50 MiB/s)

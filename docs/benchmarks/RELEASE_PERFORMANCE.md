@@ -16,7 +16,7 @@ To avoid the LLM-world confusion this document writes out every metric:
 
 ## HTTP/1.1 and HTTP/2 streaming vs reqwest 0.12
 
-**Method:** `benches/streaming_vs_reqwest.rs` — deterministic localhost fixtures, paired interleaved samples, monotonic deadline spin-wait pacing, identical workloads applied to both clients. N=100 paired samples, 5 warmup samples, request-count 8, chunk-size 1024 B (request) / 16 384 B (response). Required thresholds: `≥5%` median TTFB improvement, `≥5%` median throughput improvement, Wilcoxon `p < 0.01`, p95 regression `≤5%`. Bench profile: thin LTO + `codegen-units = 1`. Measured on a single quiet AWS Graviton4 host (aarch64), commit `26d5a78`, 3 repeats per workload; the table shows the median repeat.
+**Method:** `benches/streaming_vs_reqwest.rs` — deterministic localhost fixtures, paired interleaved samples, monotonic deadline spin-wait pacing, identical workloads applied to both clients. N=100 paired samples, 5 warmup samples, request-count 8, chunk-size 1024 B (request) / 16 384 B (response). Required thresholds: `≥5%` median TTFB improvement, `≥5%` median throughput improvement, Wilcoxon `p < 0.01`, p95 regression `≤5%`. Bench profile: thin LTO + `codegen-units = 1`. Measured on a single quiet AWS Graviton4 host (aarch64), commit `25395a8`, 3 repeats per workload; the table shows the median repeat.
 
 | Workload | Median TTFB Δ | TTFB Wilcoxon p | Median throughput Δ | p95 TTFB Δ | p95 throughput Δ | Gate |
 |---|---:|---:|---:|---:|---:|---|

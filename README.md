@@ -250,7 +250,7 @@ The RFC 8441 API is a byte tunnel. Use it when you need H2 Extended CONNECT sema
 
 ## Performance
 
-Specter ships deterministic localhost streaming benchmarks against `reqwest 0.12`. Across H1 and H2 request- and response-body streaming, Specter beats reqwest on both TTFB and throughput with Wilcoxon p-values well below 0.01. The numbers below are a single-environment re-baseline measured on a quiet AWS Graviton4 host (commit `26d5a78`, 3 repeats per workload, 100 paired samples each), with both clients measured on the same machine. Values are the median across the 3 repeats; each Artifact link is rep 1 of that workload, and the [directory README](docs/benchmarks/2026-06-03-streaming/) lists all three reps with the median and weakest-repeat computation:
+Specter ships deterministic localhost streaming benchmarks against `reqwest 0.12`. Across H1 and H2 request- and response-body streaming, Specter beats reqwest on both TTFB and throughput with Wilcoxon p-values well below 0.01. The numbers below are a single-environment re-baseline measured on a quiet AWS Graviton4 host (commit `25395a8`, 3 repeats per workload, 100 paired samples each), with both clients measured on the same machine. Values are the median across the 3 repeats; each Artifact link is rep 1 of that workload, and the [directory README](docs/benchmarks/2026-06-03-streaming/) lists all three reps with the median and weakest-repeat computation:
 
 | Workload | Protocol | TTFB Improvement | Throughput Improvement | Throughput p-value | Artifact |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -267,7 +267,7 @@ See [`docs/benchmarks/2026-06-03-streaming/`](docs/benchmarks/2026-06-03-streami
 
 ### Local native HTTP/3 vs Rust H3 clients
 
-Specter's native HTTP/3 path also has a local same-fixture comparator matrix against `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest` HTTP/3. Re-measured on the same quiet Graviton4 host (commit `26d5a78`, n=100), the artifacts [`2026-06-03-graviton4-suite-rep1.json`](docs/benchmarks/native-h3-vs-rust-clients/2026-06-03-graviton4-suite-rep1.json) and [`rep2`](docs/benchmarks/native-h3-vs-rust-clients/2026-06-03-graviton4-suite-rep2.json) each pass the H3 superiority gate with all required comparator rows present (table shows their median):
+Specter's native HTTP/3 path also has a local same-fixture comparator matrix against `quiche`, `tokio-quiche`, `h3-quinn`, and `reqwest` HTTP/3. Re-measured on the same quiet Graviton4 host (commit `25395a8`, n=100), the artifacts [`2026-06-03-graviton4-suite-rep1.json`](docs/benchmarks/native-h3-vs-rust-clients/2026-06-03-graviton4-suite-rep1.json) and [`rep2`](docs/benchmarks/native-h3-vs-rust-clients/2026-06-03-graviton4-suite-rep2.json) each pass the H3 superiority gate with all required comparator rows present (table shows their median):
 
 | Client | Role | p50 TTFB | p95 TTFB | Throughput |
 | --- | --- | ---: | ---: | ---: |
@@ -283,7 +283,7 @@ That gate is explicitly for HTTP/3 request/response workloads. `quinn_transport`
 
 Specter also ships a local RFC 6455 echo benchmark, [`benches/websocket_vs_fastwebsockets.rs`](benches/websocket_vs_fastwebsockets.rs), against `fastwebsockets 0.10.0` and `tokio-tungstenite 0.24`.
 
-From the Graviton4 re-baseline (commit `26d5a78`), using 20,000 measured 1 KiB binary echoes after 2,000 warmups, across three reps:
+From the Graviton4 re-baseline (commit `25395a8`), using 20,000 measured 1 KiB binary echoes after 2,000 warmups, across three reps:
 
 | Rep | Specter | fastwebsockets | tokio-tungstenite | Specter vs fws | Specter vs tung |
 | --- | ---: | ---: | ---: | ---: | ---: |
