@@ -1,6 +1,6 @@
 [package]
 name = "specter-node"
-version = "4.1.10"
+version = "4.2.0"
 edition = "2021"
 license = "MIT"
 description = "Node.js bindings for Specter HTTP client"

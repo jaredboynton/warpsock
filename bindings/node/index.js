@@ -8,7 +8,7 @@
 const { execSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
 
-const PACKAGE_VERSION = '4.1.10';
+const PACKAGE_VERSION = '4.2.0';
 
 const targets = {
   'darwin-x64': {

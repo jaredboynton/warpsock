@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.1.10] - 2026-05-27
+## [4.2.0] - 2026-06-03
+
+### Added
+
+- gRPC plumbing primitive behind the `grpc` Cargo feature: HTTP/2 response trailers surfaced through `Response::trailers()` (three-state contract: present, clean-end-absent, stream-reset error), a length-prefixed message framing codec (`GrpcFramer`) with zero-copy on the contained-message path and per-message gzip support, and a fingerprint-safe `grpc_request` constructor that emits `POST /pkg.Service/Method` with `content-type: application/grpc+proto` and `te: trailers` without altering the wire fingerprint.
+- gRPC surface exposed in the Node and Python bindings (`grpc_request` builder and async `trailers()` accessor), with both binding crates enabling the `grpc` feature.
+
+### Changed
+
+- HTTP/2 trailer delivery uses a per-stream side channel allocated only when a request opts into trailers (`te: trailers`), keeping the existing response-streaming hot path byte-identical and allocation-neutral when gRPC is unused.
 
 ### Fixed
 

@@ -304,7 +304,7 @@ if _NativeSyncClient is not None:
     SyncResponse = _NativeSyncResponse
 
 
-__version__ = "4.1.10"
+__version__ = "4.2.0"
 __all__ = [
     "AsyncClient",
     "Client",
