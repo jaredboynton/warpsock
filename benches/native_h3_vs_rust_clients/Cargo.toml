@@ -4,6 +4,14 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Detached from the parent Cargo workspace (whose members are only the language
+# bindings). This comparator crate keeps its own Cargo.lock and an isolated
+# dependency graph (quiche / quinn / tokio-quiche / s2n-quic), so it declares an
+# empty [workspace] table to stop the parent workspace from claiming it. Without
+# this, `cargo build` inside this directory fails with "current package believes
+# it's in a workspace when it's not" after the workspace unification.
+[workspace]
+
 [features]
 default = []
 reqwest-h3 = ["reqwest/http3"]
