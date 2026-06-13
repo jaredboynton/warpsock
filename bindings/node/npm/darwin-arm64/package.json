@@ -1,6 +1,6 @@
 {
   "name": "warpsock-darwin-arm64",
-  "version": "4.2.5",
+  "version": "4.2.6",
   "cpu": [
     "arm64"
   ],

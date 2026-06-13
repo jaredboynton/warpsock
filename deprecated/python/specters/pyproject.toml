@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specters"
-version = "4.2.5"
+version = "4.2.6"
 description = "Deprecated package name for Warpsock. Install warpsock instead."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "Jared Boynton" }]
-dependencies = ["warpsock==4.2.5"]
+dependencies = ["warpsock==4.2.6"]
 keywords = ["http", "http2", "http3", "tls", "fingerprint", "chrome", "browser", "websocket", "client", "async"]
 classifiers = [
     "Development Status :: 7 - Inactive",

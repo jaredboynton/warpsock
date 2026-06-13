@@ -866,21 +866,63 @@ impl<'a> RequestBuilder<'a> {
             return self.send_streaming_once().await;
         }
 
-        if self.body.is_streaming() {
-            let mut response = self.send_streaming_once().await?;
-            if response.is_redirect() {
-                drain_streaming_body(response.body_mut()).await?;
-                return Err(Error::HttpProtocol(
-                    "redirect would require replaying a non-replayable streaming request body"
-                        .into(),
-                ));
-            }
-            return Ok(response);
-        }
-
         let client = self.client;
-        let mut request = self.build()?;
         let mut redirects = 0u32;
+        let initial_body_is_streaming = self.body.is_streaming();
+        let mut request = if initial_body_is_streaming {
+            let request = self.build()?;
+            let Request {
+                method,
+                url,
+                headers,
+                body,
+                version,
+                timeout,
+            } = request;
+            let redirect_source = Request {
+                method: method.clone(),
+                url: url.clone(),
+                headers: headers.clone(),
+                body: RequestBody::Empty,
+                version,
+                timeout,
+            };
+            let mut response = RequestBuilder {
+                client,
+                url: Some(url),
+                method,
+                headers,
+                body,
+                version,
+                timeout,
+                error: None,
+            }
+            .send_streaming_once()
+            .await?;
+
+            if !response.is_redirect() {
+                return Ok(response);
+            }
+
+            let location = match response.redirect_url() {
+                Some(value) => value.to_string(),
+                None => return Ok(response),
+            };
+
+            if let RedirectPolicy::Limited(limit) = policy {
+                if redirects >= limit {
+                    return Err(Error::RedirectLimit { count: limit });
+                }
+            }
+
+            drain_streaming_body(response.body_mut()).await?;
+
+            let next_url = redirect_source.url.join(&location).map_err(Error::from)?;
+            redirects += 1;
+            client.redirect_request_after_streaming_upload(&redirect_source, &response, next_url)?
+        } else {
+            self.build()?
+        };
 
         loop {
             let builder = RequestBuilder {
@@ -977,20 +1019,7 @@ impl<'a> RequestBuilder<'a> {
                 .await;
             let response = response.with_url(request_url);
 
-            if let Some(enc) = response.content_encoding() {
-                let enc_lc = enc.to_lowercase();
-                if enc_lc.contains("gzip")
-                    || enc_lc.contains("deflate")
-                    || enc_lc.contains("br")
-                    || enc_lc.contains("zstd")
-                {
-                    return Err(Error::Decompression(
-                        "Compressed streaming is unsupported".into(),
-                    ));
-                }
-            }
-
-            return Ok(response);
+            return Ok(response.decode_streaming_content());
         }
 
         // Parse URI
@@ -1094,8 +1123,7 @@ impl<'a> RequestBuilder<'a> {
                 .store_cookies_from_headers(response.headers(), request_url.as_str())
                 .await;
             let response = response.with_url(request_url);
-            reject_compressed_streaming(&response)?;
-            return Ok(response);
+            return Ok(response.decode_streaming_content());
         } else {
             if let Some(content_length) = request.body.content_length() {
                 if content_length > 0 && !request.headers.contains("content-length") {
@@ -1310,25 +1338,8 @@ impl<'a> RequestBuilder<'a> {
             }
         };
 
-        reject_compressed_streaming(&response)?;
-        Ok(response)
+        Ok(response.decode_streaming_content())
     }
-}
-
-fn reject_compressed_streaming(response: &Response) -> Result<()> {
-    if let Some(enc) = response.content_encoding() {
-        let enc_lc = enc.to_lowercase();
-        if enc_lc.contains("gzip")
-            || enc_lc.contains("deflate")
-            || enc_lc.contains("br")
-            || enc_lc.contains("zstd")
-        {
-            return Err(Error::Decompression(
-                "Compressed streaming is unsupported".into(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 async fn drain_streaming_body(body: &mut Body) -> Result<()> {
@@ -1792,6 +1803,25 @@ impl Client {
         response: &Response,
         next_url: Url,
     ) -> Result<Request> {
+        self.redirect_request_inner(request, response, next_url, request.body.is_streaming())
+    }
+
+    fn redirect_request_after_streaming_upload(
+        &self,
+        request: &Request,
+        response: &Response,
+        next_url: Url,
+    ) -> Result<Request> {
+        self.redirect_request_inner(request, response, next_url, true)
+    }
+
+    fn redirect_request_inner(
+        &self,
+        request: &Request,
+        response: &Response,
+        next_url: Url,
+        request_body_was_streaming: bool,
+    ) -> Result<Request> {
         let status = response.status().as_u16();
         let mut method = request.method.clone();
         let mut headers = request.headers.clone();
@@ -1804,7 +1834,7 @@ impl Client {
             headers.remove("content-length");
             headers.remove("content-type");
             RequestBody::Empty
-        } else if request.body.is_streaming() {
+        } else if request_body_was_streaming {
             return Err(Error::HttpProtocol(
                 "redirect would require replaying a non-replayable streaming request body".into(),
             ));

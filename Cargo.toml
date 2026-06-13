@@ -1,6 +1,6 @@
 [package]
 name = "warpsock"
-version = "4.2.5"
+version = "4.2.6"
 edition = "2021"
 license = "MIT"
 description = "Rust HTTP client with browser-like Chrome and Firefox fingerprints across TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSockets"
@@ -65,6 +65,7 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "fs", "io-util"] }
 
 # Compression
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
 flate2 = "1"
 brotli = "8"
 zstd = "0.13"

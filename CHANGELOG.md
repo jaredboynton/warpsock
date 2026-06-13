@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.6] - 2026-06-13
+
+### Added
+
+- Streaming responses now decode gzip, deflate, brotli, zstd, and chained `Content-Encoding` bodies while the body is polled across H1, H2, and H3 `send_streaming()` paths. `206 Partial Content` remains byte-preserving and encoded.
+- H2 streaming response decompression preserves trailer delivery after the decoded body has been drained.
+
+### Fixed
+
+- Streaming upload redirects that switch to `GET` (`303`, plus non-GET `301`/`302`) now follow without replaying the non-replayable request body; replay-preserving redirects such as `307` still fail closed.
+- Node declarations now publish `RequestBuilder.bodyStream()` and the async iterable `Response.body` streaming surface.
+- Python async `RequestBuilder.body_stream()` sends now preserve the streaming response body instead of eagerly buffering it before returning.
+- Python `SyncRequestBuilder.body_stream()` now accepts normal Python iterables of bytes-like chunks and streams them through the Rust request body path instead of rejecting the sync API.
+
 ## [4.2.5] - 2026-06-13
 
 ### Fixed

@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use futures_core::Stream;
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::{future_into_py, into_future};
@@ -88,7 +88,7 @@ pub struct SyncRequestBuilder {
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    body: Option<Vec<u8>>,
+    body: Option<SyncRequestBodyKind>,
     version: Option<RustHttpVersion>,
 }
 
@@ -103,6 +103,11 @@ enum RequestBodyKind {
     Stream(Py<PyAny>),
 }
 
+enum SyncRequestBodyKind {
+    Buffered(Vec<u8>),
+    Stream(Py<PyAny>),
+}
+
 struct PythonBodyStream {
     rx: mpsc::Receiver<StdResult<Bytes, RustError>>,
 }
@@ -112,6 +117,40 @@ impl Stream for PythonBodyStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+struct PythonSyncBodyStream {
+    iterator: Py<PyAny>,
+}
+
+impl Stream for PythonSyncBodyStream {
+    type Item = StdResult<Bytes, RustError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result: StdResult<Option<Bytes>, String> = Python::with_gil(|py| {
+            let next = match self.iterator.bind(py).call_method0("__next__") {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    if err.is_instance_of::<PyStopIteration>(py) {
+                        return Ok(None);
+                    }
+                    return Err(err.to_string());
+                }
+            };
+            next.extract::<Vec<u8>>()
+                .map(Bytes::from)
+                .map(Some)
+                .map_err(|_| "body_stream chunks must be bytes-like".to_string())
+        });
+
+        match result {
+            Ok(Some(bytes)) => Poll::Ready(Some(Ok(bytes))),
+            Ok(None) => Poll::Ready(None),
+            Err(err) => Poll::Ready(Some(Err(RustError::HttpProtocol(format!(
+                "Python request body stream failed: {err}"
+            ))))),
+        }
     }
 }
 
@@ -529,7 +568,7 @@ async fn send_buffered_request(
     url: String,
     headers: Vec<(String, String)>,
     version: Option<RustHttpVersion>,
-    body: Option<Vec<u8>>,
+    body: Option<SyncRequestBodyKind>,
 ) -> PyResult<RustResponse> {
     let mut req_builder = match method.as_str() {
         "GET" => client.get(url.as_str()),
@@ -555,11 +594,20 @@ async fn send_buffered_request(
         req_builder = req_builder.header(key, value);
     }
 
-    if let Some(body) = body {
-        req_builder = req_builder.body(body);
+    match body {
+        Some(SyncRequestBodyKind::Buffered(body)) => {
+            req_builder.body(body).send().await.map_err(to_py_err)
+        }
+        Some(SyncRequestBodyKind::Stream(iterator)) => {
+            let resp = req_builder
+                .body_stream(PythonSyncBodyStream { iterator })
+                .send_streaming()
+                .await
+                .map_err(to_py_err)?;
+            buffer_response_body(resp).await
+        }
+        None => req_builder.send().await.map_err(to_py_err),
     }
-
-    req_builder.send().await.map_err(to_py_err)
 }
 
 #[pymethods]
@@ -829,8 +877,7 @@ impl RequestBuilder {
                             }
 
                             let resp = if streaming {
-                                let resp = req_builder.send_streaming().await.map_err(to_py_err)?;
-                                buffer_response_body(resp).await?
+                                req_builder.send_streaming().await.map_err(to_py_err)?
                             } else {
                                 req_builder.send().await.map_err(to_py_err)?
                             };
@@ -884,20 +931,25 @@ impl SyncRequestBuilder {
 
     /// Set the request body as bytes.
     fn body(&mut self, body: &[u8]) -> PyResult<()> {
-        self.body = Some(body.to_vec());
+        self.body = Some(SyncRequestBodyKind::Buffered(body.to_vec()));
         Ok(())
     }
 
-    /// Async iterable request bodies require the async client.
-    fn body_stream(&mut self, _async_iterable: Py<PyAny>) -> PyResult<()> {
-        Err(PyValueError::new_err(
-            "SyncRequestBuilder.body_stream is not supported; use AsyncClient for async iterable bodies",
-        ))
+    /// Set the request body from a Python iterable of bytes-like chunks.
+    fn body_stream(&mut self, iterable: Py<PyAny>) -> PyResult<()> {
+        let iterator = Python::with_gil(|py| {
+            iterable
+                .bind(py)
+                .call_method0("__iter__")
+                .map(|obj| obj.unbind())
+        })?;
+        self.body = Some(SyncRequestBodyKind::Stream(iterator));
+        Ok(())
     }
 
     /// Set the request body as a JSON string.
     fn json(&mut self, json_str: &str) -> PyResult<()> {
-        self.body = Some(json_str.as_bytes().to_vec());
+        self.body = Some(SyncRequestBodyKind::Buffered(json_str.as_bytes().to_vec()));
         if !self
             .headers
             .iter()
@@ -911,7 +963,7 @@ impl SyncRequestBuilder {
 
     /// Set the request body as form data.
     fn form(&mut self, form_str: &str) -> PyResult<()> {
-        self.body = Some(form_str.as_bytes().to_vec());
+        self.body = Some(SyncRequestBodyKind::Buffered(form_str.as_bytes().to_vec()));
         if !self
             .headers
             .iter()

@@ -83,6 +83,71 @@ async fn h3_response_body_is_poll_based() {
 }
 
 #[tokio::test]
+async fn h3_streaming_gzip_response_decodes_split_data_frames() {
+    let body = b"h3 gzip streaming body ".repeat(128);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &body).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let split = compressed.len() / 2;
+    let first_chunk = compressed[..split].to_vec();
+    let second_chunk = compressed[split..].to_vec();
+
+    let server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+
+    server.start(move |conn| {
+        let first_chunk = first_chunk.clone();
+        let second_chunk = second_chunk.clone();
+        async move {
+            let stream_id = loop {
+                match conn.read_event().await {
+                    Some(MockEvent::Headers { stream_id, .. }) => break stream_id,
+                    Some(_) => continue,
+                    None => return,
+                }
+            };
+
+            conn.send_response_headers(
+                stream_id,
+                vec![
+                    (":status", "200"),
+                    ("content-encoding", "gzip"),
+                    ("content-type", "text/plain"),
+                ],
+                false,
+            )
+            .await;
+            conn.send_response_data(stream_id, &first_chunk, false)
+                .await;
+            conn.send_response_data(stream_id, &second_chunk, true)
+                .await;
+        }
+    });
+
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let mut response = client
+        .get(&url)
+        .version(HttpVersion::Http3Only)
+        .send_streaming()
+        .await
+        .unwrap();
+
+    assert_eq!(response.content_encoding(), Some("gzip"));
+    assert_eq!(
+        response
+            .body_mut()
+            .collect_to_bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        body.as_slice()
+    );
+}
+
+#[tokio::test]
 async fn h3_response_body_delivers_error_after_buffered_data() {
     let server = MockH3Server::new().await.unwrap();
     let url = server.url();

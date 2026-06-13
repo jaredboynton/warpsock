@@ -607,19 +607,16 @@ async fn h1_compressed_streaming_decodes_incrementally() {
     let fixture = H1Fixture::start().await;
     let client = Client::builder().prefer_http2(false).build().unwrap();
 
-    let res = client
+    let mut response = client
         .get(fixture.endpoint("/compressed"))
         .version(HttpVersion::Http1_1)
         .send_streaming()
-        .await;
+        .await
+        .unwrap();
 
-    assert!(res.is_err());
-    let err = res.err().unwrap();
-    assert!(
-        matches!(err, warpsock::Error::Decompression(_)),
-        "Expected Decompression error, got {:?}",
-        err
-    );
+    assert_eq!(response.content_encoding(), Some("gzip"));
+    let body = response.body_mut().collect_to_bytes().await.unwrap();
+    assert_eq!(body, Bytes::from_static(b"hello compressed"));
 }
 
 #[tokio::test]

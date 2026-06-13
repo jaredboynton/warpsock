@@ -400,5 +400,21 @@ class TestSyncRequests:
         assert isinstance(response.text(), str)
         assert isinstance(response.bytes(), bytes)
 
+    def test_sync_client_post_with_iterable_body_stream(self, http_server):
+        def chunks():
+            yield b"one-"
+            yield b"two-"
+            yield b"three"
+
+        client = warpsock.SyncClient.builder().build()
+        request = client.post(f"{http_server}/post")
+        request.version(warpsock.HttpVersion.Http1_1)
+        request.body_stream(chunks())
+
+        response = request.send()
+        body = response.json()
+
+        assert body["data"] == "one-two-three"
+
     def test_async_client_alias_preserves_existing_client(self):
         assert warpsock.AsyncClient is warpsock.Client

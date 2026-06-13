@@ -1,6 +1,6 @@
 [package]
 name = "warpsock-python"
-version = "4.2.5"
+version = "4.2.6"
 edition = "2021"
 license = "MIT"
 description = "Python bindings for Warpsock HTTP client"

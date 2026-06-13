@@ -233,7 +233,8 @@ impl H2Handle {
                 trailers_rx,
             )),
             "HTTP/2".to_string(),
-        ))
+        )
+        .decode_streaming_content())
     }
 
     /// Attempt the inline shared-writer streaming fast path. Returns
@@ -319,7 +320,8 @@ impl H2Handle {
                     trailers_rx,
                 )),
                 "HTTP/2".to_string(),
-            )),
+            )
+            .decode_streaming_content()),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::HttpProtocol("Headers channel closed".into())),
         };

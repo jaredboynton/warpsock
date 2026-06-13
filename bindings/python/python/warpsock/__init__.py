@@ -228,10 +228,8 @@ class SyncRequestBuilder:
     def body(self, body):
         self._inner.body(body)
 
-    def body_stream(self, async_iterable):
-        raise TypeError(
-            "SyncRequestBuilder.body_stream is not supported; use AsyncClient for async iterable bodies"
-        )
+    def body_stream(self, iterable):
+        self._inner.body_stream(iterable)
 
     def json(self, json_str):
         self._inner.json(json_str)
@@ -304,7 +302,7 @@ if _NativeSyncClient is not None:
     SyncResponse = _NativeSyncResponse
 
 
-__version__ = "4.2.5"
+__version__ = "4.2.6"
 __all__ = [
     "AsyncClient",
     "Client",

@@ -279,12 +279,10 @@ impl H3Handle {
         let (status, headers, body) = self
             .send_streaming_parts_with_timeouts(method, uri, headers, body, body_timeouts)
             .await?;
-        Ok(Response::with_body(
-            status,
-            headers,
-            body,
-            "HTTP/3".to_string(),
-        ))
+        Ok(
+            Response::with_body(status, headers, body, "HTTP/3".to_string())
+                .decode_streaming_content(),
+        )
     }
 
     /// Send an HTTP/3 request and return status, headers, and body parts as

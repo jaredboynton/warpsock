@@ -375,6 +375,10 @@ impl H2Body {
         }
     }
 
+    pub(crate) fn take_trailers_rx(&mut self) -> Option<TrailerReceiver> {
+        self.trailers_rx.take()
+    }
+
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal
     }

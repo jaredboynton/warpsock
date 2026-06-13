@@ -888,7 +888,7 @@ async fn public_streaming_preserves_high_level_request_semantics_inner() {
             "upload_body_bytes": h3_body_seen.lock().await.len()
         },
         "protocol_limitations": {
-            "compressed_streaming": "explicitly unsupported; compressed streaming returns Error::Decompression in transport tests"
+            "compressed_streaming": "supported; Content-Encoding is decoded while polling the streaming body"
         }
     });
     fs::write(
@@ -994,4 +994,44 @@ async fn poll_body_hard_cutover_has_no_legacy_shim() {
             path.display()
         );
     }
+}
+
+#[test]
+fn node_types_publish_streaming_surfaces() {
+    let types = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bindings/node/index.d.ts"),
+    )
+    .unwrap();
+
+    assert!(
+        types.contains(
+            "bodyStream(asyncIterable: AsyncIterable<Buffer | Uint8Array>): RequestBuilder;"
+        ),
+        "Node declarations must expose the JS bodyStream wrapper"
+    );
+    assert!(
+        types.contains("readonly body: AsyncIterable<Buffer>;"),
+        "Node declarations must expose the async iterable response body"
+    );
+}
+
+#[test]
+fn python_async_body_stream_send_preserves_streaming_response() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bindings/python/src/lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        source.contains(
+            "let resp = if streaming {\n                                req_builder.send_streaming().await.map_err(to_py_err)?\n                            } else {"
+        ),
+        "Python async body_stream send must return the streaming Rust response after headers"
+    );
+    assert!(
+        !source.contains(
+            "let resp = req_builder.send_streaming().await.map_err(to_py_err)?;\n                                buffer_response_body(resp).await?"
+        ),
+        "Python async body_stream send must not eagerly buffer the streaming response"
+    );
 }

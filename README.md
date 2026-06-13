@@ -210,7 +210,7 @@ jar.save_to_file("cookies.txt").await?;
 
 ### Response helpers
 
-`Response::decoded_body()`, `Response::text()`, and `Response::json()` transparently decompress gzip/deflate/br/zstd payloads (including chained encodings) before decoding, which matches modern browser behavior.
+`Response::decoded_body()`, `Response::text()`, and `Response::json()` transparently decompress gzip/deflate/br/zstd payloads (including chained encodings) before decoding, which matches modern browser behavior. `send_streaming()` response bodies apply the same content codings while the body is polled, except for `206 Partial Content`, where byte ranges remain encoded.
 
 ### WebSockets
 

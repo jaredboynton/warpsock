@@ -3,6 +3,9 @@
 use crate::error::{Error, Result};
 use crate::headers::Headers;
 use crate::url::Url;
+use async_compression::tokio::bufread::{
+    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
+};
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -11,6 +14,7 @@ use std::future::Future;
 use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
 /// Public response body implementing [`http_body::Body`].
 ///
@@ -35,6 +39,312 @@ enum BodyInner {
     H2Direct(Box<crate::transport::h2::H2DirectBody>),
     H3(crate::transport::h3::H3Body),
     H3Direct(Box<crate::transport::h3::NativeH3DirectBody>),
+    Decoded(Box<DecodedBody>),
+}
+
+type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + 'static>>;
+
+const STREAM_DECODE_CHUNK_SIZE: usize = 16 * 1024;
+
+struct DecodedBody {
+    reader: BoxedAsyncRead,
+    error_context: String,
+    trailers_rx: Option<crate::transport::h2::TrailerReceiver>,
+    protocol: BodyCapacityProtocol,
+    ended: bool,
+}
+
+impl DecodedBody {
+    fn new(mut body: Body, codings: &[String]) -> Self {
+        let protocol = body.capacity().protocol;
+        let trailers_rx = body.take_h2_trailers_rx();
+        let mut reader: BoxedAsyncRead = Box::pin(BodyAsyncRead::new(body));
+        let mut applied = Vec::new();
+
+        for coding in codings.iter().rev() {
+            match coding.as_str() {
+                "gzip" | "x-gzip" => {
+                    reader = Box::pin(GzipDecoder::new(BufReader::new(reader)));
+                    applied.push("gzip");
+                }
+                "deflate" => {
+                    reader = Box::pin(DeflateCompatDecoder::new(reader));
+                    applied.push("deflate");
+                }
+                "br" => {
+                    reader = Box::pin(BrotliDecoder::new(BufReader::new(reader)));
+                    applied.push("br");
+                }
+                "zstd" => {
+                    reader = Box::pin(ZstdDecoder::new(BufReader::new(reader)));
+                    applied.push("zstd");
+                }
+                "identity" => {}
+                _ => {}
+            }
+        }
+
+        let error_context = if applied.is_empty() {
+            "content-encoding".to_string()
+        } else {
+            format!("content-encoding {}", applied.join(", "))
+        };
+
+        Self {
+            reader,
+            error_context,
+            trailers_rx,
+            protocol,
+            ended: false,
+        }
+    }
+
+    async fn trailers(&mut self) -> Result<Option<Headers>> {
+        let Some(rx) = self.trailers_rx.take() else {
+            return Ok(None);
+        };
+        match rx.await {
+            Err(_) => Ok(None),
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(headers)) => Ok(Some(Headers::from(headers))),
+        }
+    }
+
+    fn poll_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Bytes, Error>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+
+        let mut buffer = [0_u8; STREAM_DECODE_CHUNK_SIZE];
+        let mut read_buf = ReadBuf::new(&mut buffer);
+        match self.reader.as_mut().poll_read(cx, &mut read_buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let filled = read_buf.filled();
+                if filled.is_empty() {
+                    self.ended = true;
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(Bytes::copy_from_slice(filled))))
+                }
+            }
+            Poll::Ready(Err(error)) => {
+                self.ended = true;
+                Poll::Ready(Some(Err(decode_stream_error(&self.error_context, error))))
+            }
+        }
+    }
+}
+
+struct BodyAsyncRead {
+    body: Body,
+    current: Option<Bytes>,
+    offset: usize,
+}
+
+impl BodyAsyncRead {
+    fn new(body: Body) -> Self {
+        Self {
+            body,
+            current: None,
+            offset: 0,
+        }
+    }
+}
+
+impl AsyncRead for BodyAsyncRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if self.current.is_some() {
+                let n = {
+                    let chunk = self.current.as_ref().expect("checked current chunk");
+                    let remaining = &chunk[self.offset..];
+                    let n = remaining.len().min(buf.remaining());
+                    buf.put_slice(&remaining[..n]);
+                    n
+                };
+                self.offset += n;
+                if self
+                    .current
+                    .as_ref()
+                    .map(|chunk| self.offset == chunk.len())
+                    .unwrap_or(false)
+                {
+                    self.current = None;
+                    self.offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.body).poll_chunk(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    self.current = Some(bytes);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    return Poll::Ready(Err(std::io::Error::other(BodyReadError(error))));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+struct DeflateCompatDecoder {
+    state: DeflateCompatState,
+}
+
+enum DeflateCompatState {
+    Probe {
+        reader: Option<BoxedAsyncRead>,
+        prefix: [u8; 2],
+        len: usize,
+    },
+    Decode(BoxedAsyncRead),
+}
+
+impl DeflateCompatDecoder {
+    fn new(reader: BoxedAsyncRead) -> Self {
+        Self {
+            state: DeflateCompatState::Probe {
+                reader: Some(reader),
+                prefix: [0; 2],
+                len: 0,
+            },
+        }
+    }
+}
+
+impl AsyncRead for DeflateCompatDecoder {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            match &mut self.state {
+                DeflateCompatState::Probe {
+                    reader,
+                    prefix,
+                    len,
+                } => {
+                    while *len < prefix.len() {
+                        let mut byte = [0_u8; 1];
+                        let mut read_buf = ReadBuf::new(&mut byte);
+                        match reader
+                            .as_mut()
+                            .expect("deflate probe reader present")
+                            .as_mut()
+                            .poll_read(cx, &mut read_buf)
+                        {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Ready(Ok(())) => {
+                                let filled = read_buf.filled();
+                                if filled.is_empty() {
+                                    break;
+                                }
+                                prefix[*len] = filled[0];
+                                *len += 1;
+                            }
+                        }
+                    }
+
+                    let reader = reader.take().expect("deflate probe reader present");
+                    let prefix_bytes = Bytes::copy_from_slice(&prefix[..*len]);
+                    let prefixed: BoxedAsyncRead =
+                        Box::pin(PrefixedAsyncRead::new(prefix_bytes, reader));
+                    let decoder: BoxedAsyncRead = if looks_like_zlib_header(&prefix[..*len]) {
+                        Box::pin(ZlibDecoder::new(BufReader::new(prefixed)))
+                    } else {
+                        Box::pin(DeflateDecoder::new(BufReader::new(prefixed)))
+                    };
+                    self.state = DeflateCompatState::Decode(decoder);
+                }
+                DeflateCompatState::Decode(reader) => {
+                    return reader.as_mut().poll_read(cx, buf);
+                }
+            }
+        }
+    }
+}
+
+struct PrefixedAsyncRead {
+    prefix: Bytes,
+    offset: usize,
+    reader: BoxedAsyncRead,
+}
+
+impl PrefixedAsyncRead {
+    fn new(prefix: Bytes, reader: BoxedAsyncRead) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            reader,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedAsyncRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset < self.prefix.len() {
+            let remaining = &self.prefix[self.offset..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.offset += n;
+            return Poll::Ready(Ok(()));
+        }
+        self.reader.as_mut().poll_read(cx, buf)
+    }
+}
+
+fn looks_like_zlib_header(prefix: &[u8]) -> bool {
+    if prefix.len() < 2 {
+        return false;
+    }
+    let cmf = prefix[0];
+    let flg = prefix[1];
+    (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
+}
+
+#[derive(Debug)]
+struct BodyReadError(Error);
+
+impl fmt::Display for BodyReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for BodyReadError {}
+
+fn decode_stream_error(context: &str, error: std::io::Error) -> Error {
+    let message = error.to_string();
+    match error.into_inner() {
+        Some(inner) => match inner.downcast::<BodyReadError>() {
+            Ok(body_error) => body_error.0,
+            Err(inner) => Error::Decompression(format!("{}: {}", context, inner)),
+        },
+        None => Error::Decompression(format!("{}: {}", context, message)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +425,29 @@ impl Body {
         }
     }
 
+    pub(crate) fn with_content_decoding(self, codings: &[String]) -> Self {
+        if !codings
+            .iter()
+            .any(|coding| is_streaming_content_coding(coding))
+        {
+            return self;
+        }
+        Self {
+            inner: BodyInner::Decoded(Box::new(DecodedBody::new(self, codings))),
+        }
+    }
+
+    fn is_content_decoded(&self) -> bool {
+        matches!(self.inner, BodyInner::Decoded(_))
+    }
+
+    fn take_h2_trailers_rx(&mut self) -> Option<crate::transport::h2::TrailerReceiver> {
+        match &mut self.inner {
+            BodyInner::H2(body) => body.take_trailers_rx(),
+            _ => None,
+        }
+    }
+
     /// Await HTTP/2 response trailers for this body, if any.
     ///
     /// Only H2 streaming bodies can carry trailers, and only when the caller
@@ -128,6 +461,7 @@ impl Body {
     pub async fn trailers(&mut self) -> Result<Option<Headers>> {
         match &mut self.inner {
             BodyInner::H2(body) => body.trailers().await,
+            BodyInner::Decoded(body) => body.trailers().await,
             BodyInner::Empty
             | BodyInner::Buffered(_)
             | BodyInner::H1(_)
@@ -148,7 +482,8 @@ impl Body {
             | BodyInner::H2(_)
             | BodyInner::H2Direct(_)
             | BodyInner::H3(_)
-            | BodyInner::H3Direct(_) => false,
+            | BodyInner::H3Direct(_)
+            | BodyInner::Decoded(_) => false,
         }
     }
 
@@ -161,6 +496,7 @@ impl Body {
                 | BodyInner::H2Direct(_)
                 | BodyInner::H3(_)
                 | BodyInner::H3Direct(_)
+                | BodyInner::Decoded(_)
         )
     }
 
@@ -183,7 +519,8 @@ impl Body {
             | BodyInner::H2(_)
             | BodyInner::H2Direct(_)
             | BodyInner::H3(_)
-            | BodyInner::H3Direct(_) => None,
+            | BodyInner::H3Direct(_)
+            | BodyInner::Decoded(_) => None,
         }
     }
 
@@ -193,6 +530,7 @@ impl Body {
         match &self.inner {
             BodyInner::H3(body) => Some(body.capacity()),
             BodyInner::H3Direct(body) => Some(body.capacity()),
+            BodyInner::Decoded(_) => None,
             _ => None,
         }
     }
@@ -280,6 +618,15 @@ impl Body {
                     ended: capacity.ended,
                 }
             }
+            BodyInner::Decoded(body) => BodyCapacity {
+                protocol: body.protocol,
+                buffer_capacity: 0,
+                buffered_chunks: 0,
+                available_slots: 0,
+                buffered_bytes: 0,
+                closed: body.ended,
+                ended: body.ended,
+            },
         }
     }
 
@@ -338,6 +685,7 @@ impl fmt::Debug for Body {
             BodyInner::H2Direct(_) => f.debug_struct("Body::H2DirectStreaming").finish(),
             BodyInner::H3(_) => f.debug_struct("Body::H3Streaming").finish(),
             BodyInner::H3Direct(_) => f.debug_struct("Body::H3DirectStreaming").finish(),
+            BodyInner::Decoded(_) => f.debug_struct("Body::DecodedStreaming").finish(),
         }
     }
 }
@@ -356,7 +704,8 @@ impl Clone for Body {
             | BodyInner::H2(_)
             | BodyInner::H2Direct(_)
             | BodyInner::H3(_)
-            | BodyInner::H3Direct(_) => {
+            | BodyInner::H3Direct(_)
+            | BodyInner::Decoded(_) => {
                 panic!("warpsock::Body::clone is not supported for streaming bodies")
             }
         }
@@ -388,6 +737,12 @@ impl HttpBody for Body {
             BodyInner::H2Direct(body) => Pin::new(body.as_mut()).poll_frame(cx),
             BodyInner::H3(body) => Pin::new(body).poll_frame(cx),
             BodyInner::H3Direct(body) => Pin::new(body.as_mut()).poll_frame(cx),
+            BodyInner::Decoded(body) => match body.poll_chunk(cx) {
+                Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 
@@ -401,6 +756,7 @@ impl HttpBody for Body {
             BodyInner::H2Direct(body) => body.is_terminal(),
             BodyInner::H3(body) => body.is_terminal(),
             BodyInner::H3Direct(body) => body.is_terminal(),
+            BodyInner::Decoded(body) => body.ended,
         }
     }
 
@@ -414,6 +770,7 @@ impl HttpBody for Body {
             BodyInner::H2Direct(body) => body.size_hint(),
             BodyInner::H3(body) => body.size_hint(),
             BodyInner::H3Direct(body) => body.size_hint(),
+            BodyInner::Decoded(_) => SizeHint::new(),
         }
     }
 }
@@ -443,6 +800,7 @@ impl Body {
                 Poll::Pending => Poll::Pending,
             },
             BodyInner::H3(body) => Pin::new(body).poll_data(cx),
+            BodyInner::Decoded(body) => body.poll_chunk(cx),
         }
     }
 }
@@ -513,6 +871,28 @@ impl Response {
             http_version,
             effective_url: None,
         }
+    }
+
+    pub(crate) fn decode_streaming_content(mut self) -> Self {
+        if self.status == 206
+            || !self.body.is_streaming()
+            || self.body.is_content_decoded()
+            || !self.headers.contains("content-encoding")
+        {
+            return self;
+        }
+
+        let codings = content_encoding_tokens(&self.headers);
+        if !codings
+            .iter()
+            .any(|coding| is_streaming_content_coding(coding))
+        {
+            return self;
+        }
+
+        let body = std::mem::take(&mut self.body);
+        self.body = body.with_content_decoding(&codings);
+        self
     }
 
     pub(crate) fn into_status_headers_version(self) -> (u16, Headers, String) {
@@ -637,15 +1017,12 @@ impl Response {
             Error::HttpProtocol("response body is streaming, not buffered".into())
         })?;
 
-        let encodings: Vec<&str> = self
-            .content_encoding()
-            .map(|s| s.split(',').map(str::trim).collect())
-            .unwrap_or_default();
+        let encodings = content_encoding_tokens(&self.headers);
 
         if !encodings.is_empty() {
             let mut data = body.clone();
             for encoding in encodings.iter().rev() {
-                data = match encoding.to_lowercase().as_str() {
+                data = match encoding.as_str() {
                     "gzip" | "x-gzip" => decode_gzip(&data)?,
                     "deflate" => decode_deflate(&data)?,
                     "br" => decode_brotli(&data)?,
@@ -708,6 +1085,20 @@ impl Response {
             Ok(self)
         }
     }
+}
+
+fn content_encoding_tokens(headers: &Headers) -> Vec<String> {
+    headers
+        .get_all("Content-Encoding")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_streaming_content_coding(coding: &str) -> bool {
+    matches!(coding, "gzip" | "x-gzip" | "deflate" | "br" | "zstd")
 }
 
 fn decode_gzip(data: &[u8]) -> Result<Bytes> {

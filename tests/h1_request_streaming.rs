@@ -13,6 +13,7 @@ use warpsock::{Client, Error, HttpVersion, RedirectPolicy};
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
+    method: String,
     path: String,
     headers: Vec<(String, String)>,
     raw_body: Vec<u8>,
@@ -97,12 +98,14 @@ async fn handle_connection(mut stream: TcpStream, requests: Arc<Mutex<Vec<Captur
         let header_end = buffer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let header_bytes = buffer[..header_end].to_vec();
         let request_text = String::from_utf8_lossy(&header_bytes);
-        let path = request_text
+        let request_line = request_text
             .lines()
             .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/")
+            .unwrap_or("GET / HTTP/1.1")
             .to_string();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or("GET").to_string();
+        let path = request_parts.next().unwrap_or("/").to_string();
         let headers = request_text
             .lines()
             .skip(1)
@@ -128,27 +131,23 @@ async fn handle_connection(mut stream: TcpStream, requests: Arc<Mutex<Vec<Captur
         };
 
         requests.lock().await.push(CapturedRequest {
+            method,
             path: path.clone(),
             headers,
             raw_body,
             decoded_body,
         });
 
-        if path == "/redirect" {
-            stream
-                .write_all(
-                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        } else {
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
-                )
-                .await
-                .unwrap();
-        }
+        let response = match path.as_str() {
+            "/redirect" => {
+                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".as_slice()
+            }
+            "/redirect303" => {
+                b"HTTP/1.1 303 See Other\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".as_slice()
+            }
+            _ => b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok".as_slice(),
+        };
+        stream.write_all(response).await.unwrap();
         stream.flush().await.unwrap();
     }
 }
@@ -327,5 +326,44 @@ async fn h1_stream_redirect_requiring_replay_fails_closed() {
     assert!(
         polls.load(Ordering::SeqCst) >= 2,
         "the first request body may be sent, but it must never be replayed as empty"
+    );
+}
+
+#[tokio::test]
+async fn h1_stream_redirect_switch_to_get_does_not_replay_body() {
+    let fixture = H1UploadFixture::start().await;
+    let client = Client::builder()
+        .prefer_http2(false)
+        .redirect_policy(RedirectPolicy::Limited(3))
+        .build()
+        .unwrap();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let response = client
+        .post(fixture.endpoint("/redirect303"))
+        .version(HttpVersion::Http1_1)
+        .body_stream(CountingStream::new(&[b"abc"], polls.clone()))
+        .send_streaming()
+        .await
+        .unwrap();
+
+    assert_eq!(collect(response).await, b"ok");
+
+    let requests = fixture.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/redirect303");
+    assert_eq!(requests[0].decoded_body, b"abc");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[1].path, "/final");
+    assert_eq!(requests[1].decoded_body, b"");
+    assert_eq!(
+        header_value(&requests[1].headers, "transfer-encoding"),
+        None
+    );
+    assert_eq!(header_value(&requests[1].headers, "content-length"), None);
+    assert!(
+        polls.load(Ordering::SeqCst) >= 2,
+        "the upload stream should be consumed once by the first request"
     );
 }
