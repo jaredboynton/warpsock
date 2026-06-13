@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "warpsock"
-version = "4.2.4"
+version = "4.2.5"
 description = "Python bindings for Warpsock, a Chrome-accurate HTTP client with TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSocket fingerprinting. Improved TTFT and TPS for LLMs."
 readme = "README_PYPI.md"
 license = "MIT"

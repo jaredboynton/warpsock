@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "warpsock"
-version = "4.2.4"
+version = "4.2.5"
 dependencies = [
  "atomic-waker",
  "base64",
@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "warpsock-node"
-version = "4.2.4"
+version = "4.2.5"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "warpsock-python"
-version = "4.2.4"
+version = "4.2.5"
 dependencies = [
  "bytes",
  "futures-core",

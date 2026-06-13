@@ -5,11 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.5] - 2026-06-13
+
+### Fixed
+
+- Fixed the Python release wheel smoke so tests run from a clean temporary directory after installing the built wheel, preventing the source tree from shadowing the installed `warpsock.warpsock` extension.
+- Hardened Node and Python release jobs against transient crates.io HTTP/2 index fetch failures by disabling Cargo HTTP multiplexing in those workflows.
+
 ## [4.2.4] - 2026-06-13
 
 ### Changed
 
-- Renamed the published project from Specter/Specters to Warpsock across the Rust crate, npm package family, PyPI distribution, repository metadata, docs, and binding module names. Migration map: Rust `specters` with crate path `specter` becomes `warpsock`; npm `specters` and `specters-*` native packages become `warpsock` and `warpsock-*`; PyPI `specters` and Python module `specter` become `warpsock`. The old package names remain available for existing lockfiles and now point users at Warpsock.
+- Published the first Warpsock Rust crate after the project rename from Specter/Specters. Migration map: Rust `specters` with crate path `specter` becomes `warpsock`; npm `specters` and `specters-*` native packages become `warpsock` and `warpsock-*`; PyPI `specters` and Python module `specter` become `warpsock`. The old package names remain available for existing lockfiles and now point users at Warpsock.
 - Refreshed the published README examples for the renamed crate, current dependency line, non-deprecated timeout builder API, and repository-checkout-only example commands.
 
 ## [4.2.3] - 2026-06-09

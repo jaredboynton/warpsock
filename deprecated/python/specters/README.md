@@ -10,4 +10,4 @@ python -m pip install warpsock
 import warpsock
 ```
 
-This bridge package depends on `warpsock==4.2.4` and keeps `import specter` available during migration.
+This bridge package depends on `warpsock==4.2.5` and keeps `import specter` available during migration.

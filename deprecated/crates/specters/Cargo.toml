@@ -1,6 +1,6 @@
 [package]
 name = "specters"
-version = "4.2.4"
+version = "4.2.5"
 edition = "2021"
 license = "MIT"
 description = "Deprecated package name for Warpsock. Depend on warpsock instead."
@@ -16,4 +16,4 @@ name = "specter"
 path = "src/lib.rs"
 
 [dependencies]
-warpsock = "4.2.4"
+warpsock = "4.2.5"

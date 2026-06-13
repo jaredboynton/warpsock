@@ -18,6 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_HTTP_MULTIPLEXING: false
 
 jobs:
   preflight:
@@ -201,8 +202,11 @@ jobs:
       - name: Run tests
         run: |
           . .venv/bin/activate
-          cd bindings/python
-          pytest tests/ -v
+          unset PYTHONPATH
+          python -c "import warpsock; print('loaded:', warpsock.__file__)"
+          test_dir="$(mktemp -d)"
+          cp -R bindings/python/tests "$test_dir/tests"
+          (cd "$test_dir" && python -m pytest tests/ -v)
 
   test-linux:
     name: Test wheel (Linux ${{ matrix.target }})
