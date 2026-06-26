@@ -835,10 +835,21 @@ impl<'a> RequestBuilder<'a> {
 
         let url = self.url.ok_or_else(|| Error::missing("url"))?;
 
+        let mut headers = self.headers;
+        // A request with no Accept-Encoding is a strong bot signal: real browsers
+        // always advertise it. Cloudflare challenges such requests from datacenter
+        // egress (returning a 403 interstitial) while letting them through from
+        // residential IPs, which is why an omitted Accept-Encoding only fails in CI.
+        // Default it to the Chrome set so no caller can trip the challenge by leaving
+        // it off; an explicit Accept-Encoding from the caller is left untouched.
+        if !headers.contains("accept-encoding") {
+            headers.append("Accept-Encoding", "gzip, deflate, br, zstd");
+        }
+
         Ok(Request {
             method: self.method,
             url,
-            headers: self.headers,
+            headers,
             body: self.body,
             version: self.version,
             timeout: self.timeout,

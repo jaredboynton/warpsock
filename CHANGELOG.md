@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.8] - 2026-06-26
+
+### Fixed
+
+- Requests built without an `Accept-Encoding` header now default it to `gzip, deflate, br, zstd` in `RequestBuilder::build()`. A request with no `Accept-Encoding` is a strong bot signal: Cloudflare serves such requests a `403` challenge interstitial from datacenter egress (e.g. CI runners) while passing them from residential IPs, so the omission only failed in CI. An explicit caller-supplied `Accept-Encoding` is preserved verbatim.
+
 ## [4.2.7] - 2026-06-13
 
 ### Added
