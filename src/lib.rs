@@ -8,7 +8,7 @@
 // Opt-in mimalloc as the global allocator. Enabled via the `mimalloc`
 // feature; ships off by default so the system allocator continues to
 // govern downstream consumers that do not opt in.
-#[cfg(feature = "mimalloc")]
+#[cfg(all(feature = "mimalloc", not(feature = "test-counting-alloc")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -39,7 +39,7 @@ pub mod pool;
 // Re-exports for convenient access
 pub use cookie::{hash_cookie_value, CookieJar};
 pub use error::{Error, Result};
-pub use fingerprint::{FingerprintProfile, PriorityTree};
+pub use fingerprint::{FingerprintProfile, PrioritySignals, PriorityTree};
 #[cfg(feature = "grpc")]
 pub use grpc::{encode_message, GrpcEncoding, GrpcFramer};
 pub use headers::Headers;

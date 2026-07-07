@@ -383,3 +383,53 @@ fn assert_error_mentions<E: std::fmt::Debug + std::fmt::Display>(err: &E, needle
         "error did not mention any of {needles:?}: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workstream B2 (WS): reserved-bit / opcode fail-closed sweep (RFC 6455 §5.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rsv2_bit_without_extension_triggers_protocol_close_1002() {
+    // 0xA0 = FIN + RSV2 (0x20) + Pong(0xa) -> RSV2 set with no negotiated ext.
+    expect_protocol_error_close(server_frame_raw(0xA0, b""), 1002).await;
+}
+
+#[tokio::test]
+async fn rsv3_bit_without_extension_triggers_protocol_close_1002() {
+    // 0x92 = FIN + RSV3 (0x10) + Binary(0x2) -> RSV3 set with no negotiated ext.
+    expect_protocol_error_close(server_frame_raw(0x92, b""), 1002).await;
+}
+
+#[tokio::test]
+async fn all_reserved_non_control_opcodes_trigger_protocol_close_1002() {
+    // RFC 6455 §5.2: opcodes 0x3-0x7 are reserved for future non-control frames
+    // and MUST fail the connection.
+    for opcode in 0x3u8..=0x7 {
+        expect_protocol_error_close(server_frame_raw(0x80 | opcode, b""), 1002).await;
+    }
+}
+
+#[tokio::test]
+async fn all_reserved_control_opcodes_trigger_protocol_close_1002() {
+    // RFC 6455 §5.2: opcodes 0xB-0xF are reserved for future control frames
+    // and MUST fail the connection.
+    for opcode in 0xBu8..=0xF {
+        expect_protocol_error_close(server_frame_raw(0x80 | opcode, b""), 1002).await;
+    }
+}
+
+#[tokio::test]
+async fn fragmented_close_control_frame_triggers_protocol_close_1002() {
+    // Control frames (Close/Ping/Pong) MUST NOT be fragmented.
+    expect_protocol_error_close(
+        server_frame_with_fin(false, 0x8, &1000_u16.to_be_bytes()),
+        1002,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_close_control_frame_triggers_protocol_close_1002() {
+    // Control frames MUST have payload <= 125 bytes; 126 bytes must fail-close.
+    expect_protocol_error_close(server_frame_with_fin(true, 0x8, &[0u8; 126]), 1002).await;
+}

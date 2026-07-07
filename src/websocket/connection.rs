@@ -1,10 +1,11 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::url::Url;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::time::timeout as tokio_timeout;
+use tokio::time::{timeout as tokio_timeout, Instant, Sleep};
 
 use crate::transport::connector::MaybeHttpsStream;
 use crate::websocket::error::{WebSocketError, WebSocketResult};
@@ -18,6 +19,69 @@ use crate::websocket::WebSocketConfig;
 
 const READ_CHUNK_SIZE: usize = 16 * 1024;
 const INITIAL_READ_CAPACITY: usize = 16 * 1024;
+
+/// Reusable read-deadline timer.
+///
+/// A2c: rather than wrapping every `read_buf` in a fresh `tokio::time::timeout`
+/// (which allocates a new timer-wheel entry per read — a per-frame cost on the
+/// hot receive path), we keep a single `Sleep` future pinned on the heap and
+/// `reset` it to a new deadline before each read. Tokio's timer wheel reuses
+/// the underlying entry across resets, so a steady stream of frames performs
+/// zero timer allocations after the first read. When no `read_timeout` is set
+/// the timer is never created.
+#[derive(Debug)]
+struct ReadTimer {
+    timeout: Option<Duration>,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl ReadTimer {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            sleep: None,
+        }
+    }
+
+    /// Await `future` under the read deadline, reusing the pinned `Sleep`.
+    async fn read<T, F>(
+        &mut self,
+        url: &Url,
+        operation: &'static str,
+        future: F,
+    ) -> WebSocketResult<T>
+    where
+        F: Future<Output = std::io::Result<T>>,
+    {
+        let result = match self.timeout {
+            Some(duration) => {
+                let deadline = Instant::now() + duration;
+                match self.sleep.as_mut() {
+                    // Reuse the existing timer entry.
+                    Some(sleep) => sleep.as_mut().reset(deadline),
+                    None => self.sleep = Some(Box::pin(tokio::time::sleep_until(deadline))),
+                }
+                let sleep = self
+                    .sleep
+                    .as_mut()
+                    .expect("sleep was just initialized above");
+                tokio::select! {
+                    biased;
+                    result = future => result,
+                    _ = sleep.as_mut() => {
+                        return Err(WebSocketError::Timeout {
+                            url: url.to_string(),
+                            operation: format!("{operation} after {:?}", duration),
+                        });
+                    }
+                }
+            }
+            None => future.await,
+        };
+
+        result.map_err(|error| WebSocketError::io(url, error))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSocketFrameOpcode {
@@ -68,8 +132,8 @@ pub struct WebSocket {
     write_buffer: BytesMut,
     frame_config: FrameConfig,
     extensions: WebSocketExtensions,
-    read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    read_timer: ReadTimer,
     decoder: FrameDecoder,
     deflate_encoder: Option<PermessageDeflateEncoder>,
     mask_rng: MaskRng,
@@ -84,7 +148,7 @@ pub struct WebSocketReader {
     read_buffer: BytesMut,
     frame_config: FrameConfig,
     extensions: WebSocketExtensions,
-    read_timeout: Option<Duration>,
+    read_timer: ReadTimer,
     decoder: FrameDecoder,
     close_received: bool,
 }
@@ -124,8 +188,8 @@ impl WebSocket {
             write_buffer: BytesMut::with_capacity(READ_CHUNK_SIZE),
             frame_config: FrameConfig::new(config.max_frame_size, config.max_message_size),
             extensions,
-            read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
+            read_timer: ReadTimer::new(config.read_timeout),
             decoder: FrameDecoder::with_extensions(extensions),
             deflate_encoder: extensions
                 .permessage_deflate
@@ -152,7 +216,7 @@ impl WebSocket {
             read_buffer: self.read_buffer,
             frame_config: self.frame_config,
             extensions: self.extensions,
-            read_timeout: self.read_timeout,
+            read_timer: self.read_timer,
             decoder: self.decoder,
             close_received: self.close_received,
         };
@@ -211,7 +275,7 @@ impl WebSocket {
     pub async fn next_frame(&mut self) -> WebSocketResult<Option<WebSocketFrame>> {
         Self::read_next_frame(
             &self.url,
-            self.read_timeout,
+            &mut self.read_timer,
             &mut self.stream,
             &mut self.read_buffer,
             self.frame_config,
@@ -260,13 +324,14 @@ impl WebSocket {
                 }
             } else {
                 self.read_buffer.reserve(READ_CHUNK_SIZE);
-                let n = Self::io_with_timeout(
-                    &self.url,
-                    self.read_timeout,
-                    "read",
-                    self.stream.read_buf(&mut self.read_buffer),
-                )
-                .await?;
+                let n = self
+                    .read_timer
+                    .read(
+                        &self.url,
+                        "read",
+                        self.stream.read_buf(&mut self.read_buffer),
+                    )
+                    .await?;
                 if n == 0 {
                     return if self.close_sent || self.close_received {
                         Ok(None)
@@ -407,7 +472,7 @@ impl WebSocket {
 
     async fn read_next_frame<S>(
         url: &Url,
-        read_timeout: Option<Duration>,
+        read_timer: &mut ReadTimer,
         stream: &mut S,
         read_buffer: &mut BytesMut,
         frame_config: FrameConfig,
@@ -425,7 +490,8 @@ impl WebSocket {
                 }));
             }
             read_buffer.reserve(READ_CHUNK_SIZE);
-            let n = Self::io_with_timeout(url, read_timeout, "read", stream.read_buf(read_buffer))
+            let n = read_timer
+                .read(url, "read", stream.read_buf(read_buffer))
                 .await?;
             if n == 0 {
                 return Ok(None);
@@ -438,7 +504,7 @@ impl WebSocketReader {
     pub async fn next_frame(&mut self) -> WebSocketResult<Option<WebSocketFrame>> {
         WebSocket::read_next_frame(
             &self.url,
-            self.read_timeout,
+            &mut self.read_timer,
             &mut self.stream,
             &mut self.read_buffer,
             self.frame_config,
@@ -469,13 +535,14 @@ impl WebSocketReader {
                 }
             } else {
                 self.read_buffer.reserve(READ_CHUNK_SIZE);
-                let n = WebSocket::io_with_timeout(
-                    &self.url,
-                    self.read_timeout,
-                    "read",
-                    self.stream.read_buf(&mut self.read_buffer),
-                )
-                .await?;
+                let n = self
+                    .read_timer
+                    .read(
+                        &self.url,
+                        "read",
+                        self.stream.read_buf(&mut self.read_buffer),
+                    )
+                    .await?;
                 if n == 0 {
                     return if self.close_received {
                         Ok(None)

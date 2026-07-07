@@ -1,6 +1,6 @@
 [package]
 name = "warpsock"
-version = "4.2.8"
+version = "4.3.0"
 edition = "2021"
 license = "MIT"
 description = "Rust HTTP client with browser-like Chrome and Firefox fingerprints across TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSockets"
@@ -38,6 +38,12 @@ mimalloc = ["dep:mimalloc"]
 # non-optional flate2 dependency for per-message gzip. Never compiled into the
 # default build or the perf-gate benchmark.
 grpc = []
+# Test-only: suppress the crate's mimalloc `#[global_allocator]` so an
+# integration-test binary can install its own counting allocator for the
+# allocation-budget regression tests (see tests/websocket_alloc_budget.rs).
+# Enabled implicitly under `--all-features` (which `just test-one`/`just test`
+# use); never enabled in release/bench builds, so mimalloc still governs those.
+test-counting-alloc = []
 
 [dependencies]
 # TLS with BoringSSL

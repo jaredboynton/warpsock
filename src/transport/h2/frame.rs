@@ -28,6 +28,8 @@ pub enum FrameType {
     GoAway = 0x7,
     WindowUpdate = 0x8,
     Continuation = 0x9,
+    /// RFC 9218 §7.2 PRIORITY_UPDATE frame (type 0x10, request-stream form).
+    PriorityUpdate = 0x10,
     Unknown(u8),
 }
 
@@ -44,6 +46,7 @@ impl From<u8> for FrameType {
             0x7 => Self::GoAway,
             0x8 => Self::WindowUpdate,
             0x9 => Self::Continuation,
+            0x10 => Self::PriorityUpdate,
             other => Self::Unknown(other),
         }
     }
@@ -62,6 +65,7 @@ impl From<FrameType> for u8 {
             FrameType::GoAway => 0x7,
             FrameType::WindowUpdate => 0x8,
             FrameType::Continuation => 0x9,
+            FrameType::PriorityUpdate => 0x10,
             FrameType::Unknown(v) => v,
         }
     }
@@ -1001,6 +1005,83 @@ impl RstStreamFrame {
         Ok(Self {
             stream_id,
             error_code,
+        })
+    }
+}
+
+/// RFC 9218 §7.2 PRIORITY_UPDATE frame for HTTP/2.
+///
+/// Wire format (RFC 9218 §7.2):
+/// - Frame type `0x10`, always sent on stream 0 (the connection control stream).
+/// - Payload: a 32-bit `Prioritized Stream ID` (reserved high bit MUST be 0),
+///   followed by the `Priority Field Value` — an ASCII structured-field
+///   dictionary identical to the `priority` header value (e.g. `u=3, i`).
+///
+/// Warpsock emits this only when a fingerprint profile opts into RFC 9218
+/// (`Http2Settings::priority_signals`); the certified Chrome/Firefox profiles
+/// do not, so this stays off by default (see `fingerprint::http2`). The parser
+/// exists primarily for grease-tolerance: a server MAY send PRIORITY_UPDATE and
+/// the client MUST NOT treat it as an error (RFC 9218 §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorityUpdateFrame {
+    /// Stream this update reprioritizes.
+    pub prioritized_stream_id: u32,
+    /// Priority field value (structured-field dictionary, e.g. `u=3, i`).
+    pub field_value: Bytes,
+}
+
+impl PriorityUpdateFrame {
+    /// Frame type identifier per RFC 9218 §7.2.
+    pub const TYPE: u8 = 0x10;
+
+    /// Create a new PRIORITY_UPDATE frame for the given prioritized stream.
+    pub fn new(prioritized_stream_id: u32, field_value: impl Into<Bytes>) -> Self {
+        Self {
+            prioritized_stream_id: prioritized_stream_id & 0x7fff_ffff,
+            field_value: field_value.into(),
+        }
+    }
+
+    /// Serialize to bytes (including the 9-byte frame header). PRIORITY_UPDATE
+    /// is always emitted on stream 0 with no flags.
+    pub fn serialize(&self) -> BytesMut {
+        let payload_len = 4 + self.field_value.len();
+        let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload_len);
+
+        let header = FrameHeader {
+            length: payload_len as u32,
+            frame_type: FrameType::PriorityUpdate,
+            flags: 0,
+            stream_id: 0,
+        };
+        header.serialize(&mut buf);
+
+        // Reserved bit MUST be 0 (RFC 9218 §7.2); mask defensively.
+        buf.put_u32(self.prioritized_stream_id & 0x7fff_ffff);
+        buf.extend_from_slice(&self.field_value);
+        buf
+    }
+
+    /// Parse a PRIORITY_UPDATE frame payload.
+    ///
+    /// Per RFC 9218 §7.2 a PRIORITY_UPDATE frame is sent on stream 0; a frame
+    /// on any other stream is a connection error. The reserved high bit of the
+    /// Prioritized Stream ID is ignored on receipt. Malformed structured-field
+    /// values are NOT rejected here: RFC 9218 §7 requires that unparseable
+    /// priority field values be ignored, not errored — the caller keeps
+    /// `field_value` as-received and simply does not act on it.
+    pub fn parse(stream_id: u32, mut payload: Bytes) -> Result<Self, String> {
+        if stream_id != 0 {
+            return Err("PRIORITY_UPDATE frame must be sent on stream 0".to_string());
+        }
+        if payload.len() < 4 {
+            return Err("PRIORITY_UPDATE frame payload shorter than 4 bytes".to_string());
+        }
+        let raw = payload.get_u32();
+        let prioritized_stream_id = raw & 0x7fff_ffff;
+        Ok(Self {
+            prioritized_stream_id,
+            field_value: payload,
         })
     }
 }

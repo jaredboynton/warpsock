@@ -361,3 +361,14 @@ clean-boringssl-cache:
 [group('cleanup')]
 clean-incremental:
     rm -rf target/debug/incremental
+
+# =============================================================================
+# CONFORMANCE (opt-in; requires Docker)
+# =============================================================================
+
+# Run the Autobahn TestSuite (RFC 6455 / 7692) conformance harness.
+# Requires Docker; NOT part of `just test`. Archives the report under
+# docs/benchmarks/autobahn/<date>/ and gates on zero FAILED cases.
+[group('conformance')]
+autobahn:
+    bash scripts/autobahn.sh

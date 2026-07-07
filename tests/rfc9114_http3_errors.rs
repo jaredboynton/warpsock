@@ -50,3 +50,23 @@ async fn test_h3_dns_resolution_failure() {
         err
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workstream B2 (H3): high-level malformed-input tolerance (RFC 9114 §9)
+// ---------------------------------------------------------------------------
+//
+// Codec-level frame-tolerance assertions (unknown frame types, grease frames,
+// MAX_PUSH_ID, QPACK dynamic-table edge cases, truncated frames) live in
+// tests/h3_native_codec.rs where the H3Frame codec is exported. These tests
+// keep the client-facing error-path assertions for RFC 9114 §9.
+
+#[tokio::test]
+async fn test_h3_request_target_without_authority_is_rejected() {
+    // RFC 9114 §4.3.1 requires :authority; a URL with no host must fail rather
+    // than emit a malformed request.
+    let client = H3Client::new();
+    let result = client
+        .send_request("https:///path-only", "GET", vec![], None)
+        .await;
+    assert!(result.is_err(), "URL without authority must be rejected");
+}

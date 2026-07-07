@@ -12,7 +12,7 @@ use crate::timeouts::Timeouts;
 use crate::transport::connector::{AlpnProtocol, BoringConnector};
 use crate::transport::h1_h2::Client;
 
-use super::extension::{PermessageDeflateConfig, WebSocketExtensions};
+use super::extension::{PermessageDeflateOffer, WebSocketExtensions};
 use super::handshake::{
     build_handshake_request, map_websocket_url, perform_handshake, HandshakeTimeouts,
 };
@@ -91,11 +91,25 @@ impl<'a> WebSocketBuilder<'a> {
         self
     }
 
+    /// Offer permessage-deflate with warpsock's default no-context-takeover
+    /// offer (`client_no_context_takeover; server_no_context_takeover`), which
+    /// bounds compressor/decompressor memory. No certified Chrome WebSocket
+    /// capture exists under `docs/fingerprints/` to justify flipping this
+    /// default, so it preserves the historical memory profile; use
+    /// [`permessage_deflate_with`](Self::permessage_deflate_with) for a
+    /// Chrome-style `client_max_window_bits` offer or bounded windows.
     pub fn permessage_deflate(mut self) -> Self {
-        self.extensions = WebSocketExtensions::permessage_deflate(PermessageDeflateConfig {
-            client_no_context_takeover: true,
-            server_no_context_takeover: true,
-        });
+        self.extensions = WebSocketExtensions::offer(PermessageDeflateOffer::no_context_takeover());
+        self
+    }
+
+    /// Offer permessage-deflate with an explicit RFC 7692 offer. Use this to
+    /// advertise `client_max_window_bits`, request a bounded
+    /// `server_max_window_bits`, or toggle context takeover independently.
+    /// [`PermessageDeflateOffer::default`] yields the Chrome-style offer
+    /// (`permessage-deflate; client_max_window_bits`).
+    pub fn permessage_deflate_with(mut self, offer: PermessageDeflateOffer) -> Self {
+        self.extensions = WebSocketExtensions::offer(offer);
         self
     }
 

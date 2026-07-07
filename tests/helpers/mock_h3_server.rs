@@ -706,7 +706,9 @@ impl NativeMockH3Connection {
                             active = true;
                             let _ = self.evt_tx.send(MockEvent::GoAway { id }).await;
                         }
-                        H3Frame::Settings(_) | H3Frame::Unknown { .. } => {}
+                        H3Frame::Settings(_)
+                        | H3Frame::PriorityUpdateRequest { .. }
+                        | H3Frame::Unknown { .. } => {}
                     }
                 }
                 if event.fin && self.finished_client_streams.insert(event.stream_id) {

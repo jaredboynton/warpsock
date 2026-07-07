@@ -1518,7 +1518,10 @@ impl NativeBenchH3Connection {
                     }
                     drop(data);
                 }
-                H3Frame::Settings(_) | H3Frame::GoAway { .. } | H3Frame::Unknown { .. } => {}
+                H3Frame::Settings(_)
+                | H3Frame::GoAway { .. }
+                | H3Frame::PriorityUpdateRequest { .. }
+                | H3Frame::Unknown { .. } => {}
             }
         }
 

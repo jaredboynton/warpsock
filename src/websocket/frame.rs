@@ -238,9 +238,15 @@ impl FrameDecoder {
 
         match opcode {
             OpCode::Text => {
-                let text = std::str::from_utf8(&payload)
-                    .map_err(|e| WebSocketError::utf8(url, e.to_string()))?
-                    .to_owned();
+                std::str::from_utf8(&payload)
+                    .map_err(|e| WebSocketError::utf8(url, e.to_string()))?;
+                // Zero-copy: transfer the validated `Bytes` into `Vec<u8>` (no
+                // realloc when refcount==1 — `payload` was freshly produced by
+                // `BytesMut::split_to().freeze()`), then into `String` without a
+                // second UTF-8 scan.
+                let vec: Vec<u8> = payload.into();
+                // SAFETY: `from_utf8` above validated these exact bytes as UTF-8.
+                let text = unsafe { String::from_utf8_unchecked(vec) };
                 Ok(Some(Message::Text(text)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(payload))),

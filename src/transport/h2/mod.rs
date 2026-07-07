@@ -49,8 +49,9 @@ pub use connection::{
 pub use driver::{DriverCommand, H2Driver};
 pub use frame::{
     flags, DataFrame, ErrorCode, FrameHeader, FrameType, GoAwayFrame, HeadersFrame, PingFrame,
-    PriorityData, PriorityFrame, PushPromiseFrame, RstStreamFrame, SettingsFrame, SettingsId,
-    WindowUpdateFrame, CONNECTION_PREFACE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_SIZE,
+    PriorityData, PriorityFrame, PriorityUpdateFrame, PushPromiseFrame, RstStreamFrame,
+    SettingsFrame, SettingsId, WindowUpdateFrame, CONNECTION_PREFACE, DEFAULT_MAX_FRAME_SIZE,
+    FRAME_HEADER_SIZE,
 };
 pub use handle::H2Handle;
 pub use hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};

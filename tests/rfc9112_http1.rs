@@ -144,3 +144,81 @@ async fn test_response_header_folding_rejection() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workstream B2 (H1): RFC 9112 §11 security-considerations fail-closed sweep
+// ---------------------------------------------------------------------------
+
+async fn send_raw_response_and_get_result(
+    raw_response: &'static [u8],
+) -> warpsock::error::Result<warpsock::response::Response> {
+    let url = start_test_server(move |mut socket| {
+        Box::pin(async move {
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let _ = socket.write_all(raw_response).await;
+            let _ = socket.flush().await;
+        })
+    })
+    .await;
+
+    let uri: Uri = url.parse().unwrap();
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", uri.port().unwrap()))
+        .await
+        .unwrap();
+    let mut conn = H1Connection::new(MaybeHttpsStream::Http(stream));
+    let response = conn.send_request(Method::GET, &uri, vec![], None).await?;
+    Ok(response)
+}
+
+#[tokio::test]
+async fn test_transfer_encoding_wins_over_content_length_rfc9112_6_3() {
+    // RFC 9112 §6.3: if a message has both Transfer-Encoding and Content-Length,
+    // the Content-Length MUST be ignored (Transfer-Encoding wins). A request
+    // smuggling defence: the chunked framing decides the body length, so the
+    // (deliberately wrong) Content-Length: 3 must not truncate the 5-byte body.
+    let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
+    let mut response = send_raw_response_and_get_result(raw)
+        .await
+        .expect("chunked body with conflicting Content-Length must parse via TE");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.bytes().unwrap_or_default();
+    assert_eq!(
+        body.as_ref(),
+        b"Hello",
+        "TE-chunked framing must win over Content-Length"
+    );
+}
+
+#[tokio::test]
+async fn test_chunk_size_overflow_is_rejected_rfc9112_7_1() {
+    // RFC 9112 §7.1: a chunk-size that overflows must be treated as an error,
+    // never conflated with \"need more data\". An over-large hex chunk-size that
+    // cannot fit in usize must fail-close.
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nFFFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n";
+    let result = send_raw_response_and_get_result(raw).await;
+    // Either the initial parse fails, or the body drain fails; both are
+    // acceptable fail-closed outcomes. What is NOT acceptable is silently
+    // accepting an oversized/overflowing chunk-size.
+    if let Ok(response) = result {
+        let body = response.bytes();
+        assert!(
+            body.is_err() || body.unwrap().is_empty(),
+            "overflowing chunk-size must not yield a valid body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_chunk_size_hex_is_rejected() {
+    // A non-hex chunk-size line is malformed framing and must fail-close.
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nZZZ\r\nx\r\n0\r\n\r\n";
+    let result = send_raw_response_and_get_result(raw).await;
+    if let Ok(response) = result {
+        let body = response.bytes();
+        assert!(
+            body.is_err() || body.unwrap().is_empty(),
+            "invalid chunk-size hex must not yield a valid body"
+        );
+    }
+}

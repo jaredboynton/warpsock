@@ -9,9 +9,7 @@ use tokio::time::timeout as tokio_timeout;
 use crate::headers::Headers;
 use crate::transport::connector::MaybeHttpsStream;
 
-use super::extension::{
-    parse_permessage_deflate_response, PermessageDeflateConfig, WebSocketExtensions,
-};
+use super::extension::{parse_permessage_deflate_response, WebSocketExtensions};
 use super::{WebSocketError, WebSocketResult};
 
 const ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -132,7 +130,7 @@ pub(crate) fn build_handshake_request(
     if offered_extensions.has_permessage_deflate() {
         headers.insert(
             "Sec-WebSocket-Extensions",
-            PermessageDeflateConfig::OFFER_HEADER,
+            offered_extensions.offer_or_default().header_value(),
         );
     }
 
@@ -345,7 +343,7 @@ fn validate_extensions(
     }
 
     let joined = values.join(",");
-    match parse_permessage_deflate_response(url, &joined)? {
+    match parse_permessage_deflate_response(url, &joined, offered_extensions.offer_or_default())? {
         Some(config) => Ok(WebSocketExtensions::permessage_deflate(config)),
         None => Err(WebSocketError::UnexpectedExtension {
             url: url.to_string(),

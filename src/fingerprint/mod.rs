@@ -5,7 +5,7 @@ pub mod http3;
 pub mod profiles;
 pub mod tls;
 
-pub use http2::PriorityTree;
+pub use http2::{PrioritySignals, PriorityTree};
 pub use http3::{
     H3Settings, H3StreamFingerprint, Http3Fingerprint, QpackHeaderBlockStrategy,
     QpackStringEncodingStrategy, QuicEcnCodepoint, QuicTransportParams, RawQuicTransportParameter,

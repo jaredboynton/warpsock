@@ -1,6 +1,6 @@
 {
   "name": "warpsock",
-  "version": "4.2.8",
+  "version": "4.3.0",
   "description": "Node.js bindings for Warpsock, a browser-fingerprint HTTP client with TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSocket support. Improved TTFT and TPS for LLMs.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -36,10 +36,10 @@
     "testTimeout": 60000
   },
   "optionalDependencies": {
-    "warpsock-darwin-x64": "4.2.8",
-    "warpsock-darwin-arm64": "4.2.8",
-    "warpsock-linux-x64-gnu": "4.2.8",
-    "warpsock-linux-arm64-gnu": "4.2.8"
+    "warpsock-darwin-x64": "4.3.0",
+    "warpsock-darwin-arm64": "4.3.0",
+    "warpsock-linux-x64-gnu": "4.3.0",
+    "warpsock-linux-arm64-gnu": "4.3.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.2",

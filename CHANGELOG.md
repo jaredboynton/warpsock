@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-07-07
+
+### Added
+
+- RFC 9218 Extensible Priorities: the client now emits the `priority` request
+  header and `PRIORITY_UPDATE` frames on HTTP/2 and HTTP/3 matching certified
+  Chrome profiles, and tolerates (ignores without error) server-sent priority
+  signals per RFC 9218 §7. Covered by `tests/rfc9218_priorities.rs`.
+- RFC 7692 permessage-deflate negotiation completeness:
+  `client_max_window_bits`/`server_max_window_bits` and context-takeover modes
+  are now negotiable via `PermessageDeflateOffer` and the
+  `permessage_deflate_with` builder method; the parameterless
+  `permessage_deflate()` shortcut keeps the previous no-context-takeover
+  default. Covered by `tests/rfc7692_permessage_deflate.rs`.
+- Autobahn TestSuite conformance harness (`just autobahn`,
+  `scripts/autobahn.sh` + `examples/autobahn_echo.rs`): opt-in, Docker-based,
+  gates on zero FAILED cases and archives reports under
+  `docs/benchmarks/autobahn/<date>/`. Current result: 517 cases, 0 FAILED for
+  both the plain and permessage-deflate agents.
+- Malformed-input hardening test sweep: HTTP/3 unknown-frame/grease tolerance
+  (RFC 9114 §9), HTTP/1.1 request-smuggling vectors (CL+TE conflict, bare CR,
+  obs-fold, duplicate Content-Length), and WebSocket reserved-bit/opcode
+  fail-closed cases. Test-only: existing behavior already complied.
+- `docs/rfc-compliance-matrix.md`: one row per RFC MUST-cluster mapped to its
+  owning integration test, with the Autobahn artifact reference and justified
+  Chrome-fingerprint deviations.
+- h2spec/h3spec client-mirror conformance mapping under
+  `docs/benchmarks/conformance/`, plus `tests/h2spec_client_conformance.rs`
+  closing client-relevant gaps.
+- WebSocket steady-state allocation-budget regression test
+  (`tests/websocket_alloc_budget.rs`) behind the test-only
+  `test-counting-alloc` feature.
+
+### Changed
+
+- WebSocket text frames are now decoded zero-copy: UTF-8 is validated in place
+  and the payload is converted `Bytes` → `String` without the per-frame
+  `to_owned()` copy on the hot receive path.
+
+### Fixed
+
+- permessage-deflate (RFC 7692) compress/decompress now drain `flate2` fully instead of a single fixed-capacity `compress_vec`/`decompress_vec` call. The single call silently stopped at the buffer's capacity (returning `Status::Ok`, not an error), truncating any message that (de)compressed larger than the initial guess and corrupting the stream under context takeover. The fix loops with a correct termination rule — all input consumed and the last call left spare output capacity — which also avoids the infinite re-emission of the SYNC-flush marker that a naive `total_out`-progress loop hits. Proven by the Autobahn TestSuite: RFC 7692 cases 12.x/13.x now grade OK (0 FAILED) with `AUTOBAHN_DEFLATE=1`.
+
 ## [4.2.8] - 2026-06-26
 
 ### Fixed

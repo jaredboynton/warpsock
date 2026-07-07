@@ -597,7 +597,8 @@ impl NativeH3DriverState {
                     events.push(NativeH3Event::PeerSettings);
                 }
                 H3Frame::GoAway { id } => events.push(NativeH3Event::GoAway { id }),
-                H3Frame::Unknown { .. } => {}
+                // RFC 9218 §7 grease tolerance: client does not schedule; ignore.
+                H3Frame::PriorityUpdateRequest { .. } | H3Frame::Unknown { .. } => {}
                 H3Frame::Data(_) | H3Frame::Headers(_) => {
                     return Err(Error::HttpProtocol(
                         "server control stream carried request/response frame".into(),
@@ -628,7 +629,8 @@ impl NativeH3DriverState {
                     bytes,
                 }),
                 H3Frame::GoAway { id } => events.push(NativeH3Event::GoAway { id }),
-                H3Frame::Unknown { .. } => {}
+                // RFC 9218 §7 grease tolerance: client does not schedule; ignore.
+                H3Frame::PriorityUpdateRequest { .. } | H3Frame::Unknown { .. } => {}
                 H3Frame::Settings(_) => {
                     return Err(Error::HttpProtocol(
                         "request stream carried SETTINGS frame".into(),
@@ -4769,7 +4771,8 @@ impl NativeH3Driver {
                         NativeH3StreamingResponseEvent::GoAway { id },
                     );
                 }
-                H3Frame::Unknown { .. } => {}
+                // RFC 9218 §7 grease tolerance: client does not schedule; ignore.
+                H3Frame::PriorityUpdateRequest { .. } | H3Frame::Unknown { .. } => {}
                 H3Frame::Settings(_) => {
                     return Err(Error::HttpProtocol(
                         "request stream carried SETTINGS frame".into(),
@@ -4866,7 +4869,8 @@ impl NativeH3Driver {
                         "native H3 direct GET stream {stream_id} received GOAWAY id={id}"
                     )));
                 }
-                H3Frame::Unknown { .. } => {}
+                // RFC 9218 §7 grease tolerance: client does not schedule; ignore.
+                H3Frame::PriorityUpdateRequest { .. } | H3Frame::Unknown { .. } => {}
                 H3Frame::Settings(_) => {
                     self.handshake.release_client_stream(stream_id);
                     return Err(Error::HttpProtocol(

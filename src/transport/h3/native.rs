@@ -17,6 +17,8 @@ const FRAME_DATA: u64 = 0x0;
 const FRAME_HEADERS: u64 = 0x1;
 const FRAME_SETTINGS: u64 = 0x4;
 const FRAME_GOAWAY: u64 = 0x7;
+// RFC 9218 §7.2: PRIORITY_UPDATE frame for request streams (type 0xf0700).
+const FRAME_PRIORITY_UPDATE_REQUEST: u64 = 0xf0700;
 const FRAME_GREASE: u64 = 0x21;
 
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
@@ -30,8 +32,21 @@ pub enum H3Frame {
     Data(Bytes),
     Headers(Bytes),
     Settings(Vec<H3Setting>),
-    GoAway { id: u64 },
-    Unknown { frame_type: u64, payload: Bytes },
+    GoAway {
+        id: u64,
+    },
+    /// RFC 9218 §7.2 PRIORITY_UPDATE frame (request-stream form, type 0xf0700).
+    /// Payload: a varint Prioritized Element ID (the request stream ID) followed
+    /// by the ASCII priority field value (same structured-field encoding as the
+    /// `priority` header). Sent on the control stream.
+    PriorityUpdateRequest {
+        prioritized_element_id: u64,
+        field_value: Bytes,
+    },
+    Unknown {
+        frame_type: u64,
+        payload: Bytes,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +256,15 @@ pub fn encode_frame(frame: &H3Frame) -> Bytes {
             put_varint(&mut payload, *id);
             (FRAME_GOAWAY, payload.freeze())
         }
+        H3Frame::PriorityUpdateRequest {
+            prioritized_element_id,
+            field_value,
+        } => {
+            let mut payload = BytesMut::new();
+            put_varint(&mut payload, *prioritized_element_id);
+            payload.extend_from_slice(field_value);
+            (FRAME_PRIORITY_UPDATE_REQUEST, payload.freeze())
+        }
         H3Frame::Unknown {
             frame_type,
             payload,
@@ -278,6 +302,23 @@ fn decode_frame_payload(frame_type: u64, payload: Bytes) -> Result<H3Frame> {
             Ok(H3Frame::GoAway {
                 id: get_varint(&mut payload)?,
             })
+        }
+        FRAME_PRIORITY_UPDATE_REQUEST => {
+            // RFC 9218 §7.2. A server MAY send PRIORITY_UPDATE; the client MUST
+            // NOT error on it (§7). If the payload is malformed we still tolerate
+            // it by falling back to an Unknown frame rather than failing the
+            // connection.
+            let mut body = payload.clone();
+            match get_varint(&mut body) {
+                Ok(prioritized_element_id) => Ok(H3Frame::PriorityUpdateRequest {
+                    prioritized_element_id,
+                    field_value: body,
+                }),
+                Err(_) => Ok(H3Frame::Unknown {
+                    frame_type: FRAME_PRIORITY_UPDATE_REQUEST,
+                    payload,
+                }),
+            }
         }
         frame_type => Ok(H3Frame::Unknown {
             frame_type,

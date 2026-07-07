@@ -472,3 +472,123 @@ fn native_request_stream_encodes_headers_then_data_frames() {
     assert_eq!(decode_header_block(block.as_ref()).unwrap(), headers);
     assert_eq!(frames[1], H3Frame::Data(Bytes::from_static(b"hello")));
 }
+
+// ---------------------------------------------------------------------------
+// Workstream B2 (H3): malformed-input hardening sweep (RFC 9114 §7.2, §9)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn native_h3_unknown_request_stream_frame_types_decode_as_unknown() {
+    // RFC 9114 §9: a client MUST ignore unknown frame types on request streams.
+    // At the codec layer this means unknown types decode as H3Frame::Unknown
+    // (never an error), so the driver can skip them.
+    for frame_type in [0x2u64, 0x6, 0x8, 0x9, 0xd, 0x40, 0x1234, 0x1f * 0x1f + 0x21] {
+        let frame = H3Frame::Unknown {
+            frame_type,
+            payload: Bytes::from_static(b"\x00\x01\x02"),
+        };
+        let decoded = decode_frame(&encode_frame(&frame)).unwrap();
+        assert_eq!(
+            decoded, frame,
+            "frame type {frame_type:#x} must decode as Unknown"
+        );
+    }
+}
+
+#[test]
+fn native_h3_grease_frame_types_are_tolerated_between_known_frames() {
+    // RFC 9114 §9 / §7.2.8: reserved (grease) frame types of form 0x1f*N+0x21
+    // MUST be ignored. They must decode as Unknown and not disturb decoding of
+    // the surrounding known frames.
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&encode_frame(&H3Frame::Headers(Bytes::from_static(
+        b"\x00\xd1\xd7",
+    ))));
+    for grease in [0x21u64, 0x1f + 0x21, 0x1f * 7 + 0x21] {
+        wire.extend_from_slice(&encode_frame(&H3Frame::Unknown {
+            frame_type: grease,
+            payload: Bytes::from_static(b"grease"),
+        }));
+    }
+    wire.extend_from_slice(&encode_frame(&H3Frame::Data(Bytes::from_static(b"body"))));
+
+    let frames = decode_frames(&wire).unwrap();
+    // First is HEADERS, last is DATA; the greases in between decode as Unknown.
+    assert!(matches!(frames.first(), Some(H3Frame::Headers(_))));
+    assert_eq!(
+        frames.last(),
+        Some(&H3Frame::Data(Bytes::from_static(b"body")))
+    );
+    let unknowns = frames
+        .iter()
+        .filter(|f| matches!(f, H3Frame::Unknown { .. }))
+        .count();
+    assert_eq!(
+        unknowns, 3,
+        "all three grease frames must decode as Unknown"
+    );
+}
+
+#[test]
+fn native_h3_max_push_id_frame_decodes_as_unknown_and_is_ignored() {
+    // RFC 9114 §7.2.7: MAX_PUSH_ID (type 0xd) is only sent by clients. A server
+    // that sends it is a protocol error the client tolerates by treating the
+    // frame as unknown/ignored (the client never enables server push). We must
+    // not choke on the frame or its varint payload.
+    let mut payload = bytes::BytesMut::new();
+    // varint-encode a large push id.
+    payload.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0, 0x10, 0x00]); // 8-byte varint
+    let frame = H3Frame::Unknown {
+        frame_type: 0xd,
+        payload: payload.freeze(),
+    };
+    let decoded = decode_frame(&encode_frame(&frame)).unwrap();
+    assert_eq!(decoded, frame);
+}
+
+#[test]
+fn native_h3_truncated_frame_is_rejected_not_silently_accepted() {
+    // A frame whose declared length exceeds the available payload MUST be
+    // rejected rather than read out of bounds.
+    let mut wire = encode_frame(&H3Frame::Data(Bytes::from_static(b"hello"))).to_vec();
+    wire.truncate(wire.len() - 2); // drop last 2 payload bytes but keep length
+    assert!(
+        decode_frame(&wire).is_err(),
+        "truncated frame must be rejected"
+    );
+    assert!(
+        decode_frames(&wire).is_err(),
+        "truncated frame stream must be rejected"
+    );
+}
+
+#[test]
+fn native_h3_qpack_dynamic_table_capacity_edge_values_round_trip() {
+    // RFC 9114 §4.2 / RFC 9204: SETTINGS_QPACK_MAX_TABLE_CAPACITY and
+    // SETTINGS_QPACK_BLOCKED_STREAMS must survive edge values (0 = dynamic table
+    // disabled, and a large capacity) through encode/decode without loss.
+    for (cap, blocked) in [(0u64, 0u64), (4096, 16), (1 << 30, 1024)] {
+        let frame = H3Frame::Settings(vec![
+            H3Setting::QpackMaxTableCapacity(cap),
+            H3Setting::QpackBlockedStreams(blocked),
+        ]);
+        let decoded = decode_frame(&encode_frame(&frame)).unwrap();
+        assert_eq!(
+            decoded, frame,
+            "qpack cap={cap} blocked={blocked} must round-trip"
+        );
+    }
+}
+
+#[test]
+fn native_h3_settings_frame_tolerates_unknown_setting_identifiers() {
+    // RFC 9114 §7.2.4.1: an endpoint MUST ignore settings it does not understand.
+    // Unknown identifiers must decode into H3Setting::Additional, never error.
+    let frame = H3Frame::Settings(vec![
+        H3Setting::QpackMaxTableCapacity(0),
+        H3Setting::Additional(0x1f * 3 + 0x21, 42), // grease setting id
+        H3Setting::Additional(0x4242, 7),
+    ]);
+    let decoded = decode_frame(&encode_frame(&frame)).unwrap();
+    assert_eq!(decoded, frame);
+}

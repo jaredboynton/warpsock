@@ -16,6 +16,7 @@ pub use connection::{
     WebSocket, WebSocketFrame, WebSocketFrameOpcode, WebSocketReader, WebSocketWriter,
 };
 pub use error::{WebSocketError, WebSocketResult};
+pub use extension::PermessageDeflateOffer;
 pub use message::{CloseCode, CloseFrame, Message, PreparedMessage};
 
 /// WebSocket frame/message limits and idle timeouts.

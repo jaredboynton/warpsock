@@ -99,3 +99,66 @@ async fn test_h3_malformed_frame() {
         }
     }
 }
+
+/// RFC 9114 4.1: HEADERS is the first frame on a request stream. A server that
+/// sends a DATA frame *before* any HEADERS on the response (request) stream
+/// commits H3_FRAME_UNEXPECTED. The mirror obligation for the warpsock client
+/// is to fail-closed on this rather than emit a bodiless/garbage response.
+///
+/// Deterministic: loopback mock H3 server on 127.0.0.1:0, readiness-gated, no
+/// fixed sleeps.
+#[tokio::test]
+async fn test_h3_data_before_headers_rfc9114() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("trace")
+        .try_init();
+
+    let server: MockH3Server = MockH3Server::new().await.unwrap();
+    let url = server.url();
+    let url_clone = url.clone();
+
+    server.start(
+        |conn: helpers::mock_h3_server::MockH3Connection| async move {
+            assert!(conn.wait_application_ready(Duration::from_secs(1)).await);
+
+            // Stream 0 is the client's first (bidirectional) request stream.
+            // Emit a DATA frame (type 0x00) with no preceding HEADERS: this is
+            // H3_FRAME_UNEXPECTED per RFC 9114 4.1. The client MUST fail-closed.
+            let request_stream_id = 0;
+            conn.send_frame(request_stream_id, 0x00, b"body-before-headers")
+                .await;
+        },
+    );
+
+    let client = H3Client::new().danger_accept_invalid_certs(true);
+
+    // Bound the request: the server sends a stray DATA frame and no HEADERS, so
+    // the client must either surface an error or leave the request unresolved
+    // (which our timeout turns into a clean, non-hanging failure). The MUST we
+    // assert is negative: the request MUST NOT succeed. A hang past the budget
+    // would itself be a failure of the harness, which is why we cap it.
+    let res = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.send_request(&url_clone, "GET", vec![], None),
+    )
+    .await;
+
+    match res {
+        Ok(Ok(_)) => {
+            panic!("client must not succeed on DATA-before-HEADERS (H3_FRAME_UNEXPECTED)")
+        }
+        Ok(Err(e)) => {
+            // Client surfaced a protocol/closure error — the ideal fail-closed path.
+            let msg = format!("{}", e);
+            tracing::info!("Client received expected error: {}", msg);
+        }
+        Err(_elapsed) => {
+            // No response and no bogus success within budget: the client did not
+            // accept the illegal DATA-before-HEADERS as a valid response. Also
+            // an acceptable fail-closed outcome (client never fabricated a body).
+            tracing::info!(
+                "Client did not resolve DATA-before-HEADERS into a response (fail-closed)"
+            );
+        }
+    }
+}

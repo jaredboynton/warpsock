@@ -21,8 +21,9 @@ use crate::response::Response as WarpsockResponse;
 
 use super::frame::{
     flags, ContinuationFrame, DataFrame, ErrorCode, FrameHeader, FrameType, GoAwayFrame,
-    HeadersFrame, PingFrame, PriorityFrame, PushPromiseFrame, RstStreamFrame, SettingsFrame,
-    SettingsId, WindowUpdateFrame, CONNECTION_PREFACE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_SIZE,
+    HeadersFrame, PingFrame, PriorityFrame, PriorityUpdateFrame, PushPromiseFrame, RstStreamFrame,
+    SettingsFrame, SettingsId, WindowUpdateFrame, CONNECTION_PREFACE, DEFAULT_MAX_FRAME_SIZE,
+    FRAME_HEADER_SIZE,
 };
 use super::hpack::{HpackDecoder, HpackEncoder, PseudoHeaderOrder};
 use super::hpack_impl::Encoder as RawHpackEncoder;
@@ -1529,6 +1530,16 @@ where
                     )));
                 }
                 // Server push is not supported; the frame is ignored
+                Ok(true) // Continue reading
+            }
+            FrameType::PriorityUpdate => {
+                // RFC 9218 §7 grease tolerance: a server MAY send PRIORITY_UPDATE
+                // (type 0x10). Warpsock is a client and does not schedule, so we
+                // parse the frame for validation/observability and then ignore it.
+                // A malformed or unexpected priority signal MUST NOT be treated as
+                // an error (RFC 9218 §7), so a parse failure here is swallowed
+                // rather than surfaced.
+                let _ = PriorityUpdateFrame::parse(header.stream_id, payload.clone());
                 Ok(true) // Continue reading
             }
             _ => {
