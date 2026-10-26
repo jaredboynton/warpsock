@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/streaming_integration.rs`: the low-level `H2Connection` streaming
   tests run against the local TLS `MockH2Server` instead of nghttp2.org's
   httpbin, which now answers 502.
+- CI: tests that depend on third-party hosts now live in `tests/live_*.rs`,
+  stay out of the push/PR gate (nextest `ci` profile) and run nightly in the
+  `live-network` workflow. `tls.peet.ws` resets connections from GitHub
+  runners, which turned every push red.
 
 ## [4.3.0] - 2026-07-07
 

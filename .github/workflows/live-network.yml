@@ -1,0 +1,45 @@
+name: Live network
+
+# Tests that depend on third-party hosts (tests/live_*.rs). Kept out of the
+# push/PR gate so an outside service's availability or IP policy can't block
+# merges; failures here are visible but non-blocking.
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  live-linux:
+    name: Live network (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-test-linux
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: actions/cache@v4
+        with:
+          path: lib/boringssl
+          key: boringssl-x86_64-unknown-linux-gnu-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install prebuilt BoringSSL
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install-boringssl-prebuilt.sh
+          ./scripts/install-boringssl-prebuilt.sh --manifest-path Cargo.toml x86_64-unknown-linux-gnu
+
+      - run: cargo nextest run --all-features --profile live --locked

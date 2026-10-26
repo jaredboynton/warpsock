@@ -21,6 +21,8 @@ filter = 'binary(=validation_h2_streaming) | binary(=streaming_public_api) | bin
 test-group = 'streaming-heavy'
 
 [profile.ci]
+# Live-network binaries (tests/live_*.rs) run in .github/workflows/live-network.yml.
+default-filter = "not binary(/^live_/)"
 # CI profile -- retry once to handle transient flakes
 test-threads = 4
 retries = 1
@@ -62,3 +64,9 @@ test-group = 'streaming-heavy'
 [test-groups]
 h3-stateful = { max-threads = 2 }
 streaming-heavy = { max-threads = 2 }
+
+[profile.live]
+# Third-party-host tests only; see .github/workflows/live-network.yml.
+default-filter = "binary(/^live_/)"
+retries = 1
+failure-output = "final"
