@@ -1,124 +1,146 @@
-//! Streaming HTTP/2 integration tests.
+//! Low-level `H2Connection` streaming tests.
 //!
-//! These tests verify real streaming capability by connecting to actual
-//! streaming endpoints and receiving data incrementally via channels.
+//! The local tests stream from `MockH2Server` over TLS, so they're hermetic.
+//! `test_real_streaming_cloudflare_trace` is the one live-network smoke test.
 //!
 //! Run with: cargo test --test streaming_integration
 
 use bytes::Bytes;
 use http::{Request, Uri};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use warpsock::fingerprint::http2::Http2Settings;
 use warpsock::fingerprint::tls::TlsFingerprint;
 use warpsock::transport::connector::BoringConnector;
+use warpsock::transport::h2::hpack_impl::Encoder;
 use warpsock::transport::h2::{H2Connection, PseudoHeaderOrder};
 
-/// Test streaming with nghttp2.org's HTTP/2 test server.
-/// Uses /httpbin/stream-bytes/N which streams N random bytes.
-#[tokio::test]
-async fn test_real_streaming_nghttp2() {
-    let fp = TlsFingerprint::chrome_142();
-    let connector = BoringConnector::with_fingerprint(fp);
-    let settings = Http2Settings::default();
+mod helpers;
+use helpers::mock_h2_server::{MockH2Connection, MockH2Server};
+use helpers::tls::generate_cert_bundle;
 
-    // nghttp2.org supports HTTP/2 and has streaming endpoints
-    let uri: Uri = "https://nghttp2.org/httpbin/stream-bytes/4096"
-        .parse()
-        .unwrap();
+/// Starts a TLS HTTP/2 server that answers each request with `200` and a
+/// `content-type`, waits for `release` if given, then sends `frames` as DATA
+/// frames, ending the stream on the last one.
+async fn serve(frames: Vec<Bytes>, release: Option<Arc<Notify>>) -> Uri {
+    let (mut builder, _) = generate_cert_bundle();
+    builder.set_alpn_select_callback(|_, protos| {
+        boring::ssl::select_next_proto(b"\x02h2", protos).ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let server = MockH2Server::new().await.unwrap();
+    let uri = format!("{}/stream", server.url_tls()).parse().unwrap();
+    server.start_tls(builder.build(), move |conn: MockH2Connection| {
+        let (frames, release) = (frames.clone(), release.clone());
+        async move {
+            conn.read_preface().await.unwrap();
+            conn.send_settings(&[]).await.unwrap();
+            conn.send_settings_ack().await.unwrap();
+            let stream_id = loop {
+                let (_, frame_type, _, stream_id, _) = conn.read_frame().await.unwrap();
+                if frame_type == 0x01 {
+                    break stream_id;
+                }
+            };
+            let headers = Encoder::new().encode(&[
+                (b":status".as_slice(), b"200".as_slice()),
+                (
+                    b"content-type".as_slice(),
+                    b"application/octet-stream".as_slice(),
+                ),
+            ]);
+            conn.send_headers(stream_id, &headers, false, true)
+                .await
+                .unwrap();
+            if let Some(release) = release {
+                release.notified().await;
+            }
+            for (i, frame) in frames.iter().enumerate() {
+                conn.send_data(stream_id, frame, i + 1 == frames.len())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    uri
+}
 
-    let stream = connector
-        .connect(&uri)
+/// Streams one GET to `uri` over `H2Connection` with the Chrome TLS
+/// fingerprint. Fires `release` once `send_request_streaming` has returned the
+/// response head, then drives the connection and collects the body chunks.
+async fn stream_get(uri: &Uri, release: Option<&Notify>) -> (http::Response<Bytes>, Vec<Bytes>) {
+    let stream = BoringConnector::with_fingerprint(TlsFingerprint::chrome_142())
+        .danger_accept_invalid_certs(true)
+        .connect(uri)
         .await
         .expect("TLS connection should succeed");
-
-    if !stream.is_h2() {
-        panic!("Server did not negotiate HTTP/2 - cannot test streaming");
+    assert!(stream.is_h2(), "server must negotiate HTTP/2");
+    let mut conn =
+        H2Connection::connect(stream, Http2Settings::default(), PseudoHeaderOrder::Chrome)
+            .await
+            .expect("HTTP/2 connection should succeed");
+    let request = Request::get(uri).body(Bytes::new()).unwrap();
+    let (response, mut rx) = timeout(Duration::from_secs(5), conn.send_request_streaming(request))
+        .await
+        .expect("response head must not wait for the body")
+        .expect("streaming request should succeed");
+    if let Some(release) = release {
+        release.notify_one();
     }
-
-    let mut h2_conn = H2Connection::connect(stream, settings, PseudoHeaderOrder::Chrome)
-        .await
-        .expect("HTTP/2 connection should succeed");
-
-    // Build streaming request - do NOT include pseudo-headers, H2 handles those
-    let request = Request::builder()
-        .method("GET")
-        .uri(&uri)
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        )
-        .header("accept", "*/*")
-        .body(Bytes::new())
-        .expect("Failed to build request");
-
-    // Send streaming request
-    let (response, mut rx) = h2_conn
-        .send_request_streaming(request)
-        .await
-        .expect("Streaming request should succeed");
-
-    assert_eq!(response.status(), 200, "Should get 200 OK");
-
-    // Spawn reader task
-    let reader_handle = tokio::spawn(async move {
-        let mut bytes_received = 0;
-        let mut chunks = 0;
-
-        while let Some(result) = rx.recv().await {
-            match result {
-                Ok(chunk) => {
-                    bytes_received += chunk.len();
-                    chunks += 1;
-                }
-                Err(e) => {
-                    panic!("Stream error: {}", e);
-                }
-            }
+    let driver =
+        tokio::spawn(async move { while let Ok(true) = conn.read_streaming_frames().await {} });
+    let chunks = timeout(Duration::from_secs(10), async {
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.expect("stream error"));
         }
-
-        (bytes_received, chunks)
-    });
-
-    // Drive the connection to read frames
-    let driver_handle = tokio::spawn(async move {
-        loop {
-            match h2_conn.read_streaming_frames().await {
-                Ok(true) => continue,
-                Ok(false) => break, // Stream ended
-                Err(e) => {
-                    // Connection closed or error - this is expected when stream ends
-                    tracing::debug!("Stream reader ended: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wait for both tasks with timeout
-    let (total_bytes, chunk_count) = timeout(Duration::from_secs(15), async {
-        // Wait for driver to finish (which signals stream end)
-        let _ = driver_handle.await;
-        // Then get results from reader
-        reader_handle.await.expect("Reader task should complete")
+        chunks
     })
     .await
-    .expect("Streaming should complete within 15 seconds");
+    .expect("body should finish within 10 seconds");
+    driver.abort();
+    (response, chunks)
+}
 
-    // Verify we received data in chunks
-    assert!(total_bytes > 0, "Should have received some bytes");
+/// A 64 KiB body arrives as several DATA chunks, complete and in order.
+#[tokio::test]
+async fn streams_multi_frame_body_in_order() {
+    let frames: Vec<Bytes> = (0..4u8)
+        .map(|i| Bytes::from(vec![b'a' + i; 16_384]))
+        .collect();
+    let uri = serve(frames.clone(), None).await;
+
+    let (response, chunks) = stream_get(&uri, None).await;
+
+    assert_eq!(response.status(), 200);
     assert!(
-        chunk_count >= 1,
-        "Should have received at least 1 chunk (got {} chunks, {} bytes)",
-        chunk_count,
-        total_bytes
+        chunks.len() >= 2,
+        "64 KiB should arrive in several chunks, got {}",
+        chunks.len()
     );
+    assert_eq!(chunks.concat(), frames.concat());
+}
 
-    tracing::info!(
-        "Streaming test passed: received {} bytes in {} chunks",
-        total_bytes,
-        chunk_count
+/// `send_request_streaming` returns the response head while the server is
+/// still holding the body back.
+#[tokio::test]
+async fn returns_response_head_before_body() {
+    let release = Arc::new(Notify::new());
+    let uri = serve(
+        vec![Bytes::from_static(b"late body")],
+        Some(release.clone()),
+    )
+    .await;
+
+    let (response, chunks) = stream_get(&uri, Some(&release)).await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
     );
+    assert_eq!(chunks.concat(), b"late body");
 }
 
 /// Test streaming with Cloudflare's HTTP/2 SSE-style endpoint.
@@ -202,190 +224,4 @@ async fn test_real_streaming_cloudflare_trace() {
     );
 
     tracing::info!("Cloudflare streaming test passed: {} bytes", body.len());
-}
-
-/// Test streaming larger response to verify chunking behavior.
-#[tokio::test]
-async fn test_streaming_larger_response() {
-    let fp = TlsFingerprint::chrome_142();
-    let connector = BoringConnector::with_fingerprint(fp);
-    let settings = Http2Settings::default();
-
-    // Request 64KB of random bytes - should definitely chunk
-    let uri: Uri = "https://nghttp2.org/httpbin/stream-bytes/65536"
-        .parse()
-        .unwrap();
-
-    let stream = connector
-        .connect(&uri)
-        .await
-        .expect("TLS connection should succeed");
-
-    if !stream.is_h2() {
-        panic!("Server did not negotiate HTTP/2");
-    }
-
-    let mut h2_conn = H2Connection::connect(stream, settings, PseudoHeaderOrder::Chrome)
-        .await
-        .expect("HTTP/2 connection should succeed");
-
-    let request = Request::builder()
-        .method("GET")
-        .uri(&uri)
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        )
-        .header("accept", "*/*")
-        .body(Bytes::new())
-        .expect("Failed to build request");
-
-    let (response, mut rx) = h2_conn
-        .send_request_streaming(request)
-        .await
-        .expect("Streaming request should succeed");
-
-    assert_eq!(response.status(), 200);
-
-    // Track chunk sizes to verify we're actually streaming
-    let reader_handle = tokio::spawn(async move {
-        let mut chunk_sizes: Vec<usize> = Vec::new();
-        while let Some(result) = rx.recv().await {
-            match result {
-                Ok(chunk) => chunk_sizes.push(chunk.len()),
-                Err(e) => panic!("Stream error: {}", e),
-            }
-        }
-        chunk_sizes
-    });
-
-    let driver_handle = tokio::spawn(async move {
-        loop {
-            match h2_conn.read_streaming_frames().await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(_) => break,
-            }
-        }
-    });
-
-    let chunk_sizes = timeout(Duration::from_secs(15), async {
-        let _ = driver_handle.await;
-        reader_handle.await.expect("Reader should complete")
-    })
-    .await
-    .expect("Should complete within 15 seconds");
-
-    let total_bytes: usize = chunk_sizes.iter().sum();
-    let chunk_count = chunk_sizes.len();
-
-    // For 64KB, we expect multiple chunks (HTTP/2 max frame size is typically 16KB)
-    assert!(
-        chunk_count >= 2,
-        "64KB response should arrive in multiple chunks (got {} chunks)",
-        chunk_count
-    );
-    assert!(
-        total_bytes >= 60000,
-        "Should receive at least 60KB (got {} bytes)",
-        total_bytes
-    );
-
-    tracing::info!(
-        "Large streaming test passed: {} bytes in {} chunks",
-        total_bytes,
-        chunk_count
-    );
-    tracing::debug!("Chunk sizes: {:?}", chunk_sizes);
-}
-
-/// Test that streaming API correctly handles response headers.
-#[tokio::test]
-async fn test_streaming_headers_available_immediately() {
-    let fp = TlsFingerprint::chrome_142();
-    let connector = BoringConnector::with_fingerprint(fp);
-    let settings = Http2Settings::default();
-
-    let uri: Uri = "https://nghttp2.org/httpbin/headers".parse().unwrap();
-
-    let stream = connector
-        .connect(&uri)
-        .await
-        .expect("TLS connection should succeed");
-
-    if !stream.is_h2() {
-        panic!("Server did not negotiate HTTP/2");
-    }
-
-    let mut h2_conn = H2Connection::connect(stream, settings, PseudoHeaderOrder::Chrome)
-        .await
-        .expect("HTTP/2 connection should succeed");
-
-    let request = Request::builder()
-        .method("GET")
-        .uri(&uri)
-        .header("user-agent", "warpsock/test")
-        .header("accept", "application/json")
-        .header("x-custom-header", "test-value")
-        .body(Bytes::new())
-        .expect("Failed to build request");
-
-    let (response, mut rx) = h2_conn
-        .send_request_streaming(request)
-        .await
-        .expect("Streaming request should succeed");
-
-    // Headers should be available immediately (before body streams)
-    assert_eq!(response.status(), 200, "Should get 200 OK");
-
-    // Check content-type header is present
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .map(|v| v.to_str().unwrap_or(""));
-    assert!(
-        content_type.is_some(),
-        "Content-Type header should be present"
-    );
-
-    // Now collect body
-    let reader_handle = tokio::spawn(async move {
-        let mut body = Vec::new();
-        while let Some(result) = rx.recv().await {
-            if let Ok(chunk) = result {
-                body.extend_from_slice(&chunk);
-            }
-        }
-        body
-    });
-
-    let driver_handle = tokio::spawn(async move {
-        loop {
-            match h2_conn.read_streaming_frames().await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(_) => break,
-            }
-        }
-    });
-
-    let body = timeout(Duration::from_secs(10), async {
-        let _ = driver_handle.await;
-        reader_handle.await.expect("Reader should complete")
-    })
-    .await
-    .expect("Should complete within 10 seconds");
-
-    // Verify response contains our headers echoed back
-    let body_str = String::from_utf8_lossy(&body);
-    let json: serde_json::Value = serde_json::from_str(&body_str).expect("Should be valid JSON");
-
-    if let Some(headers) = json.get("headers") {
-        assert!(
-            headers.get("X-Custom-Header").is_some() || headers.get("x-custom-header").is_some(),
-            "Custom header should be echoed back"
-        );
-    }
-
-    tracing::info!("Headers streaming test passed");
 }

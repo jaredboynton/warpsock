@@ -178,7 +178,7 @@ async fn test_transfer_encoding_wins_over_content_length_rfc9112_6_3() {
     // smuggling defence: the chunked framing decides the body length, so the
     // (deliberately wrong) Content-Length: 3 must not truncate the 5-byte body.
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
-    let mut response = send_raw_response_and_get_result(raw)
+    let response = send_raw_response_and_get_result(raw)
         .await
         .expect("chunked body with conflicting Content-Length must parse via TE");
     assert_eq!(response.status().as_u16(), 200);

@@ -33,13 +33,12 @@ async fn handshake_read_headers(conn: &MockH2Connection) -> std::io::Result<u32>
         let (_, frame_type, flags, sid, _) = conn.read_frame().await?;
         match frame_type {
             0x01 => break sid, // HEADERS from client request
-            0x04 => {
-                if flags & 0x01 == 0 {
+            0x04
+                if flags & 0x01 == 0 => {
                     // client SETTINGS -> answer + ack
                     conn.send_settings(&[(0x03, 100), (0x04, 65535)]).await?;
                     conn.send_settings_ack().await?;
                 }
-            }
             _ => { /* ignore WINDOW_UPDATE / PRIORITY / etc. */ }
         }
     };

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.1] - 2026-10-26
+
+### Security
+
+- `zstd` 0.13 -> 0.14.3 (`zstd-safe` 8.2.0, `zstd-sys` 2.1.2): fixes
+  RUSTSEC-2026-0391 (data from an abandoned stream leaks into the next stream
+  on a reused context) and RUSTSEC-2026-0398 / RUSTSEC-2026-0403 (`zstd-safe`
+  memory-safety bugs in seekable and legacy-frame decompression). No API change.
+- Lockfile patch bumps for `h2`, `quinn-proto`, `rustls`, `rustls-webpki`,
+  `webpki-roots` and `tokio` clear their RustSec advisories in the Node and
+  Python builds.
+
+### Fixed
+
+- `tests/streaming_integration.rs`: the low-level `H2Connection` streaming
+  tests run against the local TLS `MockH2Server` instead of nghttp2.org's
+  httpbin, which now answers 502.
+
 ## [4.3.0] - 2026-07-07
 
 ### Added

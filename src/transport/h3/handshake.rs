@@ -5509,40 +5509,32 @@ fn apply_h3_stream_frame(
             if !native::h3_frame_block_is_complete(buffer.as_ref())? && !fin {
                 return Ok(None);
             }
-            match native::decode_frames(buffer.as_ref()) {
-                Ok(frames) => {
-                    let consumed = buffer.len() as u64;
-                    buffer.clear();
-                    buffer_offsets.insert(
-                        stream_id,
-                        buffer_base.checked_add(consumed).ok_or_else(|| {
-                            Error::HttpProtocol("native H3 stream range overflow".into())
-                        })?,
-                    );
-                    frames
-                }
-                Err(error) => return Err(error),
-            }
+            let frames = native::decode_frames(buffer.as_ref())?;
+            let consumed = buffer.len() as u64;
+            buffer.clear();
+            buffer_offsets.insert(
+                stream_id,
+                buffer_base
+                    .checked_add(consumed)
+                    .ok_or_else(|| Error::HttpProtocol("native H3 stream range overflow".into()))?,
+            );
+            frames
         };
         (Some(stream_type), frames)
     } else {
         if !native::h3_frame_block_is_complete(buffer.as_ref())? && !fin {
             return Ok(None);
         }
-        match native::decode_frames(buffer.as_ref()) {
-            Ok(frames) => {
-                let consumed = buffer.len() as u64;
-                buffer.clear();
-                buffer_offsets.insert(
-                    stream_id,
-                    buffer_base.checked_add(consumed).ok_or_else(|| {
-                        Error::HttpProtocol("native H3 stream range overflow".into())
-                    })?,
-                );
-                (None, frames)
-            }
-            Err(error) => return Err(error),
-        }
+        let frames = native::decode_frames(buffer.as_ref())?;
+        let consumed = buffer.len() as u64;
+        buffer.clear();
+        buffer_offsets.insert(
+            stream_id,
+            buffer_base
+                .checked_add(consumed)
+                .ok_or_else(|| Error::HttpProtocol("native H3 stream range overflow".into()))?,
+        );
+        (None, frames)
     };
 
     if fin {
