@@ -1,6 +1,6 @@
 [package]
 name = "warpsock"
-version = "4.3.1"
+version = "4.3.2"
 edition = "2021"
 license = "MIT"
 description = "Rust HTTP client with browser-like Chrome and Firefox fingerprints across TLS, HTTP/1.1, HTTP/2, HTTP/3, and WebSockets"
