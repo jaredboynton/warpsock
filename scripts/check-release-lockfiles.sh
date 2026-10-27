@@ -118,7 +118,7 @@ checks = [
     ('packages[""].version', data.get("packages", {}).get("", {}).get("version")),
 ]
 optional = data.get("packages", {}).get("", {}).get("optionalDependencies", {})
-for name in ("warpsock-darwin-arm64", "warpsock-darwin-x64", "warpsock-linux-arm64-gnu", "warpsock-linux-x64-gnu"):
+for name in ("@postman-cs/warpsock-darwin-arm64", "@postman-cs/warpsock-darwin-x64", "@postman-cs/warpsock-linux-arm64-gnu", "@postman-cs/warpsock-linux-x64-gnu"):
     checks.append((f'packages[""].optionalDependencies.{name}', optional.get(name)))
 
 for source, actual in checks:

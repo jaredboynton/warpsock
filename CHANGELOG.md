@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.2] - 2026-10-26
+
+### Changed
+
+- npm: the Node bindings now publish as `@postman-cs/warpsock`, with native packages
+  `@postman-cs/warpsock-<platform>`. The unscoped `warpsock` npm packages stay at 4.3.0 and
+  won't get further releases; switch with `npm install @postman-cs/warpsock`. crates.io and
+  PyPI 4.3.2 are identical to 4.3.1.
+
 ## [4.3.1] - 2026-10-26
 
 ### Security

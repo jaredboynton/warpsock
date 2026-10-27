@@ -286,7 +286,7 @@ jobs:
           cd "$tmp/install"
           npm init -y >/dev/null
           npm install --ignore-scripts "$tmp/$native_tgz" "$tmp/$root_tgz"
-          NAPI_RS_ENFORCE_VERSION_CHECK=1 node -e "require('warpsock')"
+          NAPI_RS_ENFORCE_VERSION_CHECK=1 node -e "require('@postman-cs/warpsock')"
 
       - name: Publish
         run: |

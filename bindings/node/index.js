@@ -8,24 +8,24 @@
 const { execSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
 
-const PACKAGE_VERSION = '4.3.1';
+const PACKAGE_VERSION = '4.3.2';
 
 const targets = {
   'darwin-x64': {
     local: './warpsock.darwin-x64.node',
-    package: 'warpsock-darwin-x64',
+    package: '@postman-cs/warpsock-darwin-x64',
   },
   'darwin-arm64': {
     local: './warpsock.darwin-arm64.node',
-    package: 'warpsock-darwin-arm64',
+    package: '@postman-cs/warpsock-darwin-arm64',
   },
   'linux-x64-gnu': {
     local: './warpsock.linux-x64-gnu.node',
-    package: 'warpsock-linux-x64-gnu',
+    package: '@postman-cs/warpsock-linux-x64-gnu',
   },
   'linux-arm64-gnu': {
     local: './warpsock.linux-arm64-gnu.node',
-    package: 'warpsock-linux-arm64-gnu',
+    package: '@postman-cs/warpsock-linux-arm64-gnu',
   },
 };
 

@@ -15,13 +15,13 @@ Supported Chrome profiles are `FingerprintProfile.Chrome142` through `Fingerprin
 ## Installation
 
 ```bash
-npm install warpsock
+npm install @postman-cs/warpsock
 ```
 
 ## HTTP
 
 ```javascript
-const { clientBuilder, FingerprintProfile } = require('warpsock');
+const { clientBuilder, FingerprintProfile } = require('@postman-cs/warpsock');
 
 const client = clientBuilder()
   .fingerprint(FingerprintProfile.Chrome148)
@@ -41,7 +41,7 @@ console.log(response.text());
 ## RFC 6455 WebSockets
 
 ```javascript
-const { CLOSE_NORMAL, clientBuilder } = require('warpsock');
+const { CLOSE_NORMAL, clientBuilder } = require('@postman-cs/warpsock');
 
 const client = clientBuilder()
   .cookieStore(true)
@@ -70,7 +70,7 @@ RFC 6455 sockets are framed message connections. `send*`, `next`, and `close` op
 ## RFC 8441 HTTP/2 Tunnels
 
 ```javascript
-const { clientBuilder } = require('warpsock');
+const { clientBuilder } = require('@postman-cs/warpsock');
 
 const client = clientBuilder()
   .http2PriorKnowledge(true)
